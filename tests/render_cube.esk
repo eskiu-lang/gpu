@@ -1,0 +1,126 @@
+// Renders the textured cube into a 256x256 texture with depth, checks that
+// the middle shows the cube over the clear color, and writes the pixels to the
+// file named by GPU_DUMP (raw RGBA) when it is set.
+import <io>;
+import <mem>;
+import <fs>;
+import <env>;
+import <gpu>;
+import <gpu/math>;
+
+string shader =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) shade: f32 };\n"
+    "@group(0) @binding(0) var<uniform> mvp: mat4x4<f32>;\n"
+    "@group(0) @binding(1) var tex: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) shade: f32) -> V {\n"
+    "    return V(mvp * vec4(p, 1.0), uv, shade);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    return vec4(textureSample(tex, samp, v.uv).rgb * v.shade, 1.0);\n"
+    "}\n";
+
+// 6 faces x 4 corners: position, uv, shade.
+void cube(*float out, *uint32 idx) {
+    float[72] p = {-1,-1, 1,  1,-1, 1,  1, 1, 1, -1, 1, 1,
+                    1,-1,-1, -1,-1,-1, -1, 1,-1,  1, 1,-1,
+                   -1,-1,-1, -1,-1, 1, -1, 1, 1, -1, 1,-1,
+                    1,-1, 1,  1,-1,-1,  1, 1,-1,  1, 1, 1,
+                   -1, 1, 1,  1, 1, 1,  1, 1,-1, -1, 1,-1,
+                   -1,-1,-1,  1,-1,-1,  1,-1, 1, -1,-1, 1};
+    float[8] uv = {0, 1, 1, 1, 1, 0, 0, 0};
+    float[6] shade = {1.0, 0.7, 0.8, 0.8, 0.95, 0.6};
+    for (f in 0..6) {
+        for (c in 0..4) {
+            int v = f * 4 + c;
+            out[v * 6 + 0] = p[v * 3 + 0];
+            out[v * 6 + 1] = p[v * 3 + 1];
+            out[v * 6 + 2] = p[v * 3 + 2];
+            out[v * 6 + 3] = uv[c * 2];
+            out[v * 6 + 4] = uv[c * 2 + 1];
+            out[v * 6 + 5] = shade[f];
+        }
+        uint32 b = (uint32)(f * 4);
+        uint32[6] q = {b, b + 1, b + 2, b, b + 2, b + 3};
+        for (k in 0..6) idx[f * 6 + k] = q[k];
+    }
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuTexture target = gpu.target(256, 256)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(256, 256)?;
+    defer depth.release();
+    float[144] verts;
+    uint32[36] idx;
+    cube(&verts[0], &idx[0]);
+    GpuBuffer vb = gpu.vertices(&verts, sizeof(verts))?;
+    defer vb.release();
+    GpuBuffer ib = gpu.indices(&idx[0], 36)?;
+    defer ib.release();
+    uint8[1024] pixels;
+    for (y in 0..16) {
+        for (x in 0..16) {
+            bool on = ((x / 4) + (y / 4)) % 2 == 0;
+            int i = (y * 16 + x) * 4;
+            pixels[i] = on ? 240 : 40;
+            pixels[i + 1] = on ? 140 : 60;
+            pixels[i + 2] = on ? 40 : 120;
+            pixels[i + 3] = 255;
+        }
+    }
+    GpuTexture image = gpu.image(16, 16, &pixels)?;
+    defer image.release();
+    GpuSampler samp = gpu.sampler(false)?;
+    defer samp.release();
+    Mat4 view = mat4_look_at(Vec3{0.0, 1.5, 5.0}, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+    Mat4 proj = mat4_perspective(0.9, 1.0, 0.1, 100.0);
+    Mat4 model = mat4_rotate(0.6, Vec3{0.4, 1.0, 0.2});
+    Mat4 vm = view.mul(&model);
+    Mat4 mvp = proj.mul(&vm);
+    GpuBuffer ub = gpu.uniform(&mvp, sizeof(Mat4))?;
+    defer ub.release();
+    GpuVertexLayout layout = GpuVertexLayout{stride: 24};
+    defer layout.release();
+    layout.add(WGPUVertexFormat_Float32x3, 0);
+    layout.add(WGPUVertexFormat_Float32x2, 12);
+    layout.add(WGPUVertexFormat_Float32, 20);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: target.format,
+        layout: &layout, depth: true, cull: WGPUCullMode_Back};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    pipe.bind(0, &ub);
+    pipe.bind_texture(1, &image);
+    pipe.bind_sampler(2, &samp);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &depth);
+    pass.draw_indexed(&pipe, &vb, &ib, 36, 1);
+    pass.end()?;
+    *uint8 out = alloc<uint8>(256 * 256 * 4);
+    defer free(out);
+    target.read(out)?;
+    int covered = 0;
+    for (i in 0..256 * 256) {
+        if (out[i * 4] != 0 || out[i * 4 + 1] != 0 || out[i * 4 + 2] != 0) covered++;
+    }
+    string dump = env_get("GPU_DUMP");
+    if (dump != null) {
+        *void f = fs_open(dump, "wb");
+        fs_write(f, out, 256 * 256 * 4);
+        fs_close(f);
+    }
+    printf("cube covers %d%% of the image\n", covered * 100 / (256 * 256));
+    bool middle = out[(128 * 256 + 128) * 4] != 0;
+    bool corner = out[0] == 0 && out[1] == 0 && out[2] == 0;
+    return Ok<int, string>(middle && corner && covered > 256 * 256 / 8 ? 0 : 1);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return r.value;
+}
