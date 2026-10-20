@@ -4,3 +4,12 @@ version = "0.1.0"
 main = "examples/compute.esk"
 
 [deps]
+
+# wgpu-native's own release archives, fetched by eskiuc build / run / test / fetch. SDL3
+# (<gpu/window>) has no prebuilt macOS or Linux library: it comes from the system.
+[native.wgpu_native]
+macos-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip", sha256 = "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e" }
+macos-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip", sha256 = "8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41" }
+linux-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-x86_64-release.zip", sha256 = "95a4d90c071005a98d03eab348beaa6b07e16eb00d1dcdb9f8348f75eb97ec5a" }
+linux-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-aarch64-release.zip", sha256 = "015fcdf1dbae82e614a783cc38017e5399ae0927a889fe9b69c9b664bc61b47a" }
+windows-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-gnu-release.zip", sha256 = "d471e3614733c1d4ddd61bfd19868356477d0d37bf531bf8c6cb64a7f579bd2a" }
