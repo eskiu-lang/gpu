@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  WGPU_VERSION: v29.0.1.1
+
+jobs:
+  linux:
+    # Software Vulkan (lavapipe): the tests run with no GPU.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu, wgpu-native and lavapipe
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 unzip
+          curl -fsSL -o wgpu.zip https://github.com/gfx-rs/wgpu-native/releases/download/$WGPU_VERSION/wgpu-linux-x86_64-release.zip
+          unzip -q wgpu.zip -d $HOME/wgpu
+          echo "LD_LIBRARY_PATH=$HOME/wgpu/lib" >> $GITHUB_ENV
+      - name: Layout check
+        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
+      - name: Tests
+        run: eskiuc test -L$HOME/wgpu/lib
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu, wgpu-native and SDL3
+        run: |
+          brew install eskiu-lang/eskiu/eskiu wgpu-native sdl3
+      - name: Layout check
+        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $(brew --prefix wgpu-native)/include $(brew --prefix)/lib
+      - name: Tests
+        run: eskiuc test -L$(brew --prefix)/lib
+      - name: Examples build
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done

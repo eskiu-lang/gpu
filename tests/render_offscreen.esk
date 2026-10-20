@@ -22,7 +22,7 @@ Result<int, string> run() {
     defer target.release();
     float[15] verts = {-1.0, -1.0, 1.0, 0.0, 0.0,
                         1.0, -1.0, 1.0, 0.0, 0.0,
-                        0.0,  1.0, 1.0, 0.0, 0.0};
+                        0.0, 1.0, 1.0, 0.0, 0.0};
     GpuBuffer vb = gpu.vertices(&verts, sizeof(verts))?;
     defer vb.release();
     GpuVertexLayout layout = GpuVertexLayout{stride: 20};
