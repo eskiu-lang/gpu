@@ -1,0 +1,133 @@
+// OBJ and MTL loading against tests/data/quad.obj (made by
+// tools/gen_test_models.py), then the quad drawn offscreen with its texture.
+import <io>;
+import <mem>;
+import <libc>;
+import <fs>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/obj>;
+import <gpu/model>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b) {
+    return fabs((double)(a - b)) < 0.001;
+}
+
+uint32 pixel(*uint8 px, int x, int y) {
+    *uint8 p = px + (y * 64 + x) * 4;
+    return (uint32)p[0] << 16 | (uint32)p[1] << 8 | (uint32)p[2];
+}
+
+void expect(string what, uint32 got, uint32 want) {
+    if (got != want) {
+        printf("FAIL %s: %06x, want %06x\n", what, got, want);
+        fails++;
+    }
+}
+
+Result<int, string> run() {
+    Gltf g = obj_load("tests/data/quad.obj")?;
+    defer g.free();
+    check("two objects, two nodes", g.meshes.size == 2 && g.nodes.size == 2 && g.roots.size == 2);
+    GltfPrimitive* q = &g.meshes.data[0].primitives.data[0];
+    check("the four-corner face is two triangles over 4 vertices", q.vertex_count == 4 && q.index_count == 6);
+    check("negative indices", near(q.positions[3], 1.0) && near(q.positions[4], -1.0));
+    check("texture coordinates are flipped to top-down", near(q.uvs[1], 1.0) && near(q.uvs[7], 0.0));
+    check("normals", q.normals != null && near(q.normals[2], 1.0));
+    check("materials from the mtl", g.materials.size == 2 && q.material == 0);
+    GltfMaterial* flat = &g.materials.data[0];
+    check("illum 0 is unlit", flat.unlit && flat.base_color_texture.texture >= 0);
+    check("-clamp on picks the clamping sampler", g.textures.data[flat.base_color_texture.texture].sampler == 1);
+    GltfMaterial* glass = &g.materials.data[1];
+    check("d below 1 blends", glass.alpha_mode == GLTF_BLEND && near(glass.base_color.w, 0.5));
+    check("Ns becomes roughness", near(glass.roughness, (float)sqrt(2.0 / 100.0)));
+    check("Ke is the emission", near(glass.emissive.x, 0.1));
+    check("bump with -bm", glass.normal_texture.texture >= 0 && near(glass.normal_texture.scale, 0.5));
+    check("the texture file is read once", g.images.size == 1);
+    GltfPrimitive* t = &g.meshes.data[1].primitives.data[0];
+    check("vertex colors", t.colors != null && near(t.colors[4], 0.0) && near(t.colors[5], 1.0) && near(q.colors[0], 1.0));
+    check("a missing file is an error", !obj_load("tests/data/missing.obj").ok);
+    string bad = "v 0 0 0\nf 1 2 3\n";
+    Result<Gltf, string> r = obj_parse(bad, null);
+    check("an index out of range is an error", !r.ok && strstr(r.error, "line 2") != null);
+    int64 n = 0;
+    *uint8 text = fs_read_all("tests/data/quad.obj", &n);
+    defer free(text);
+    *uint8 copy = alloc<uint8>(n + 1);
+    defer free(copy);
+    uint32 seed = 777;
+    for (round in 0..600) {
+        memcpy(copy, text, n);
+        copy[n] = 0;
+        if (round < (int)n) copy[round] = 0;
+        for (k in 0..3) {
+            seed = seed * 1103515245 + 12345;
+            int64 at = (int64)(seed >> 8) % n;
+            uint8[8] pick = {'/', '-', ' ', '\n', '9', 'f', 'v', '.'};
+            copy[at] = pick[(int)((seed >> 4) & 7)];
+        }
+        Result<Gltf, string> m = obj_parse((string)copy, "tests/data");
+        if (m.ok) m.value.free();
+    }
+    *uint8 mtl = fs_read_all("tests/data/quad.mtl", &n);
+    defer free(mtl);
+    *uint8 mcopy = alloc<uint8>(n + 1);
+    defer free(mcopy);
+    for (round in 0..600) {
+        memcpy(mcopy, mtl, n);
+        mcopy[n] = 0;
+        if (round < (int)n) mcopy[round] = 0;
+        for (k in 0..3) {
+            seed = seed * 1103515245 + 12345;
+            int64 at = (int64)(seed >> 8) % n;
+            uint8[8] pick = {'-', ' ', '\n', '9', 'm', 'd', '.', 'x'};
+            mcopy[at] = pick[(int)((seed >> 4) & 7)];
+        }
+        _Obj o;
+        String_append(&o.dir, "tests/data");
+        _obj_parse_mtl(&o, (*char)mcopy);
+        _obj_cleanup(&o);
+        Gltf_free(&o.g);
+    }
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuTexture target = gpu.target(64, 64)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(64, 64)?;
+    defer depth.release();
+    GpuModel model = gpu.model(&g, target.format)?;
+    defer model.release();
+    GpuCamera cam = gpu_camera(Vec3{0.0, 0.0, 2.5}, Vec3{0.0, 0.0, 0.0}, 0.8, 1.0, 0.1, 5.0);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &depth);
+    model.draw(&pass, &cam);
+    pass.end()?;
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    target.read(px)?;
+    expect("top left is red", pixel(px, 16, 16), 0xff0000);
+    expect("top right is green", pixel(px, 48, 16), 0x00ff00);
+    expect("bottom left is blue", pixel(px, 16, 48), 0x0000ff);
+    expect("bottom right is white", pixel(px, 48, 48), 0xffffff);
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("obj: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}

@@ -5,6 +5,11 @@ textured_quad.glb: a 2x2 quad facing +Z with a 4x4 PNG texture (red, green,
 blue and white quadrants), a nearest sampler, KHR_materials_unlit, and
 positions stored as a sparse accessor over a zero-filled view.
 
+quad.obj (+ quad.mtl, quad_tex.png): the same quad as an OBJ with an unlit
+textured material (illum 0, map_Kd with options), negative indices and a
+four-corner face, plus a second object with vertex colors, a translucent
+material and a bump map.
+
 skin_anim.gltf: a skinned strip (triangle strip mode) over two joints, with
 the buffer embedded as base64, and one animation with a LINEAR rotation, a
 STEP translation and a CUBICSPLINE scale.
@@ -141,6 +146,30 @@ def skin_anim():
         json.dump(j, f, indent=1)
 
 
+def quad_obj():
+    px = []
+    for y in range(4):
+        for x in range(4):
+            if y < 2:
+                px += [255, 0, 0, 255] if x < 2 else [0, 255, 0, 255]
+            else:
+                px += [0, 0, 255, 255] if x < 2 else [255, 255, 255, 255]
+    with open(os.path.join(OUT, "quad_tex.png"), "wb") as f:
+        f.write(png(4, 4, bytes(px)))
+    with open(os.path.join(OUT, "quad.mtl"), "w") as f:
+        f.write("# test materials\n"
+                "newmtl flat\nKd 1 1 1\nillum 0\nmap_Kd -s 1 1 1 -clamp on quad_tex.png\n\n"
+                "newmtl glass\nKd 0.2 0.4 0.6\nd 0.5\nNs 98\nKe 0.1 0 0\nbump -bm 0.5 quad_tex.png\n")
+    with open(os.path.join(OUT, "quad.obj"), "w") as f:
+        f.write("# a quad facing +Z\nmtllib quad.mtl\no quad\n"
+                "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\n"
+                "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0 0 1\n"
+                "usemtl flat\nf -4/-4/-1 -3/-3/-1 -2/-2/-1 -1/-1/-1\n"
+                "o behind\nv 0 0 10 1 0 0\nv 1 0 10 0 1 0\nv 0 1 10 0 0 1\n"
+                "usemtl glass\nf 5 6 7\n")
+
+
 os.makedirs(OUT, exist_ok=True)
+quad_obj()
 textured_quad()
 skin_anim()

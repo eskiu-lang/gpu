@@ -1,0 +1,581 @@
+// obj.esk: Wavefront OBJ models with their MTL materials and textures.
+//
+// obj_load returns the same Gltf that gltf_load does, so <gpu/model> draws an
+// OBJ file as it draws a glTF one:
+//
+//     Gltf data = obj_load("chair.obj")?;
+//     defer data.free();
+//     GpuModel model = gpu.model(&data, surface.format)?;
+//
+// Each `o` object becomes a mesh with one node, and each material used in it a
+// primitive. Faces may be polygons (triangulated as fans), indices may be
+// negative, and `v` may carry a vertex color. The MTL is read into glTF's
+// metallic-roughness terms: Kd and map_Kd are the base color, d (or Tr) its
+// alpha, Ke and map_Ke the emission, bump/map_Bump/norm the normal map (with
+// -bm), Ns the roughness (or Pr and Pm from the PBR extension), and illum 0
+// draws the color unlit. Textures are read relative to the MTL file; a texture
+// file that is missing leaves the material untextured. OBJ texture coordinates
+// count v from the bottom; they are flipped to glTF's top-down convention.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <fs>;
+import <path>;
+import <libc>;
+import <gpu/math>;
+import <gpu/gltf>;
+
+struct _ObjKey {
+    int v;
+    int t;
+    int n;
+    uint32 out;
+    bool used;
+}
+
+struct _ObjPrim {
+    int mesh;
+    int material;
+    List<float> pos;
+    List<float> uv;
+    List<float> nrm;
+    List<float> col;
+    List<uint32> idx;
+    *_ObjKey table;
+    uint32 cap;
+    uint32 count;
+    bool all_uv;
+    bool all_n;
+}
+
+struct _Obj {
+    Gltf g;
+    List<float> v;
+    List<float> vc;
+    List<float> vt;
+    List<float> vn;
+    bool has_colors;
+    List<_ObjPrim> prims;
+    List<String> mat_names;
+    List<String> image_paths;
+    int mesh;
+    int material;
+    int line;
+    String dir;
+}
+
+String _obj_err;
+
+string _obj_fail(int line, string what) {
+    String_clear(&_obj_err);
+    if (line > 0) String_appendf(&_obj_err, "obj: line %d: %s", line, what);
+    else String_appendf(&_obj_err, "obj: %s", what);
+    return _obj_err.data;
+}
+
+*char _obj_skip(*char p) {
+    while (*p == ' ' || *p == '\t') p = p + 1;
+    return p;
+}
+
+bool _obj_end(*char p) {
+    return *p == 0 || *p == '\n' || *p == '\r' || *p == '#';
+}
+
+// Reads up to n numbers after p into out; returns how many were read.
+int _obj_floats(*char p, *float out, int n) {
+    int got = 0;
+    while (got < n) {
+        p = _obj_skip(p);
+        if (_obj_end(p)) break;
+        *char end = p;
+        double d = strtod((string)p, (*string)&end);
+        if (end == p) break;
+        out[got] = (float)d;
+        got++;
+        p = end;
+    }
+    return got;
+}
+
+// The keyword at p (up to a blank) compared with kw.
+bool _obj_is(*char p, string kw) {
+    int i = 0;
+    while (kw[i] != 0) {
+        if (p[i] != kw[i]) return false;
+        i++;
+    }
+    return p[i] == ' ' || p[i] == '\t' || p[i] == 0 || p[i] == '\n' || p[i] == '\r';
+}
+
+// The rest of the line from p, trimmed, into out.
+void _obj_rest(*char p, String* out) {
+    String_clear(out);
+    p = _obj_skip(p);
+    *char e = p;
+    while (*e != 0 && *e != '\n' && *e != '\r') e = e + 1;
+    while (e > p && (e[-1] == ' ' || e[-1] == '\t')) e = e - 1;
+    for (*char c = p; c < e; c = c + 1) String_push(out, *c == '\\' ? '/' : *c);
+    if (out.data == null) String_append(out, "");
+}
+
+int _obj_new_mesh(*_Obj o, string name) {
+    GltfMesh mesh;
+    if (name != null) String_append(&mesh.name, name);
+    List_push(&o.g.meshes, mesh);
+    GltfNode node;
+    node.mesh = o.g.meshes.size - 1;
+    node.skin = -1;
+    node.parent = -1;
+    node.rotation = quat_identity();
+    node.scale = Vec3{1.0, 1.0, 1.0};
+    if (name != null) String_append(&node.name, name);
+    List_push(&o.g.nodes, node);
+    List_push(&o.g.roots, o.g.nodes.size - 1);
+    return o.g.meshes.size - 1;
+}
+
+_ObjPrim* _obj_prim(*_Obj o) {
+    if (o.mesh < 0) o.mesh = _obj_new_mesh(o, null);
+    for (i in 0..o.prims.size) {
+        _ObjPrim* p = &o.prims.data[i];
+        if (p.mesh == o.mesh && p.material == o.material) return p;
+    }
+    _ObjPrim p;
+    p.mesh = o.mesh;
+    p.material = o.material;
+    p.cap = 1024;
+    p.table = alloc<_ObjKey>((int64)p.cap);
+    p.all_uv = true;
+    p.all_n = true;
+    List_push(&o.prims, p);
+    return &o.prims.data[o.prims.size - 1];
+}
+
+uint32 _obj_hash(int v, int t, int n) {
+    uint32 h = (uint32)v * 2654435761 ^ (uint32)t * 2246822519 ^ (uint32)n * 3266489917;
+    return h ^ (h >> 15);
+}
+
+void _obj_grow(_ObjPrim* p) {
+    uint32 old = p.cap;
+    *_ObjKey t = p.table;
+    p.cap = old * 2;
+    p.table = alloc<_ObjKey>((int64)p.cap);
+    for (i in 0..old) {
+        if (!t[i].used) continue;
+        uint32 at = _obj_hash(t[i].v, t[i].t, t[i].n) & (p.cap - 1);
+        while (p.table[at].used) at = (at + 1) & (p.cap - 1);
+        p.table[at] = t[i];
+    }
+    free(t);
+}
+
+// The primitive's vertex for position v, texcoord t and normal n (0-based, -1
+// when absent), added on first use.
+uint32 _obj_vertex(*_Obj o, _ObjPrim* p, int v, int t, int n) {
+    if (p.count * 2 >= p.cap) _obj_grow(p);
+    uint32 at = _obj_hash(v, t, n) & (p.cap - 1);
+    while (p.table[at].used) {
+        _ObjKey* k = &p.table[at];
+        if (k.v == v && k.t == t && k.n == n) return k.out;
+        at = (at + 1) & (p.cap - 1);
+    }
+    uint32 out = p.count;
+    p.table[at] = _ObjKey{v, t, n, out, true};
+    p.count++;
+    for (k in 0..3) List_push(&p.pos, o.v.data[v * 3 + k]);
+    if (o.has_colors) {
+        for (k in 0..3) List_push(&p.col, o.vc.data[v * 3 + k]);
+    }
+    if (t >= 0) {
+        List_push(&p.uv, o.vt.data[t * 2]);
+        List_push(&p.uv, 1.0 - o.vt.data[t * 2 + 1]);
+    } else {
+        List_push(&p.uv, 0.0);
+        List_push(&p.uv, 0.0);
+        p.all_uv = false;
+    }
+    if (n >= 0) {
+        for (k in 0..3) List_push(&p.nrm, o.vn.data[n * 3 + k]);
+    } else {
+        for (k in 0..3) List_push(&p.nrm, 0.0);
+        p.all_n = false;
+    }
+    return out;
+}
+
+// Parses one index of a face corner ("7", "-1"); 0 when absent. Moves *pp.
+int _obj_index(*char* pp) {
+    *char p = *pp;
+    bool neg = false;
+    if (*p == '-') {
+        neg = true;
+        p = p + 1;
+    }
+    int v = 0;
+    bool any = false;
+    while (*p >= '0' && *p <= '9') {
+        if (v < 100000000) v = v * 10 + (int)(*p - '0');
+        p = p + 1;
+        any = true;
+    }
+    *pp = p;
+    if (!any) return 0;
+    return neg ? -v : v;
+}
+
+// Resolves a 1-based (or negative, relative) index into count items; -1 when
+// absent, -2 when out of range.
+int _obj_resolve(int i, int count) {
+    if (i == 0) return -1;
+    int r = i > 0 ? i - 1 : count + i;
+    if (r < 0 || r >= count) return -2;
+    return r;
+}
+
+string _obj_face(*_Obj o, *char p) {
+    _ObjPrim* prim = _obj_prim(o);
+    uint32[3] first;
+    uint32 prev = 0;
+    int corners = 0;
+    int nv = o.v.size / 3;
+    int nt = o.vt.size / 2;
+    int nn = o.vn.size / 3;
+    while (true) {
+        p = _obj_skip(p);
+        if (_obj_end(p)) break;
+        int vi = _obj_index(&p);
+        int ti = 0;
+        int ni = 0;
+        if (*p == '/') {
+            p = p + 1;
+            ti = _obj_index(&p);
+            if (*p == '/') {
+                p = p + 1;
+                ni = _obj_index(&p);
+            }
+        }
+        if (*p != ' ' && *p != '\t' && !_obj_end(p)) return _obj_fail(o.line, "bad face");
+        int v = _obj_resolve(vi, nv);
+        int t = _obj_resolve(ti, nt);
+        int n = _obj_resolve(ni, nn);
+        if (v < 0 || t == -2 || n == -2) return _obj_fail(o.line, "face index out of range");
+        uint32 id = _obj_vertex(o, prim, v, t, n);
+        if (corners == 0) first[0] = id;
+        if (corners >= 2) {
+            List_push(&prim.idx, first[0]);
+            List_push(&prim.idx, prev);
+            List_push(&prim.idx, id);
+        }
+        prev = id;
+        corners++;
+    }
+    if (corners < 3 && corners > 0) return _obj_fail(o.line, "a face needs three corners");
+    return null;
+}
+
+// An image's index for the file name (relative to the MTL's directory), read
+// once; -1 when the file cannot be read.
+int _obj_image(*_Obj o, string name) {
+    String full;
+    defer String_free(&full);
+    if (o.dir.data != null && o.dir.len > 0 && path_is_absolute(name) == 0) path_join(&full, o.dir.data, name);
+    else String_append(&full, name);
+    for (i in 0..o.image_paths.size) {
+        if (strcmp(o.image_paths.data[i].data, full.data) == 0) return i;
+    }
+    int64 n = 0;
+    *uint8 data = fs_read_all(full.data, &n);
+    if (data == null) return -1;
+    GltfImage img;
+    String_append(&img.name, name);
+    String ext;
+    defer String_free(&ext);
+    path_extension(&ext, name);
+    String_append(&img.mime, ext.data != null && (strcmp(ext.data, ".jpg") == 0 || strcmp(ext.data, ".jpeg") == 0
+        || strcmp(ext.data, ".JPG") == 0 || strcmp(ext.data, ".JPEG") == 0) ? "image/jpeg" : "image/png");
+    img.data = data;
+    img.len = (uint64)n;
+    img.owned = true;
+    List_push(&o.g.images, img);
+    String copy;
+    String_append(&copy, full.data);
+    List_push(&o.image_paths, copy);
+    return o.g.images.size - 1;
+}
+
+// A texture map line ("map_Kd -s 1 1 1 -clamp on wood.png"): sets ref to a
+// texture of the file, and *scale to a -bm value.
+void _obj_map(*_Obj o, *char p, GltfTextureRef* ref, *float scale) {
+    bool clamp = false;
+    String tok;
+    defer String_free(&tok);
+    p = _obj_skip(p);
+    while (*p == '-') {
+        p = _obj_token(p, &tok);
+        bool numeric3 = strcmp(tok.data, "-o") == 0 || strcmp(tok.data, "-s") == 0 || strcmp(tok.data, "-t") == 0;
+        int args = strcmp(tok.data, "-mm") == 0 ? 2 : 1;
+        bool bm = strcmp(tok.data, "-bm") == 0;
+        bool cl = strcmp(tok.data, "-clamp") == 0;
+        if (numeric3) {
+            for (a in 0..3) {
+                *char q = _obj_skip(p);
+                *char end = q;
+                strtod((string)q, (*string)&end);
+                if (end == q || _obj_end(q)) break;
+                p = end;
+            }
+        } else {
+            for (a in 0..args) {
+                p = _obj_token(p, &tok);
+                if (bm && scale != null) *scale = (float)atof(tok.data);
+                if (cl) clamp = strcmp(tok.data, "on") == 0;
+            }
+        }
+        p = _obj_skip(p);
+    }
+    String name;
+    defer String_free(&name);
+    _obj_rest(p, &name);
+    if (name.len == 0) return;
+    int img = _obj_image(o, name.data);
+    if (img < 0) return;
+    List_push(&o.g.textures, GltfTexture{img, clamp ? 1 : 0});
+    *ref = GltfTextureRef{o.g.textures.size - 1, 0, 1.0};
+}
+
+// The next blank-separated token after p into out; returns where it ends.
+*char _obj_token(*char p, String* out) {
+    String_clear(out);
+    p = _obj_skip(p);
+    while (*p != 0 && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+        String_push(out, *p);
+        p = p + 1;
+    }
+    if (out.data == null) String_append(out, "");
+    return p;
+}
+
+GltfMaterial _obj_default_material() {
+    GltfTextureRef none = GltfTextureRef{-1, 0, 1.0};
+    return GltfMaterial{base_color: Vec4{0.8, 0.8, 0.8, 1.0}, metallic: 0.0, roughness: 0.7,
+        base_color_texture: none, metallic_roughness_texture: none, normal_texture: none,
+        occlusion_texture: none, emissive_texture: none, alpha_cutoff: 0.5};
+}
+
+string _obj_read_mtl(*_Obj o, string name) {
+    String full;
+    defer String_free(&full);
+    if (o.dir.data != null && o.dir.len > 0 && path_is_absolute(name) == 0) path_join(&full, o.dir.data, name);
+    else String_append(&full, name);
+    int64 n = 0;
+    *uint8 data = fs_read_all(full.data, &n);
+    if (data == null) return null;
+    defer free(data);
+    _obj_parse_mtl(o, (*char)data);
+    return null;
+}
+
+void _obj_parse_mtl(*_Obj o, *char p) {
+    GltfMaterial* m = null;
+    bool has_pr = false;
+    float[3] f;
+    while (*p != 0) {
+        *char line = _obj_skip(p);
+        while (*p != 0 && *p != '\n') p = p + 1;
+        if (*p == '\n') p = p + 1;
+        if (_obj_is(line, "newmtl")) {
+            GltfMaterial mat = _obj_default_material();
+            String mname;
+            _obj_rest(line + 6, &mname);
+            String_append(&mat.name, mname.data);
+            List_push(&o.g.materials, mat);
+            List_push(&o.mat_names, mname);
+            m = &o.g.materials.data[o.g.materials.size - 1];
+            has_pr = false;
+            continue;
+        }
+        if (m == null) continue;
+        if (_obj_is(line, "Kd") && _obj_floats(line + 2, &f[0], 3) == 3) m.base_color = Vec4{f[0], f[1], f[2], m.base_color.w};
+        else if (_obj_is(line, "d") && _obj_floats(line + 1, &f[0], 1) == 1) m.base_color.w = f[0];
+        else if (_obj_is(line, "Tr") && _obj_floats(line + 2, &f[0], 1) == 1) m.base_color.w = 1.0 - f[0];
+        else if (_obj_is(line, "Ke") && _obj_floats(line + 2, &f[0], 3) == 3) m.emissive = Vec3{f[0], f[1], f[2]};
+        else if (_obj_is(line, "Ns") && _obj_floats(line + 2, &f[0], 1) == 1 && !has_pr) {
+            float r = (float)sqrt(2.0 / ((double)f[0] + 2.0));
+            m.roughness = r < 0.05 ? 0.05 : (r > 1.0 ? 1.0 : r);
+        }
+        else if (_obj_is(line, "Pr") && _obj_floats(line + 2, &f[0], 1) == 1) {
+            m.roughness = f[0];
+            has_pr = true;
+        }
+        else if (_obj_is(line, "Pm") && _obj_floats(line + 2, &f[0], 1) == 1) m.metallic = f[0];
+        else if (_obj_is(line, "illum") && _obj_floats(line + 5, &f[0], 1) == 1) m.unlit = f[0] == 0.0;
+        else if (_obj_is(line, "map_Kd")) _obj_map(o, line + 6, &m.base_color_texture, null);
+        else if (_obj_is(line, "map_Ke")) {
+            _obj_map(o, line + 6, &m.emissive_texture, null);
+            if (m.emissive_texture.texture >= 0 && m.emissive.x == 0.0 && m.emissive.y == 0.0 && m.emissive.z == 0.0) {
+                m.emissive = Vec3{1.0, 1.0, 1.0};
+            }
+        }
+        else if (_obj_is(line, "map_d")) {
+            if (m.alpha_mode == GLTF_OPAQUE) m.alpha_mode = GLTF_MASK;
+        }
+        else if (_obj_is(line, "bump") || _obj_is(line, "map_Bump") || _obj_is(line, "map_bump") || _obj_is(line, "norm")) {
+            float scale = 1.0;
+            int skip = _obj_is(line, "bump") ? 4 : (_obj_is(line, "norm") ? 4 : 8);
+            _obj_map(o, line + skip, &m.normal_texture, &scale);
+            m.normal_texture.scale = scale;
+        }
+    }
+    for (i in 0..o.g.materials.size) {
+        GltfMaterial* mm = &o.g.materials.data[i];
+        if (mm.base_color.w < 1.0) mm.alpha_mode = GLTF_BLEND;
+    }
+}
+
+int _obj_find_material(*_Obj o, string name) {
+    for (i in 0..o.mat_names.size) {
+        if (strcmp(o.mat_names.data[i].data, name) == 0) return i;
+    }
+    return -1;
+}
+
+string _obj_parse(*_Obj o, *char p) {
+    String word;
+    defer String_free(&word);
+    float[6] f;
+    o.mesh = -1;
+    o.material = -1;
+    while (*p != 0) {
+        o.line++;
+        *char line = _obj_skip(p);
+        while (*p != 0 && *p != '\n') p = p + 1;
+        if (*p == '\n') p = p + 1;
+        if (line[0] == 'v' && (line[1] == ' ' || line[1] == '\t')) {
+            int n = _obj_floats(line + 1, &f[0], 6);
+            if (n < 3) return _obj_fail(o.line, "a vertex needs x, y and z");
+            for (k in 0..3) List_push(&o.v, f[k]);
+            if (n == 6) {
+                o.has_colors = true;
+                for (k in 3..6) List_push(&o.vc, f[k]);
+            } else {
+                for (k in 0..3) List_push(&o.vc, 1.0);
+            }
+        } else if (line[0] == 'v' && line[1] == 't') {
+            f[1] = 0.0;
+            if (_obj_floats(line + 2, &f[0], 2) < 1) return _obj_fail(o.line, "bad texture coordinate");
+            List_push(&o.vt, f[0]);
+            List_push(&o.vt, f[1]);
+        } else if (line[0] == 'v' && line[1] == 'n') {
+            if (_obj_floats(line + 2, &f[0], 3) < 3) return _obj_fail(o.line, "a normal needs x, y and z");
+            for (k in 0..3) List_push(&o.vn, f[k]);
+        } else if (line[0] == 'f' && (line[1] == ' ' || line[1] == '\t')) {
+            string err = _obj_face(o, line + 1);
+            if (err != null) return err;
+        } else if (_obj_is(line, "o") || _obj_is(line, "g")) {
+            _obj_rest(line + 1, &word);
+            if (_obj_is(line, "o") || o.mesh < 0) o.mesh = _obj_new_mesh(o, word.data);
+        } else if (_obj_is(line, "usemtl")) {
+            _obj_rest(line + 6, &word);
+            o.material = _obj_find_material(o, word.data);
+        } else if (_obj_is(line, "mtllib")) {
+            _obj_rest(line + 6, &word);
+            if (word.len == 0) continue;
+            string err = _obj_read_mtl(o, word.data);
+            if (err != null) return err;
+        }
+    }
+    return null;
+}
+
+// Moves the built primitives into their meshes.
+void _obj_finish(*_Obj o) {
+    int nmat = o.g.materials.size;
+    for (i in 0..o.prims.size) {
+        _ObjPrim* b = &o.prims.data[i];
+        free(b.table);
+        if (b.idx.size == 0) continue;
+        GltfPrimitive p;
+        p.mode = GLTF_TRIANGLES;
+        p.material = b.material >= 0 && b.material < nmat ? b.material : -1;
+        p.vertex_count = b.count;
+        p.positions = b.pos.data;
+        p.uvs = b.uv.data;
+        p.normals = b.all_n ? b.nrm.data : null;
+        if (!b.all_n) List_free(&b.nrm);
+        if (o.has_colors) {
+            p.colors = alloc<float>((int64)b.count * 4 + 1);
+            bool have = b.col.size == (int)b.count * 3;
+            for (k in 0..b.count) {
+                for (c in 0..3) p.colors[k * 4 + c] = have ? b.col.data[k * 3 + c] : 1.0;
+                p.colors[k * 4 + 3] = 1.0;
+            }
+        }
+        List_free(&b.col);
+        p.index_count = (uint32)b.idx.size;
+        p.indices = b.idx.data;
+        p.min = Vec3{p.positions[0], p.positions[1], p.positions[2]};
+        p.max = p.min;
+        for (k in 0..p.vertex_count) {
+            Vec3 v = Vec3{p.positions[k * 3], p.positions[k * 3 + 1], p.positions[k * 3 + 2]};
+            p.min = Vec3{v.x < p.min.x ? v.x : p.min.x, v.y < p.min.y ? v.y : p.min.y, v.z < p.min.z ? v.z : p.min.z};
+            p.max = Vec3{v.x > p.max.x ? v.x : p.max.x, v.y > p.max.y ? v.y : p.max.y, v.z > p.max.z ? v.z : p.max.z};
+        }
+        List_push(&o.g.meshes.data[b.mesh].primitives, p);
+    }
+}
+
+void _obj_cleanup(*_Obj o) {
+    List_free(&o.v);
+    List_free(&o.vc);
+    List_free(&o.vt);
+    List_free(&o.vn);
+    for (i in 0..o.mat_names.size) String_free(&o.mat_names.data[i]);
+    List_free(&o.mat_names);
+    for (i in 0..o.image_paths.size) String_free(&o.image_paths.data[i]);
+    List_free(&o.image_paths);
+    List_free(&o.prims);
+    String_free(&o.dir);
+}
+
+// Parses OBJ text held in memory (NUL-terminated). The MTL files and textures
+// it names are read relative to base_dir (null for the current directory).
+Result<Gltf, string> obj_parse(string text, string base_dir) {
+    _Obj o;
+    if (base_dir != null) String_append(&o.dir, base_dir);
+    List_push(&o.g.samplers, GltfSampler{9729, 9987, 10497, 10497});
+    List_push(&o.g.samplers, GltfSampler{9729, 9987, 33071, 33071});
+    string err = _obj_parse(&o, (*char)text);
+    if (err != null) {
+        for (i in 0..o.prims.size) {
+            _ObjPrim* b = &o.prims.data[i];
+            free(b.table);
+            List_free(&b.pos);
+            List_free(&b.uv);
+            List_free(&b.nrm);
+            List_free(&b.col);
+            List_free(&b.idx);
+        }
+        _obj_cleanup(&o);
+        Gltf_free(&o.g);
+        return Err<Gltf, string>(err);
+    }
+    _obj_finish(&o);
+    _obj_cleanup(&o);
+    return Ok<Gltf, string>(o.g);
+}
+
+Result<Gltf, string> obj_load(string path) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<Gltf, string>(_obj_fail(0, "cannot read the file"));
+    defer free(data);
+    String dir;
+    defer String_free(&dir);
+    path_dirname(&dir, path);
+    return obj_parse((string)data, dir.data);
+}

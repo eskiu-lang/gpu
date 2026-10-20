@@ -1,0 +1,12 @@
+# test materials
+newmtl flat
+Kd 1 1 1
+illum 0
+map_Kd -s 1 1 1 -clamp on quad_tex.png
+
+newmtl glass
+Kd 0.2 0.4 0.6
+d 0.5
+Ns 98
+Ke 0.1 0 0
+bump -bm 0.5 quad_tex.png
