@@ -3,7 +3,7 @@
 </p>
 
 <h2 align="center">gpu</h2>
-<p align="center">GPU compute and rendering for Eskiu, over WebGPU.</p>
+<p align="center">GPU compute, rendering and glTF models for Eskiu, over WebGPU.</p>
 <p align="center"><sub>Part of the <a href="https://github.com/eskiu-lang">Eskiu</a> project</sub></p>
 <p align="center">
   <a href="https://eskiu-lang.org">eskiu-lang.org</a> &nbsp;&middot;&nbsp;
@@ -29,6 +29,10 @@ Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
   Eskiu memory.
 - **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
   render pipelines and passes, to an offscreen texture or a window.
+- **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`) and `<gpu/model>` draws it
+  with physically based shading, normal maps, alpha modes, skinning and animation.
+- **Images.** `<gpu/image>` decodes PNG and JPEG (baseline and progressive) in pure Eskiu;
+  textures can be sRGB and mipmapped.
 - **Windows and input.** `<gpu/window>` opens a window over SDL3 and gives its surface
   and its keyboard and mouse events.
 - **Errors as `Result`.** Every call that can fail returns one, with the message from the
@@ -37,8 +41,10 @@ Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
   with every struct's layout checked against the C compiler.
 
 <p align="center">
-  <img src="assets/cube.png" alt="A textured cube rendered offscreen by tests/render_cube.esk" width="256">
+  <img src="assets/helmet.png" alt="The DamagedHelmet glTF model drawn by <gpu/model>" width="300">
+  <img src="assets/cube.png" alt="A textured cube rendered offscreen by tests/render_cube.esk" width="300">
 </p>
+<p align="center"><sub>DamagedHelmet by theblueturtle_ (CC BY 4.0), from the Khronos glTF sample assets.</sub></p>
 
 ## Compute
 
@@ -114,9 +120,51 @@ Mat4 mvp = proj * view * mat4_trs(position, spin, Vec3{1.0, 1.0, 1.0});
 ub.write(0, &mvp, sizeof(Mat4));
 ```
 
+Textures come from pixels or files. `<gpu/image>` decodes PNG and JPEG, and
+`Gpu_image_with` stores them as sRGB (for color) with mipmaps; `Gpu_sampler_with` picks the
+filtering, wrapping and anisotropy:
+
+```eskiu
+Image img = image_load("albedo.jpg")?;
+defer img.free();
+GpuImageOptions o = GpuImageOptions{srgb: true, mipmaps: true};
+GpuTexture tex = gpu.image_with(img.width, img.height, img.rgba, &o)?;
+GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, anisotropy: 8, wrap_u: WGPUAddressMode_ClampToEdge};
+GpuSampler samp = gpu.sampler_with(&so)?;
+```
+
 In a uniform or storage buffer a WGSL `vec3<f32>` takes 16 bytes, so a field the shader
 reads as `vec3` is a `Vec4` (or a `Vec3` and a `float`) on the Eskiu side. Both quit with Escape, or after N frames
 with `--frames N`.
+
+## Models
+
+```eskiu
+Gltf data = gltf_load("helmet.glb")?;
+defer data.free();
+GpuModel model = gpu.model(&data, surface.format)?;
+defer model.release();
+
+// every frame
+data.animate(0, seconds);
+model.update(mat4_identity());
+GpuCamera cam = model.camera(aspect);
+GpuPass pass = gpu.pass(frame.view, GpuColor{0.1, 0.1, 0.1, 1.0}, &depth);
+model.draw(&pass, &cam);
+pass.end()?;
+```
+
+The loader reads meshes (every attribute type, sparse accessors, strips and fans), PBR
+materials with their textures and samplers, the node hierarchy, skins and animations
+(linear, step and cubic spline), from `.glb` files or `.gltf` files with external or
+embedded buffers. `KHR_mesh_quantization`, `KHR_materials_unlit` and
+`KHR_materials_emissive_strength` are supported. The renderer shades with glTF's
+metallic-roughness model under one directional light (`model.light`) and a hemisphere
+ambient term. [`examples/model.esk`](examples/model.esk) is a viewer: drag to orbit, scroll
+to zoom, space pauses the animation.
+
+Not supported yet: morph targets, image-based lighting and shadows, Draco and meshopt
+compression, and KTX2 textures.
 
 ## Install
 
@@ -147,6 +195,9 @@ to the executable.
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
 | `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window surfaces |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 (links SDL3) |
+| `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
+| `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
+| `<gpu/model>` | `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight` |
 | `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
 | `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
 | `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
@@ -163,6 +214,7 @@ adapter it ran on. The tests and the layout check run with:
 ```bash
 eskiuc test -L/opt/homebrew/lib
 tools/gen.py $(brew --prefix wgpu-native)/include            # regenerates src/raw.esk
+python3 -I tools/gen_test_models.py                          # regenerates the glTF test models
 tools/layout_check.sh $(brew --prefix wgpu-native)/include /opt/homebrew/lib
 ```
 
