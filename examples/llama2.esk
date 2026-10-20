@@ -1,0 +1,695 @@
+// Llama 2 inference in Eskiu, after Andrej Karpathy's llama2.c: the same
+// checkpoint and tokenizer formats, the same forward pass and sampling, so
+// greedy output (-t 0) matches run.c token for token.
+//
+//     llama2 stories15M.bin -z tokenizer.bin -t 0 -n 256 -i "Once upon a time"
+//
+// It runs on the GPU through <gpu/nn> (--cpu for the plain C-like loop, --f16
+// to keep the weight matrices in f16, half the memory traffic).
+//
+// Models: https://huggingface.co/karpathy/tinyllamas (stories15M/42M/110M.bin);
+// tokenizer.bin comes with llama2.c.
+
+import <io>;
+import <mem>;
+import <string>;
+import <map>;
+import <fs>;
+import <time>;
+import <libc>;
+import <gpu>;
+import <gpu/nn>;
+
+struct Config {
+    int dim;
+    int hidden_dim;
+    int n_layers;
+    int n_heads;
+    int n_kv_heads;
+    int vocab_size;
+    int seq_len;
+}
+
+struct Weights {
+    *float token_embedding;
+    *float rms_att;
+    *float wq;
+    *float wk;
+    *float wv;
+    *float wo;
+    *float rms_ffn;
+    *float w1;
+    *float w2;
+    *float w3;
+    *float rms_final;
+    *float wcls;
+}
+
+struct RunState {
+    *float x;
+    *float xb;
+    *float xb2;
+    *float hb;
+    *float hb2;
+    *float q;
+    *float att;
+    *float logits;
+    *float key_cache;
+    *float value_cache;
+}
+
+struct Transformer {
+    Config c;
+    Weights w;
+    RunState s;
+    *uint8 data;
+}
+
+struct Tokenizer {
+    **char vocab;
+    *float scores;
+    int vocab_size;
+    int max_token_length;
+    Map<int> lookup;
+    uint8[512] byte_pieces;
+}
+
+struct ProbIndex {
+    float prob;
+    int index;
+}
+
+struct Sampler {
+    int vocab_size;
+    *ProbIndex probindex;
+    float temperature;
+    float topp;
+    uint64 rng;
+}
+
+// ── Model ────────────────────────────────────────────────────────────────────
+
+string load_transformer(Transformer* t, string path) {
+    int64 n = 0;
+    t.data = fs_read_all(path, &n);
+    if (t.data == null) return "cannot read the checkpoint";
+    if (n < 28) return "the checkpoint is too short";
+    memcpy(&t.c, t.data, 28);
+    Config* p = &t.c;
+    bool shared = p.vocab_size > 0;
+    if (p.vocab_size < 0) p.vocab_size = -p.vocab_size;
+    int head_size = p.dim / p.n_heads;
+    int64 layers = (int64)p.n_layers;
+    *float ptr = (*float)(t.data + 28);
+    Weights* w = &t.w;
+    w.token_embedding = ptr;
+    ptr = ptr + (int64)p.vocab_size * p.dim;
+    w.rms_att = ptr;
+    ptr = ptr + layers * p.dim;
+    w.wq = ptr;
+    ptr = ptr + layers * p.dim * (p.n_heads * head_size);
+    w.wk = ptr;
+    ptr = ptr + layers * p.dim * (p.n_kv_heads * head_size);
+    w.wv = ptr;
+    ptr = ptr + layers * p.dim * (p.n_kv_heads * head_size);
+    w.wo = ptr;
+    ptr = ptr + layers * (p.n_heads * head_size) * p.dim;
+    w.rms_ffn = ptr;
+    ptr = ptr + layers * p.dim;
+    w.w1 = ptr;
+    ptr = ptr + layers * p.dim * p.hidden_dim;
+    w.w2 = ptr;
+    ptr = ptr + layers * p.hidden_dim * p.dim;
+    w.w3 = ptr;
+    ptr = ptr + layers * p.dim * p.hidden_dim;
+    w.rms_final = ptr;
+    ptr = ptr + p.dim;
+    ptr = ptr + (int64)p.seq_len * head_size / 2;
+    ptr = ptr + (int64)p.seq_len * head_size / 2;
+    w.wcls = shared ? w.token_embedding : ptr;
+    int kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+    RunState* s = &t.s;
+    s.x = alloc<float>(p.dim);
+    s.xb = alloc<float>(p.dim);
+    s.xb2 = alloc<float>(p.dim);
+    s.hb = alloc<float>(p.hidden_dim);
+    s.hb2 = alloc<float>(p.hidden_dim);
+    s.q = alloc<float>(p.dim);
+    s.key_cache = alloc<float>((int64)p.n_layers * p.seq_len * kv_dim);
+    s.value_cache = alloc<float>((int64)p.n_layers * p.seq_len * kv_dim);
+    s.att = alloc<float>((int64)p.n_heads * p.seq_len);
+    s.logits = alloc<float>(p.vocab_size);
+    return null;
+}
+
+void rmsnorm(*float o, *float x, *float weight, int size) {
+    float ss = 0.0;
+    for (j in 0..size) ss += x[j] * x[j];
+    ss = ss / (float)size;
+    ss += 0.00001;
+    ss = 1.0 / sqrtf(ss);
+    for (j in 0..size) o[j] = weight[j] * (ss * x[j]);
+}
+
+void softmax(*float x, int size) {
+    float max_val = x[0];
+    for (i in 1..size) {
+        if (x[i] > max_val) max_val = x[i];
+    }
+    float sum = 0.0;
+    for (i in 0..size) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    for (i in 0..size) x[i] = x[i] / sum;
+}
+
+// W (d,n) @ x (n,) -> xout (d,)
+void matmul(*float xout, *float x, *float w, int n, int d) {
+    for (i in 0..d) {
+        float val = 0.0;
+        *float row = w + (int64)i * n;
+        for (j in 0..n) val += row[j] * x[j];
+        xout[i] = val;
+    }
+}
+
+*float forward(Transformer* t, int token, int pos) {
+    Config* p = &t.c;
+    Weights* w = &t.w;
+    RunState* s = &t.s;
+    *float x = s.x;
+    int dim = p.dim;
+    int kv_dim = (p.dim * p.n_kv_heads) / p.n_heads;
+    int kv_mul = p.n_heads / p.n_kv_heads;
+    int hidden_dim = p.hidden_dim;
+    int head_size = dim / p.n_heads;
+    memcpy(x, w.token_embedding + (int64)token * dim, (int64)dim * 4);
+    for (l in 0..p.n_layers) {
+        int64 L = (int64)l;
+        rmsnorm(s.xb, x, w.rms_att + L * dim, dim);
+        int64 loff = L * p.seq_len * kv_dim;
+        *float k = s.key_cache + loff + (int64)pos * kv_dim;
+        *float v = s.value_cache + loff + (int64)pos * kv_dim;
+        matmul(s.q, s.xb, w.wq + L * dim * dim, dim, dim);
+        matmul(k, s.xb, w.wk + L * dim * kv_dim, dim, kv_dim);
+        matmul(v, s.xb, w.wv + L * dim * kv_dim, dim, kv_dim);
+        for (i in 0..dim / 2) {
+            int ii = i * 2;
+            int head_dim = ii % head_size;
+            float freq = 1.0 / powf(10000.0, (float)head_dim / (float)head_size);
+            float val = (float)pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = ii < kv_dim ? 2 : 1;
+            for (r in 0..rotn) {
+                *float vec = r == 0 ? s.q : k;
+                float v0 = vec[ii];
+                float v1 = vec[ii + 1];
+                vec[ii] = v0 * fcr - v1 * fci;
+                vec[ii + 1] = v0 * fci + v1 * fcr;
+            }
+        }
+        float scale = sqrtf((float)head_size);
+        for (h in 0..p.n_heads) {
+            *float q = s.q + h * head_size;
+            *float att = s.att + (int64)h * p.seq_len;
+            for (ti in 0..pos + 1) {
+                *float kk = s.key_cache + loff + (int64)ti * kv_dim + (h / kv_mul) * head_size;
+                float score = 0.0;
+                for (i in 0..head_size) score += q[i] * kk[i];
+                att[ti] = score / scale;
+            }
+            softmax(att, pos + 1);
+            *float xb = s.xb + h * head_size;
+            for (i in 0..head_size) xb[i] = 0.0;
+            for (ti in 0..pos + 1) {
+                *float vv = s.value_cache + loff + (int64)ti * kv_dim + (h / kv_mul) * head_size;
+                float a = att[ti];
+                for (i in 0..head_size) xb[i] += a * vv[i];
+            }
+        }
+        matmul(s.xb2, s.xb, w.wo + L * dim * dim, dim, dim);
+        for (i in 0..dim) x[i] += s.xb2[i];
+        rmsnorm(s.xb, x, w.rms_ffn + L * dim, dim);
+        matmul(s.hb, s.xb, w.w1 + L * dim * hidden_dim, dim, hidden_dim);
+        matmul(s.hb2, s.xb, w.w3 + L * dim * hidden_dim, dim, hidden_dim);
+        for (i in 0..hidden_dim) {
+            float val = s.hb[i];
+            val = val * (1.0 / (1.0 + expf(-val)));
+            s.hb[i] = val * s.hb2[i];
+        }
+        matmul(s.xb, s.hb, w.w2 + L * dim * hidden_dim, hidden_dim, dim);
+        for (i in 0..dim) x[i] += s.xb[i];
+    }
+    rmsnorm(x, x, w.rms_final, dim);
+    matmul(s.logits, x, w.wcls, p.dim, p.vocab_size);
+    return s.logits;
+}
+
+// ── GPU ──────────────────────────────────────────────────────────────────────
+
+struct GpuModelState {
+    Gpu gpu;
+    NnProgram prog;
+    NnTensor x;
+    NnTensor xb;
+    NnTensor xb2;
+    NnTensor hb;
+    NnTensor hb2;
+    NnTensor q;
+    NnTensor kcache;
+    NnTensor vcache;
+    NnTensor logits;
+    NnTensor best;
+    NnTensor emb;
+    NnTensor wq;
+    NnTensor wk;
+    NnTensor wv;
+    NnTensor wo;
+    NnTensor w1;
+    NnTensor w2;
+    NnTensor w3;
+    NnTensor wcls;
+    NnTensor rms_final;
+    List<NnTensor> rms_att;
+    List<NnTensor> rms_ffn;
+}
+
+Result<NnTensor, string> upload(*Gpu gpu, *float data, uint64 count, bool f16) {
+    if (f16) return gpu.nn_upload_f16(data, count);
+    return gpu.nn_upload(data, count);
+}
+
+Result<int, string> gpu_setup(GpuModelState* m, Transformer* t, bool f16) {
+    m.gpu = gpu_open()?;
+    *Gpu g = &m.gpu;
+    if (f16 && !g.f16) f16 = false;
+    Config* p = &t.c;
+    Weights* w = &t.w;
+    uint64 dim = (uint64)p.dim;
+    uint64 hid = (uint64)p.hidden_dim;
+    uint64 L = (uint64)p.n_layers;
+    uint64 kv_dim = (uint64)((p.dim * p.n_kv_heads) / p.n_heads);
+    uint64 head_size = dim / (uint64)p.n_heads;
+    m.x = g.nn_tensor(dim)?;
+    m.xb = g.nn_tensor(dim)?;
+    m.xb2 = g.nn_tensor(dim)?;
+    m.hb = g.nn_tensor(hid)?;
+    m.hb2 = g.nn_tensor(hid)?;
+    m.q = g.nn_tensor(dim)?;
+    m.kcache = g.nn_tensor(L * (uint64)p.seq_len * kv_dim)?;
+    m.vcache = g.nn_tensor(L * (uint64)p.seq_len * kv_dim)?;
+    m.logits = g.nn_tensor((uint64)p.vocab_size)?;
+    m.best = g.nn_tensor(4)?;
+    m.emb = g.nn_upload(w.token_embedding, (uint64)p.vocab_size * dim)?;
+    m.wq = upload(g, w.wq, L * dim * dim, f16)?;
+    m.wk = upload(g, w.wk, L * dim * kv_dim, f16)?;
+    m.wv = upload(g, w.wv, L * dim * kv_dim, f16)?;
+    m.wo = upload(g, w.wo, L * dim * dim, f16)?;
+    m.w1 = upload(g, w.w1, L * dim * hid, f16)?;
+    m.w2 = upload(g, w.w2, L * hid * dim, f16)?;
+    m.w3 = upload(g, w.w3, L * dim * hid, f16)?;
+    m.wcls = upload(g, w.wcls, (uint64)p.vocab_size * dim, f16)?;
+    m.rms_final = g.nn_upload(w.rms_final, dim)?;
+    for (l in 0..L) {
+        List_push(&m.rms_att, g.nn_upload(w.rms_att + l * dim, dim)?);
+        List_push(&m.rms_ffn, g.nn_upload(w.rms_ffn + l * dim, dim)?);
+    }
+    m.prog = g.nn_program()?;
+    NnProgram* pr = &m.prog;
+    uint32 d = (uint32)dim;
+    uint32 h = (uint32)hid;
+    uint32 kv = (uint32)kv_dim;
+    pr.embed(&m.x, &m.emb, d);
+    for (l in 0..L) {
+        uint32 loff = (uint32)(l * (uint64)p.seq_len * kv_dim);
+        pr.rmsnorm(&m.xb, &m.x, &m.rms_att.data[l], d);
+        pr.matvec_at(&m.q, 0, 0, &m.wq, l * dim * dim, &m.xb, d, d);
+        pr.matvec_at(&m.kcache, loff, kv, &m.wk, l * dim * kv_dim, &m.xb, kv, d);
+        pr.matvec_at(&m.vcache, loff, kv, &m.wv, l * dim * kv_dim, &m.xb, kv, d);
+        pr.rope(&m.q, &m.kcache, loff, kv, d, kv, (uint32)head_size);
+        pr.attention(&m.xb, &m.q, &m.kcache, &m.vcache, loff, (uint32)p.n_heads, (uint32)p.n_kv_heads, (uint32)head_size,
+            (uint32)p.seq_len);
+        pr.matvec_at(&m.xb2, 0, 0, &m.wo, l * dim * dim, &m.xb, d, d);
+        pr.add(&m.x, &m.xb2, d);
+        pr.rmsnorm(&m.xb, &m.x, &m.rms_ffn.data[l], d);
+        pr.matvec_at(&m.hb, 0, 0, &m.w1, l * dim * hid, &m.xb, h, d);
+        pr.matvec_at(&m.hb2, 0, 0, &m.w3, l * dim * hid, &m.xb, h, d);
+        pr.silu_mul(&m.hb, &m.hb2, h);
+        pr.matvec_at(&m.xb, 0, 0, &m.w2, l * hid * dim, &m.hb, d, h);
+        pr.add(&m.x, &m.xb, d);
+    }
+    pr.rmsnorm(&m.x, &m.x, &m.rms_final, d);
+    pr.matvec(&m.logits, &m.wcls, &m.x, (uint32)p.vocab_size, d);
+    pr.argmax(&m.best, &m.logits, (uint32)p.vocab_size);
+    return Ok<int, string>(0);
+}
+
+// One forward pass on the GPU. With greedy sampling only the argmax comes
+// back; otherwise the logits are copied into t's run state.
+Result<int, string> gpu_forward(GpuModelState* m, Transformer* t, int token, int pos, bool greedy) {
+    m.prog.set_step((uint32)token, (uint32)pos);
+    m.prog.run()?;
+    if (greedy) {
+        uint32[4] best;
+        m.best.buf.read(&best[0], 16)?;
+        return Ok<int, string>((int)best[0]);
+    }
+    m.logits.read(t.s.logits, (uint64)t.c.vocab_size)?;
+    return Ok<int, string>(-1);
+}
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+
+string load_tokenizer(Tokenizer* t, string path, int vocab_size) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return "cannot read the tokenizer";
+    defer free(d);
+    t.vocab_size = vocab_size;
+    t.vocab = alloc<*char>(vocab_size);
+    t.scores = alloc<float>(vocab_size);
+    for (i in 0..256) {
+        t.byte_pieces[i * 2] = (uint8)i;
+        t.byte_pieces[i * 2 + 1] = 0;
+    }
+    Map_init(&t.lookup, vocab_size * 2);
+    int64 at = 0;
+    if (n < 4) return "the tokenizer is too short";
+    memcpy(&t.max_token_length, d, 4);
+    at = 4;
+    for (i in 0..vocab_size) {
+        if (at + 8 > n) return "the tokenizer is truncated";
+        int len = 0;
+        memcpy(&t.scores[i], d + at, 4);
+        memcpy(&len, d + at + 4, 4);
+        at += 8;
+        if (len < 0 || at + len > n) return "the tokenizer is truncated";
+        t.vocab[i] = alloc<char>(len + 1);
+        memcpy(t.vocab[i], d + at, len);
+        at += len;
+        int created = 0;
+        *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
+        if (created != 0) *slot = i;
+    }
+    return null;
+}
+
+int str_lookup(Tokenizer* t, string s) {
+    return Map_get_or(&t.lookup, s, -1);
+}
+
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    return 0;
+}
+
+string decode(Tokenizer* t, int prev, int token) {
+    *char piece = t.vocab[token];
+    if (prev == 1 && piece[0] == ' ') piece = piece + 1;
+    if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>' && piece[6] == 0) {
+        int b = hex_digit(piece[3]) * 16 + hex_digit(piece[4]);
+        piece = (*char)&t.byte_pieces[b * 2];
+    }
+    return (string)piece;
+}
+
+void safe_print(string piece) {
+    if (piece == null || piece[0] == 0) return;
+    if (piece[1] == 0) {
+        uint8 b = (uint8)piece[0];
+        if (!(isprint((int)b) != 0 || isspace((int)b) != 0)) return;
+    }
+    printf("%s", piece);
+}
+
+// Encodes text into tokens (BPE by merge score), with BOS and no EOS.
+int encode(Tokenizer* t, string text, *int tokens) {
+    *char buf = alloc<char>(t.max_token_length * 2 + 3);
+    defer free(buf);
+    int n = 0;
+    tokens[n] = 1;
+    n++;
+    if (text[0] != 0) {
+        tokens[n] = str_lookup(t, " ");
+        n++;
+    }
+    int len = 0;
+    for (*char c = (*char)text; *c != 0; c = c + 1) {
+        if (((int)(uint8)*c & 0xC0) != 0x80) len = 0;
+        buf[len] = *c;
+        len++;
+        buf[len] = 0;
+        if (((int)(uint8)c[1] & 0xC0) == 0x80 && len < 4) continue;
+        int id = str_lookup(t, (string)buf);
+        if (id != -1) {
+            tokens[n] = id;
+            n++;
+        } else {
+            for (i in 0..len) {
+                tokens[n] = (int)(uint8)buf[i] + 3;
+                n++;
+            }
+        }
+        len = 0;
+    }
+    String pair;
+    defer String_free(&pair);
+    while (true) {
+        float best_score = -10000000000.0;
+        int best_id = -1;
+        int best_idx = -1;
+        for (i in 0..n - 1) {
+            String_clear(&pair);
+            String_append(&pair, (string)t.vocab[tokens[i]]);
+            String_append(&pair, (string)t.vocab[tokens[i + 1]]);
+            int id = str_lookup(t, pair.data);
+            if (id != -1 && t.scores[id] > best_score) {
+                best_score = t.scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+        if (best_idx == -1) break;
+        tokens[best_idx] = best_id;
+        for (i in best_idx + 1..n - 1) tokens[i] = tokens[i + 1];
+        n--;
+    }
+    return n;
+}
+
+// ── Sampling ─────────────────────────────────────────────────────────────────
+
+uint32 random_u32(*uint64 state) {
+    *state = *state ^ (*state >> 12);
+    *state = *state ^ (*state << 25);
+    *state = *state ^ (*state >> 27);
+    return (uint32)((*state * 0x2545F4914F6CDD1D) >> 32);
+}
+
+float random_f32(*uint64 state) {
+    return (float)(random_u32(state) >> 8) / 16777216.0;
+}
+
+int sample_argmax(*float p, int n) {
+    int best = 0;
+    float max_p = p[0];
+    for (i in 1..n) {
+        if (p[i] > max_p) {
+            best = i;
+            max_p = p[i];
+        }
+    }
+    return best;
+}
+
+int sample_mult(*float p, int n, float coin) {
+    float cdf = 0.0;
+    for (i in 0..n) {
+        cdf += p[i];
+        if (coin < cdf) return i;
+    }
+    return n - 1;
+}
+
+// Sorts by probability, highest first (heapsort, as qsort's order on ties is
+// unspecified anyway).
+void sort_desc(*ProbIndex a, int n) {
+    for (start in 0..n / 2) {
+        int root = n / 2 - 1 - start;
+        while (true) {
+            int child = root * 2 + 1;
+            if (child >= n) break;
+            if (child + 1 < n && a[child + 1].prob < a[child].prob) child++;
+            if (a[root].prob <= a[child].prob) break;
+            ProbIndex tmp = a[root];
+            a[root] = a[child];
+            a[child] = tmp;
+            root = child;
+        }
+    }
+    for (k in 0..n - 1) {
+        int end = n - 1 - k;
+        ProbIndex tmp = a[0];
+        a[0] = a[end];
+        a[end] = tmp;
+        int root = 0;
+        while (true) {
+            int child = root * 2 + 1;
+            if (child >= end) break;
+            if (child + 1 < end && a[child + 1].prob < a[child].prob) child++;
+            if (a[root].prob <= a[child].prob) break;
+            ProbIndex t2 = a[root];
+            a[root] = a[child];
+            a[child] = t2;
+            root = child;
+        }
+    }
+}
+
+int sample_topp(*float p, int n, float topp, *ProbIndex probindex, float coin) {
+    int n0 = 0;
+    float cutoff = (1.0 - topp) / (float)(n - 1);
+    for (i in 0..n) {
+        if (p[i] >= cutoff) {
+            probindex[n0] = ProbIndex{p[i], i};
+            n0++;
+        }
+    }
+    sort_desc(probindex, n0);
+    float cumulative = 0.0;
+    int last = n0 - 1;
+    for (i in 0..n0) {
+        cumulative += probindex[i].prob;
+        if (cumulative > topp) {
+            last = i;
+            break;
+        }
+    }
+    float r = coin * cumulative;
+    float cdf = 0.0;
+    for (i in 0..last + 1) {
+        cdf += probindex[i].prob;
+        if (r < cdf) return probindex[i].index;
+    }
+    return probindex[last].index;
+}
+
+int sample(Sampler* s, *float logits) {
+    if (s.temperature == 0.0) return sample_argmax(logits, s.vocab_size);
+    for (q in 0..s.vocab_size) logits[q] = logits[q] / s.temperature;
+    softmax(logits, s.vocab_size);
+    float coin = random_f32(&s.rng);
+    if (s.topp <= 0.0 || s.topp >= 1.0) return sample_mult(logits, s.vocab_size, coin);
+    return sample_topp(logits, s.vocab_size, s.topp, s.probindex, coin);
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+void usage() {
+    printf("usage: llama2 checkpoint.bin [-z tokenizer.bin] [-t temperature] [-p topp] [-s seed] [-n steps] [-i prompt] [--cpu] [--f16]\n");
+}
+
+int main(int argc, string* argv) {
+    if (argc < 2) {
+        usage();
+        return 1;
+    }
+    string checkpoint = argv[1];
+    string tokenizer_path = "tokenizer.bin";
+    float temperature = 1.0;
+    float topp = 0.9;
+    int steps = 256;
+    string prompt = "";
+    uint64 seed = 0;
+    bool cpu = false;
+    bool f16 = false;
+    int i = 2;
+    while (i < argc) {
+        string flag = argv[i];
+        if (strcmp(flag, "--cpu") == 0 || strcmp(flag, "--f16") == 0) {
+            if (strcmp(flag, "--cpu") == 0) cpu = true;
+            else f16 = true;
+            i++;
+            continue;
+        }
+        if (i + 1 >= argc) {
+            usage();
+            return 1;
+        }
+        string val = argv[i + 1];
+        if (strcmp(flag, "-z") == 0) tokenizer_path = val;
+        else if (strcmp(flag, "-t") == 0) temperature = (float)atof(val);
+        else if (strcmp(flag, "-p") == 0) topp = (float)atof(val);
+        else if (strcmp(flag, "-n") == 0) steps = atoi(val);
+        else if (strcmp(flag, "-i") == 0) prompt = val;
+        else if (strcmp(flag, "-s") == 0) seed = (uint64)atoll(val);
+        else {
+            usage();
+            return 1;
+        }
+        i += 2;
+    }
+    if (seed == 0) seed = (uint64)time_now_ms();
+    Transformer t;
+    string err = load_transformer(&t, checkpoint);
+    if (err != null) {
+        printf("error: %s\n", err);
+        return 1;
+    }
+    if (steps <= 0 || steps > t.c.seq_len) steps = t.c.seq_len;
+    Tokenizer tok;
+    err = load_tokenizer(&tok, tokenizer_path, t.c.vocab_size);
+    if (err != null) {
+        printf("error: %s\n", err);
+        return 1;
+    }
+    GpuModelState gm;
+    if (!cpu) {
+        Result<int, string> ok = gpu_setup(&gm, &t, f16);
+        if (!ok.ok) {
+            printf("error: %s\n", ok.error);
+            return 1;
+        }
+    }
+    Sampler sampler = Sampler{t.c.vocab_size, alloc<ProbIndex>(t.c.vocab_size), temperature, topp, seed};
+    *int prompt_tokens = alloc<int>((int64)strlen(prompt) + 3);
+    int num_prompt = encode(&tok, prompt, prompt_tokens);
+    int64 start = 0;
+    int token = prompt_tokens[0];
+    int pos = 0;
+    while (pos < steps) {
+        int next = 0;
+        if (cpu) {
+            *float logits = forward(&t, token, pos);
+            next = pos < num_prompt - 1 ? prompt_tokens[pos + 1] : sample(&sampler, logits);
+        } else {
+            Result<int, string> r = gpu_forward(&gm, &t, token, pos, temperature == 0.0);
+            if (!r.ok) {
+                printf("error: %s\n", r.error);
+                return 1;
+            }
+            if (pos < num_prompt - 1) next = prompt_tokens[pos + 1];
+            else if (temperature == 0.0) next = r.value;
+            else next = sample(&sampler, t.s.logits);
+        }
+        pos++;
+        if (next == 1) break;
+        safe_print(decode(&tok, token, next));
+        fflush(null);
+        token = next;
+        if (start == 0) start = time_monotonic_ms();
+    }
+    printf("\n");
+    if (pos > 1) {
+        int64 end = time_monotonic_ms();
+        String msg;
+        String_appendf(&msg, "achieved tok/s: %f\n", (double)(pos - 1) / (double)(end - start) * 1000.0);
+        print_err(msg.data);
+        String_free(&msg);
+    }
+    return 0;
+}
