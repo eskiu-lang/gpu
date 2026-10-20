@@ -1,0 +1,113 @@
+// GGUF reading and dequantization against tests/data/quant.gguf (made by
+// tools/gen_test_gguf.py: F16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and real Q2_K to
+// Q6_K blocks, with the gguf library's dequantization as the expected values),
+// then the Q8_0 and Q4_0 matrix-vector kernels against the CPU.
+import <io>;
+import <mem>;
+import <fs>;
+import <libc>;
+import <gpu>;
+import <gpu/nn>;
+import <gpu/gguf>;
+
+int fails = 0;
+
+Result<int, string> run() {
+    Gguf f = gguf_load("tests/data/quant.gguf")?;
+    defer f.free();
+    int64 n = 0;
+    *float want = (*float)fs_read_all("tests/data/quant_expected.f32", &n);
+    defer free(want);
+    if (f.tensors.size != 11) {
+        printf("FAIL tensor count %d\n", f.tensors.size);
+        fails++;
+    }
+    uint64 at = 0;
+    for (i in 0..f.tensors.size) {
+        GgufTensor* t = &f.tensors.data[i];
+        *float got = alloc<float>((int64)t.count);
+        t.dequantize(got);
+        int bad = 0;
+        for (k in 0..t.count) {
+            if (fabsf(got[k] - want[at + k]) > 0.000001) bad++;
+        }
+        if (bad > 0 || (at + t.count) * 4 > (uint64)n) {
+            printf("FAIL %s (type %d): %d values differ\n", t.name.data, t.type, bad);
+            fails++;
+        }
+        at = at + t.count;
+        free(got);
+    }
+
+    int64 len = 0;
+    *uint8 file = fs_read_all("tests/data/quant.gguf", &len);
+    defer free(file);
+    uint32 seed = 99;
+    for (round in 0..400) {
+        *uint8 copy = alloc<uint8>(len);
+        memcpy(copy, file, len);
+        int64 cut = len;
+        if (round < 200) cut = (int64)round * len / 200;
+        else {
+            for (k in 0..4) {
+                seed = seed * 1103515245 + 12345;
+                copy[(int64)(seed >> 8) % len] = (uint8)(seed >> 3);
+            }
+        }
+        Result<Gguf, string> g = gguf_parse(copy, (uint64)cut);
+        if (g.ok) {
+            Gguf gg = g.value;
+            for (i in 0..gg.tensors.size) {
+                GgufTensor* t = &gg.tensors.data[i];
+                if (t.count <= 4096) {
+                    *float tmp = alloc<float>((int64)t.count);
+                    t.dequantize(tmp);
+                    free(tmp);
+                }
+            }
+            gg.free();
+        } else free(copy);
+    }
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    float[256] x;
+    for (i in 0..256) x[i] = (float)((i * 37) % 17) / 17.0 - 0.5;
+    NnTensor tx = gpu.nn_upload(&x[0], 256)?;
+    NnTensor out = gpu.nn_tensor(4)?;
+    string[2] names = {"q8_0", "q4_0"};
+    for (k in 0..2) {
+        GgufTensor* t = f.tensor(names[k]);
+        Result<NnTensor, string> up = k == 0 ? gpu.nn_upload_q8_0(t.data, t.count) : gpu.nn_upload_q4_0(t.data, t.count);
+        NnTensor w = up?;
+        *float deq = alloc<float>((int64)t.count);
+        t.dequantize(deq);
+        NnProgram p = gpu.nn_program()?;
+        p.matvec(&out, &w, &tx, 4, 256);
+        p.run()?;
+        float[4] got;
+        out.read(&got[0], 4)?;
+        for (r in 0..4) {
+            float acc = 0.0;
+            for (c in 0..256) acc += deq[r * 256 + c] * x[c];
+            if (fabsf(acc - got[r]) > 0.0001) {
+                printf("FAIL matvec %s row %d: %f, want %f\n", names[k], r, (double)got[r], (double)acc);
+                fails++;
+            }
+        }
+        p.release();
+        w.release();
+        free(deq);
+    }
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("gguf: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}
