@@ -32,12 +32,17 @@ struct _GpuState {
     String uncaptured;
 }
 
+// f16 and subgroups say whether shaders may use `enable f16;` and
+// `enable subgroups;`; max_buffer is the largest buffer the device allows.
 struct Gpu {
     WGPUInstance instance;
     WGPUAdapter adapter;
     WGPUDevice device;
     WGPUQueue queue;
     *_GpuState state;
+    bool f16;
+    bool subgroups;
+    uint64 max_buffer;
 }
 
 struct GpuBuffer {
@@ -134,7 +139,29 @@ Result<Gpu, string> gpu_open() {
     g.adapter = (WGPUAdapter)w.handle;
     g.state = alloc<_GpuState>(1);
     w.done = 0;
-    WGPUDeviceDescriptor dd = WGPUDeviceDescriptor{label: gpu_str("eskiu"),
+    // Ask for everything the adapter offers: the WebGPU defaults cap a
+    // storage buffer at 128 MB, too little for model weights.
+    WGPULimits limits;
+    wgpuAdapterGetLimits(g.adapter, &limits);
+    WGPUFeatureName[2] features;
+    uint64 nfeatures = 0;
+    if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_ShaderF16) != 0) {
+        features[nfeatures] = WGPUFeatureName_ShaderF16;
+        nfeatures++;
+        g.f16 = true;
+    }
+    if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_Subgroups) != 0) {
+        features[nfeatures] = WGPUFeatureName_Subgroups;
+        nfeatures++;
+        g.subgroups = true;
+    } else if (wgpuAdapterHasFeature(g.adapter, (WGPUFeatureName)WGPUNativeFeature_Subgroup) != 0) {
+        features[nfeatures] = (WGPUFeatureName)WGPUNativeFeature_Subgroup;
+        nfeatures++;
+        g.subgroups = true;
+    }
+    g.max_buffer = limits.maxBufferSize;
+    WGPUDeviceDescriptor dd = WGPUDeviceDescriptor{label: gpu_str("eskiu"), requiredFeatureCount: nfeatures,
+        requiredFeatures: &features[0], requiredLimits: &limits,
         uncapturedErrorCallbackInfo: WGPUUncapturedErrorCallbackInfo{callback: (*void)_gpu_on_uncaptured, userdata1: g.state}};
     WGPURequestDeviceCallbackInfo di = WGPURequestDeviceCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_device, userdata1: &w};
     wgpuAdapterRequestDevice(g.adapter, &dd, di);
