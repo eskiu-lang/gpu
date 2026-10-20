@@ -218,19 +218,29 @@ void GpuBuffer_write(*GpuBuffer self, uint64 offset, *void data, uint64 bytes) {
 // Copies the first bytes bytes of the buffer to out, after the work submitted
 // so far has finished.
 Result<int, string> GpuBuffer_read(*GpuBuffer self, *void out, uint64 bytes) {
-    *Gpu g = &self.gpu;
-    GpuBuffer staging = Gpu_buffer(g, bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
+    GpuBuffer staging = _gpu_stage(self, bytes)?;
     defer GpuBuffer_release(&staging);
+    return GpuBuffer_read_mapped(&staging, out, bytes);
+}
+
+// A MapRead buffer holding a copy of the first bytes bytes of b, once the
+// submitted work has finished.
+Result<GpuBuffer, string> _gpu_stage(*GpuBuffer b, uint64 bytes) {
+    *Gpu g = &b.gpu;
+    GpuBuffer staging = Gpu_buffer(g, bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
     _gpu_push(g);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
-    wgpuCommandEncoderCopyBufferToBuffer(enc, self.handle, 0, staging.handle, 0, bytes);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, b.handle, 0, staging.handle, 0, bytes);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
     wgpuQueueSubmit(g.queue, 1, &cmd);
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     string err = _gpu_pop(g, "read");
-    if (err != null) return Err<int, string>(err);
-    return GpuBuffer_read_mapped(&staging, out, bytes);
+    if (err != null) {
+        GpuBuffer_release(&staging);
+        return Err<GpuBuffer, string>(err);
+    }
+    return Ok<GpuBuffer, string>(staging);
 }
 
 // Maps a MapRead buffer and copies its first bytes bytes to out.

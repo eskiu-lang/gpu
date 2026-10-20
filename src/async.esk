@@ -1,0 +1,64 @@
+// async.esk: waiting for the GPU from async code. The device is polled from
+// the event loop every millisecond until the work is done, so other tasks run
+// meanwhile.
+//
+//     int r = await gpu.wait_async(lp);
+//     Result<int, string> got = await v.read_async(lp, out, bytes);
+
+import <mem>;
+import <string>;
+import <result>;
+import <future>;
+import <timer>;
+import <eventloop>;
+import <gpu/raw>;
+import <gpu/core>;
+
+void _gpu_on_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status;
+    w.done = 1;
+}
+
+// Polls until w is done; 1 when it was, 0 after ms_limit milliseconds.
+async int _gpu_poll_async(*Gpu g, EventLoop* lp, *_GpuWait w, int ms_limit) {
+    for (i in 0..ms_limit) {
+        wgpuDevicePoll(g.device, 0, null);
+        if (w.done) return 1;
+        await timer_after(lp, (int64)1);
+    }
+    return 0;
+}
+
+// Completes with 0 once the work submitted so far has finished, -1 when the
+// queue reports an error or a minute passes.
+async int Gpu_wait_async(*Gpu self, EventLoop* lp) {
+    _GpuWait w;
+    WGPUQueueWorkDoneCallbackInfo ci = WGPUQueueWorkDoneCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_done, userdata1: &w};
+    wgpuQueueOnSubmittedWorkDone(self.queue, ci);
+    int ok = await _gpu_poll_async(self, lp, &w, 60000);
+    String_free(&w.msg);
+    return ok == 1 && w.status == WGPUQueueWorkDoneStatus_Success ? 0 : -1;
+}
+
+// read() for async code: copies the first bytes bytes of the buffer to out.
+async Result<int, string> GpuBuffer_read_async(*GpuBuffer self, EventLoop* lp, *void out, uint64 bytes) {
+    Result<GpuBuffer, string> st = _gpu_stage(self, bytes);
+    if (!st.ok) return Err<int, string>(st.error);
+    GpuBuffer staging = st.value;
+    _GpuWait w;
+    WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: &w};
+    wgpuBufferMapAsync(staging.handle, WGPUMapMode_Read, 0, bytes, mi);
+    int ok = await _gpu_poll_async(&self.gpu, lp, &w, 60000);
+    Result<int, string> r;
+    if (ok != 1 || w.status != WGPUMapAsyncStatus_Success) {
+        r = Err<int, string>(_gpu_fail("read", &w.msg));
+    } else {
+        memcpy(out, wgpuBufferGetConstMappedRange(staging.handle, 0, bytes), (int64)bytes);
+        wgpuBufferUnmap(staging.handle);
+        r = Ok<int, string>(0);
+    }
+    String_free(&w.msg);
+    GpuBuffer_release(&staging);
+    return r;
+}

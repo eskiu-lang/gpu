@@ -1,0 +1,51 @@
+// A kernel's result read from async code.
+import <io>;
+import <mem>;
+import <future>;
+import <timer>;
+import <eventloop>;
+import <gpu>;
+import <gpu/async>;
+
+EventLoop* lp;
+async int job(*Gpu gpu, *GpuBuffer v, *float out, uint64 bytes) {
+    int idle = await gpu.wait_async(lp);
+    Result<int, string> r = await v.read_async(lp, out, bytes);
+    EventLoop_stop(lp);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return idle;
+}
+
+string twice = "@group(0) @binding(0) var<storage, read_write> v: array<u32>;\n"
+    "@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { v[id.x] = v[id.x] * 2u; }\n";
+
+int main() {
+    lp = el_new(16);
+    Result<Gpu, string> g = gpu_open();
+    if (!g.ok) return 1;
+    Gpu gpu = g.value;
+    int n = 256;
+    uint64 bytes = (uint64)n * 4;
+    *uint32 data = alloc<uint32>(n);
+    for (i in 0..n) data[i] = (uint32)i;
+    GpuBuffer v = gpu.storage(data, bytes).value;
+    GpuKernel k = gpu.kernel(twice, "main").value;
+    k.bind(0, &v);
+    (void)k.dispatch((uint32)(n / 64), 1, 1);
+    *float out = alloc<float>(n);
+    Future<int>* f = job(&gpu, &v, out, bytes);
+    EventLoop_run(lp);
+    *uint32 got = (*uint32)out;
+    int bad = 0;
+    for (i in 0..n) {
+        if (got[i] != (uint32)(i * 2)) bad++;
+    }
+    printf("async read: %d mismatches, status %d\n", bad, f.value);
+    k.release();
+    v.release();
+    gpu.release();
+    return bad == 0 && f.value == 0 ? 0 : 1;
+}
