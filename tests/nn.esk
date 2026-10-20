@@ -1,0 +1,183 @@
+// <gpu/nn> operations against the same math on the CPU, on random data.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/nn>;
+
+int fails = 0;
+uint32 seed = 1;
+
+float rnd() {
+    seed = seed * 1664525 + 1013904223;
+    return (float)(seed >> 8) / 16777216.0 - 0.5;
+}
+
+void fill(*float a, int n) {
+    for (i in 0..n) a[i] = rnd();
+}
+
+void close_to(string what, *float got, *float want, int n, float tol) {
+    float worst = 0.0;
+    for (i in 0..n) {
+        float d = fabsf(got[i] - want[i]);
+        if (d > worst) worst = d;
+    }
+    if (worst > tol) {
+        printf("FAIL %s: max error %g\n", what, (double)worst);
+        fails++;
+    }
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    int rows = 300;
+    int cols = 256;
+    *float w = alloc<float>(rows * cols);
+    *float x = alloc<float>(cols);
+    *float want = alloc<float>(rows * 4);
+    *float got = alloc<float>(rows * 4);
+    defer free(w);
+    defer free(x);
+    defer free(want);
+    defer free(got);
+    fill(w, rows * cols);
+    fill(x, cols);
+    for (r in 0..rows) {
+        float acc = 0.0;
+        for (c in 0..cols) acc += w[r * cols + c] * x[c];
+        want[r] = acc;
+    }
+    NnTensor tw = gpu.nn_upload(w, (uint64)(rows * cols))?;
+    NnTensor tx = gpu.nn_upload(x, (uint64)cols)?;
+    NnTensor out = gpu.nn_tensor((uint64)(rows * 4))?;
+    NnProgram p = gpu.nn_program()?;
+    p.matvec(&out, &tw, &tx, (uint32)rows, (uint32)cols);
+    p.set_step(0, 0);
+    p.run()?;
+    out.read(got, (uint64)rows)?;
+    close_to("matvec f32", got, want, rows, 0.0001);
+    p.release();
+
+    if (gpu.f16) {
+        NnTensor th = gpu.nn_upload_f16(w, (uint64)(rows * cols))?;
+        NnProgram ph = gpu.nn_program()?;
+        ph.matvec(&out, &th, &tx, (uint32)rows, (uint32)cols);
+        ph.set_step(0, 0);
+        ph.run()?;
+        out.read(got, (uint64)rows)?;
+        close_to("matvec f16", got, want, rows, 0.02);
+        ph.release();
+        th.release();
+    }
+
+    NnProgram pk = gpu.nn_program()?;
+    pk.matvec_at(&out, 5, (uint32)rows, &tw, (uint64)(2 * cols), &tx, 10, (uint32)cols);
+    pk.set_step(0, 2);
+    pk.run()?;
+    out.read(got, (uint64)(rows * 4))?;
+    close_to("matvec at an offset, position stride", got + 5 + 2 * rows, want + 2, 10, 0.0001);
+    pk.release();
+
+    int n = 256;
+    *float g = alloc<float>(n);
+    defer free(g);
+    fill(g, n);
+    float ss = 0.0;
+    for (i in 0..n) ss += x[i] * x[i];
+    float scale = 1.0 / sqrtf(ss / (float)n + 0.00001);
+    for (i in 0..n) want[i] = g[i] * scale * x[i];
+    NnTensor tg = gpu.nn_upload(g, (uint64)n)?;
+    NnTensor y = gpu.nn_tensor((uint64)n)?;
+    NnProgram pr = gpu.nn_program()?;
+    pr.rmsnorm(&y, &tx, &tg, (uint32)n);
+    pr.run()?;
+    y.read(got, (uint64)n)?;
+    close_to("rmsnorm", got, want, n, 0.0001);
+    pr.release();
+
+    *float b = alloc<float>(n);
+    defer free(b);
+    fill(b, n);
+    for (i in 0..n) want[i] = x[i] / (1.0 + expf(-x[i])) * b[i];
+    NnTensor ta = gpu.nn_upload(x, (uint64)n)?;
+    NnTensor tb = gpu.nn_upload(b, (uint64)n)?;
+    NnTensor best = gpu.nn_tensor(4)?;
+    NnProgram ps = gpu.nn_program()?;
+    ps.silu_mul(&ta, &tb, (uint32)n);
+    ps.add(&ta, &tb, (uint32)n);
+    ps.argmax(&best, &tb, (uint32)n);
+    ps.run()?;
+    ta.read(got, (uint64)n)?;
+    for (i in 0..n) want[i] += b[i];
+    close_to("silu_mul then add", got, want, n, 0.0001);
+    uint32[4] bi;
+    best.buf.read(&bi[0], 16)?;
+    int arg = 0;
+    for (i in 1..n) {
+        if (b[i] > b[arg]) arg = i;
+    }
+    if ((int)bi[0] != arg) {
+        printf("FAIL argmax: %d, want %d\n", (int)bi[0], arg);
+        fails++;
+    }
+    ps.release();
+
+    int heads = 4;
+    int hs = 16;
+    int dim = heads * hs;
+    int pos = 6;
+    int seq = 8;
+    *float q = alloc<float>(dim);
+    *float kc = alloc<float>(seq * dim);
+    *float vc = alloc<float>(seq * dim);
+    defer free(q);
+    defer free(kc);
+    defer free(vc);
+    fill(q, dim);
+    fill(kc, seq * dim);
+    fill(vc, seq * dim);
+    float[8] att;
+    for (h in 0..heads) {
+        float mx = -1000000.0;
+        for (t in 0..pos + 1) {
+            float s = 0.0;
+            for (i in 0..hs) s += q[h * hs + i] * kc[t * dim + h * hs + i];
+            att[t] = s / sqrtf((float)hs);
+            if (att[t] > mx) mx = att[t];
+        }
+        float sum = 0.0;
+        for (t in 0..pos + 1) {
+            att[t] = expf(att[t] - mx);
+            sum += att[t];
+        }
+        for (i in 0..hs) {
+            float acc = 0.0;
+            for (t in 0..pos + 1) acc += att[t] / sum * vc[t * dim + h * hs + i];
+            want[h * hs + i] = acc;
+        }
+    }
+    NnTensor tq = gpu.nn_upload(q, (uint64)dim)?;
+    NnTensor tk = gpu.nn_upload(kc, (uint64)(seq * dim))?;
+    NnTensor tv = gpu.nn_upload(vc, (uint64)(seq * dim))?;
+    NnTensor ao = gpu.nn_tensor((uint64)dim)?;
+    NnProgram pa = gpu.nn_program()?;
+    pa.attention(&ao, &tq, &tk, &tv, 0, (uint32)heads, (uint32)heads, (uint32)hs, (uint32)seq);
+    pa.set_step(0, (uint32)pos);
+    pa.run()?;
+    ao.read(got, (uint64)dim)?;
+    close_to("attention", got, want, dim, 0.0001);
+    pa.release();
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("nn: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}
