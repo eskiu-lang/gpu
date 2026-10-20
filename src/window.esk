@@ -1,0 +1,204 @@
+// window.esk: windows and input over SDL3, with a GPU surface to draw into.
+// A program that imports it links SDL3; <gpu> alone does not.
+//
+//     Window win = window_open("demo", 800, 600)?;
+//     defer win.release();
+//     GpuSurface surface = win.surface(&gpu)?;
+//     WindowEvent ev;
+//     while (running) {
+//         while (win.poll(&ev)) {
+//             if (ev.kind == WINDOW_QUIT) running = false;
+//             if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
+//         }
+//         ...
+//     }
+
+import <mem>;
+import <string>;
+import <result>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+
+#pragma link("SDL3")
+
+extern bool SDL_Init(uint32 flags);
+extern void SDL_Quit();
+extern string SDL_GetError();
+extern *void SDL_CreateWindow(string title, int w, int h, uint64 flags);
+extern void SDL_DestroyWindow(*void window);
+extern bool SDL_PollEvent(*void event);
+extern bool SDL_GetWindowSizeInPixels(*void window, *int w, *int h);
+extern uint32 SDL_GetWindowProperties(*void window);
+extern *void SDL_GetPointerProperty(uint32 props, string name, *void fallback);
+extern int64 SDL_GetNumberProperty(uint32 props, string name, int64 fallback);
+extern string SDL_GetCurrentVideoDriver();
+extern *void SDL_Metal_CreateView(*void window);
+extern void SDL_Metal_DestroyView(*void view);
+extern *void SDL_Metal_GetLayer(*void view);
+extern uint64 SDL_GetTicks();
+extern bool SDL_SetWindowTitle(*void window, string title);
+
+const uint32 _SDL_INIT_VIDEO = 0x20;
+const uint64 _SDL_WINDOW_RESIZABLE = 0x20;
+const uint64 _SDL_WINDOW_HIGH_PIXEL_DENSITY = 0x2000;
+const uint64 _SDL_WINDOW_METAL = 0x20000000;
+
+const int WINDOW_NONE = 0;
+const int WINDOW_QUIT = 1;
+const int WINDOW_RESIZE = 2;
+const int WINDOW_KEY_DOWN = 3;
+const int WINDOW_KEY_UP = 4;
+const int WINDOW_MOUSE_MOVE = 5;
+const int WINDOW_MOUSE_DOWN = 6;
+const int WINDOW_MOUSE_UP = 7;
+const int WINDOW_WHEEL = 8;
+
+// Key codes: printable keys are their lowercase ASCII code ('a', ' ', '1').
+const int KEY_ESCAPE = 27;
+const int KEY_RETURN = 13;
+const int KEY_RIGHT = 1073741903;
+const int KEY_LEFT = 1073741904;
+const int KEY_DOWN = 1073741905;
+const int KEY_UP = 1073741906;
+
+struct Window {
+    *void sdl;
+    *void metal;
+}
+
+// One input event. key and repeat are set for key events, button for mouse
+// buttons (1 left, 2 middle, 3 right), x and y for mouse events (pixels) and
+// the wheel (scroll amounts), dx and dy for mouse motion, width and height
+// (pixels) for WINDOW_RESIZE.
+struct WindowEvent {
+    int kind;
+    int key;
+    bool repeat;
+    int button;
+    float x;
+    float y;
+    float dx;
+    float dy;
+    uint32 width;
+    uint32 height;
+}
+
+Result<Window, string> window_open(string title, int width, int height) {
+    if (!SDL_Init(_SDL_INIT_VIDEO)) return Err<Window, string>(SDL_GetError());
+    uint64 flags = _SDL_WINDOW_RESIZABLE | _SDL_WINDOW_HIGH_PIXEL_DENSITY;
+#ifdef __APPLE__
+    flags = flags | _SDL_WINDOW_METAL;
+#endif
+    Window w;
+    w.sdl = SDL_CreateWindow(title, width, height, flags);
+    if (w.sdl == null) return Err<Window, string>(SDL_GetError());
+#ifdef __APPLE__
+    w.metal = SDL_Metal_CreateView(w.sdl);
+#endif
+    return Ok<Window, string>(w);
+}
+
+void Window_release(*Window self) {
+    if (self.metal != null) SDL_Metal_DestroyView(self.metal);
+    if (self.sdl != null) SDL_DestroyWindow(self.sdl);
+    self.metal = null;
+    self.sdl = null;
+    SDL_Quit();
+}
+
+void Window_set_title(*Window self, string title) {
+    SDL_SetWindowTitle(self.sdl, title);
+}
+
+// The drawable size in pixels (larger than the window's size in points on a
+// high-density display).
+void Window_size(*Window self, *uint32 width, *uint32 height) {
+    int w = 0;
+    int h = 0;
+    SDL_GetWindowSizeInPixels(self.sdl, &w, &h);
+    *width = (uint32)w;
+    *height = (uint32)h;
+}
+
+// Milliseconds since the window system started.
+uint64 window_ticks() {
+    return SDL_GetTicks();
+}
+
+float _win_f32(*uint8 e, int off) {
+    return *(*float)(e + off);
+}
+
+int _win_i32(*uint8 e, int off) {
+    return *(*int)(e + off);
+}
+
+// Takes the next pending event into ev; false when there is none. Events the
+// layer does not describe are skipped.
+bool Window_poll(*Window self, *WindowEvent ev) {
+    uint64[16] raw;
+    *uint8 e = (*uint8)&raw;
+    while (SDL_PollEvent(e)) {
+        *ev = WindowEvent{};
+        uint32 kind = *(*uint32)e;
+        if (kind == 0x100 || kind == 528) {
+            ev.kind = WINDOW_QUIT;
+        } else if (kind == 519) {
+            ev.kind = WINDOW_RESIZE;
+            ev.width = (uint32)_win_i32(e, 20);
+            ev.height = (uint32)_win_i32(e, 24);
+        } else if (kind == 0x300 || kind == 0x301) {
+            ev.kind = kind == 0x300 ? WINDOW_KEY_DOWN : WINDOW_KEY_UP;
+            ev.key = _win_i32(e, 28);
+            ev.repeat = e[37] != 0;
+        } else if (kind == 0x400) {
+            ev.kind = WINDOW_MOUSE_MOVE;
+            ev.x = _win_f32(e, 28);
+            ev.y = _win_f32(e, 32);
+            ev.dx = _win_f32(e, 36);
+            ev.dy = _win_f32(e, 40);
+        } else if (kind == 0x401 || kind == 0x402) {
+            ev.kind = kind == 0x401 ? WINDOW_MOUSE_DOWN : WINDOW_MOUSE_UP;
+            ev.button = (int)e[24];
+            ev.x = _win_f32(e, 28);
+            ev.y = _win_f32(e, 32);
+        } else if (kind == 0x403) {
+            ev.kind = WINDOW_WHEEL;
+            ev.x = _win_f32(e, 24);
+            ev.y = _win_f32(e, 28);
+        } else {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+// A GPU surface over the window, configured to its current size.
+Result<GpuSurface, string> Window_surface(*Window self, *Gpu gpu) {
+    Result<GpuSurface, string> r;
+#ifdef __APPLE__
+    r = Gpu_surface_metal(gpu, SDL_Metal_GetLayer(self.metal));
+#elif defined(_WIN32)
+    uint32 props = SDL_GetWindowProperties(self.sdl);
+    r = Gpu_surface_win32(gpu, SDL_GetPointerProperty(props, "SDL.window.win32.instance", null),
+        SDL_GetPointerProperty(props, "SDL.window.win32.hwnd", null));
+#else
+    uint32 props = SDL_GetWindowProperties(self.sdl);
+    string driver = SDL_GetCurrentVideoDriver();
+    if (driver != null && strcmp(driver, "wayland") == 0) {
+        r = Gpu_surface_wayland(gpu, SDL_GetPointerProperty(props, "SDL.window.wayland.display", null),
+            SDL_GetPointerProperty(props, "SDL.window.wayland.surface", null));
+    } else {
+        r = Gpu_surface_x11(gpu, SDL_GetPointerProperty(props, "SDL.window.x11.display", null),
+            (uint64)SDL_GetNumberProperty(props, "SDL.window.x11.window", 0));
+    }
+#endif
+    GpuSurface s = r?;
+    uint32 w = 0;
+    uint32 h = 0;
+    Window_size(self, &w, &h);
+    GpuSurface_configure(&s, w, h);
+    return Ok<GpuSurface, string>(s);
+}

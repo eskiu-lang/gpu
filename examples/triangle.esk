@@ -1,0 +1,66 @@
+// A spinning triangle in a window. Escape or closing the window quits;
+// --frames N quits after N frames.
+import <io>;
+import <libc>;
+import <gpu>;
+import <gpu/window>;
+
+string shader =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n"
+    "@group(0) @binding(0) var<uniform> angle: vec4<f32>;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    var p = array<vec2<f32>, 3>(vec2(0.0, 0.7), vec2(-0.6, -0.5), vec2(0.6, -0.5));\n"
+    "    var c = array<vec3<f32>, 3>(vec3(1.0, 0.3, 0.3), vec3(0.3, 1.0, 0.3), vec3(0.3, 0.4, 1.0));\n"
+    "    let s = sin(angle.x);\n"
+    "    let k = cos(angle.x);\n"
+    "    let q = vec2(p[i].x * k - p[i].y * s, p[i].x * s + p[i].y * k);\n"
+    "    return V(vec4(q.x * angle.y, q.y, 0.0, 1.0), c[i]);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return vec4(v.color, 1.0); }\n";
+
+Result<int, string> run(int max_frames) {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Window win = window_open("Eskiu triangle", 800, 600)?;
+    defer win.release();
+    GpuSurface surface = win.surface(&gpu)?;
+    defer surface.release();
+    float[4] uniforms = {0.0, 1.0, 0.0, 0.0};
+    GpuBuffer ub = gpu.uniform(&uniforms, sizeof(uniforms))?;
+    defer ub.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    pipe.bind(0, &ub);
+    bool running = true;
+    int frames = 0;
+    WindowEvent ev;
+    while (running) {
+        while (win.poll(&ev)) {
+            if (ev.kind == WINDOW_QUIT || (ev.kind == WINDOW_KEY_DOWN && ev.key == KEY_ESCAPE)) running = false;
+            if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
+        }
+        uniforms[0] = (float)window_ticks() / 1000.0;
+        uniforms[1] = (float)surface.height / (float)surface.width;
+        ub.write(0, &uniforms, sizeof(uniforms));
+        Result<GpuFrame, string> fr = surface.frame();
+        if (!fr.ok) {
+            surface.configure(surface.width, surface.height);
+            continue;
+        }
+        GpuFrame frame = fr.value;
+        GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
+        pass.draw(&pipe, null, 3, 1);
+        pass.end()?;
+        surface.present(&frame);
+        frames++;
+        if (max_frames > 0 && frames >= max_frames) running = false;
+    }
+    return Ok<int, string>(frames);
+}
+
+int max_frames = 0;
+if (argc > 2 && strcmp(argv[1], "--frames") == 0) max_frames = atoi(argv[2]);
+Result<int, string> r = run(max_frames);
+if (r.ok) printf("%d frames\n", r.value);
+else printf("error: %s\n", r.error);
