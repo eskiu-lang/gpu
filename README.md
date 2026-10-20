@@ -29,8 +29,9 @@ Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
   Eskiu memory.
 - **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
   render pipelines and passes, to an offscreen texture or a window.
-- **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`) and `<gpu/model>` draws it
-  with physically based shading, normal maps, alpha modes, skinning and animation.
+- **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
+  OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
+  based shading, normal maps, alpha modes, skinning and animation.
 - **Images.** `<gpu/image>` decodes PNG and JPEG (baseline and progressive) in pure Eskiu;
   textures can be sRGB and mipmapped.
 - **Windows and input.** `<gpu/window>` opens a window over SDL3 and gives its surface
@@ -140,7 +141,7 @@ with `--frames N`.
 ## Models
 
 ```eskiu
-Gltf data = gltf_load("helmet.glb")?;
+Gltf data = model_load("helmet.glb")?;   // or a .gltf, or an .obj
 defer data.free();
 GpuModel model = gpu.model(&data, surface.format)?;
 defer model.release();
@@ -160,8 +161,14 @@ materials with their textures and samplers, the node hierarchy, skins and animat
 embedded buffers. `KHR_mesh_quantization`, `KHR_materials_unlit` and
 `KHR_materials_emissive_strength` are supported. The renderer shades with glTF's
 metallic-roughness model under one directional light (`model.light`) and a hemisphere
-ambient term. [`examples/model.esk`](examples/model.esk) is a viewer: drag to orbit, scroll
+ambient term. [`examples/model.esk`](examples/model.esk) is a viewer for glTF and OBJ files: drag to orbit, scroll
 to zoom, space pauses the animation.
+
+OBJ files load into the same `Gltf` (`obj_load`, or `model_load` for either kind). Each
+object becomes a mesh, polygons are triangulated, and the MTL is mapped to the same
+materials: `Kd`/`map_Kd` base color, `d`/`Tr` alpha, `Ke`/`map_Ke` emission,
+`bump`/`map_Bump`/`norm` normal map (with `-bm`), `Ns` (or `Pr`/`Pm`) roughness and
+metallic, `illum 0` unlit, and `-clamp on`. Vertex colors (`v x y z r g b`) are kept.
 
 Not supported yet: morph targets, image-based lighting and shadows, Draco and meshopt
 compression, and KTX2 textures.
@@ -197,7 +204,8 @@ to the executable.
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 (links SDL3) |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
-| `<gpu/model>` | `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight` |
+| `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
+| `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight` |
 | `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
 | `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
 | `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
