@@ -19,6 +19,7 @@ import <time>;
 import <libc>;
 import <gpu>;
 import <gpu/nn>;
+import <gpu/gguf>;
 
 struct Config {
     int dim;
@@ -263,81 +264,153 @@ struct GpuModelState {
     NnTensor logits;
     NnTensor best;
     NnTensor emb;
-    NnTensor wq;
-    NnTensor wk;
-    NnTensor wv;
-    NnTensor wo;
-    NnTensor w1;
-    NnTensor w2;
-    NnTensor w3;
     NnTensor wcls;
     NnTensor rms_final;
+    List<NnTensor> wq;
+    List<NnTensor> wk;
+    List<NnTensor> wv;
+    List<NnTensor> wo;
+    List<NnTensor> w1;
+    List<NnTensor> w2;
+    List<NnTensor> w3;
     List<NnTensor> rms_att;
     List<NnTensor> rms_ffn;
 }
 
 Result<NnTensor, string> upload(*Gpu gpu, *float data, uint64 count, bool f16) {
-    if (f16) return gpu.nn_upload_f16(data, count);
+    if (f16 && gpu.f16) return gpu.nn_upload_f16(data, count);
     return gpu.nn_upload(data, count);
 }
 
-Result<int, string> gpu_setup(GpuModelState* m, Transformer* t, bool f16) {
-    m.gpu = gpu_open()?;
+Result<int, string> gpu_buffers(GpuModelState* m, Config* p) {
     *Gpu g = &m.gpu;
-    if (f16 && !g.f16) f16 = false;
+    uint64 dim = (uint64)p.dim;
+    uint64 kv_dim = (uint64)((p.dim * p.n_kv_heads) / p.n_heads);
+    m.x = g.nn_tensor(dim)?;
+    m.xb = g.nn_tensor(dim)?;
+    m.xb2 = g.nn_tensor(dim)?;
+    m.hb = g.nn_tensor((uint64)p.hidden_dim)?;
+    m.hb2 = g.nn_tensor((uint64)p.hidden_dim)?;
+    m.q = g.nn_tensor(dim)?;
+    m.kcache = g.nn_tensor((uint64)p.n_layers * (uint64)p.seq_len * kv_dim)?;
+    m.vcache = g.nn_tensor((uint64)p.n_layers * (uint64)p.seq_len * kv_dim)?;
+    m.logits = g.nn_tensor((uint64)p.vocab_size)?;
+    m.best = g.nn_tensor(4)?;
+    return Ok<int, string>(0);
+}
+
+// Uploads a llama2.c checkpoint's weights.
+Result<int, string> gpu_load_bin(GpuModelState* m, Transformer* t, bool f16) {
+    *Gpu g = &m.gpu;
     Config* p = &t.c;
     Weights* w = &t.w;
     uint64 dim = (uint64)p.dim;
     uint64 hid = (uint64)p.hidden_dim;
-    uint64 L = (uint64)p.n_layers;
     uint64 kv_dim = (uint64)((p.dim * p.n_kv_heads) / p.n_heads);
-    uint64 head_size = dim / (uint64)p.n_heads;
-    m.x = g.nn_tensor(dim)?;
-    m.xb = g.nn_tensor(dim)?;
-    m.xb2 = g.nn_tensor(dim)?;
-    m.hb = g.nn_tensor(hid)?;
-    m.hb2 = g.nn_tensor(hid)?;
-    m.q = g.nn_tensor(dim)?;
-    m.kcache = g.nn_tensor(L * (uint64)p.seq_len * kv_dim)?;
-    m.vcache = g.nn_tensor(L * (uint64)p.seq_len * kv_dim)?;
-    m.logits = g.nn_tensor((uint64)p.vocab_size)?;
-    m.best = g.nn_tensor(4)?;
     m.emb = g.nn_upload(w.token_embedding, (uint64)p.vocab_size * dim)?;
-    m.wq = upload(g, w.wq, L * dim * dim, f16)?;
-    m.wk = upload(g, w.wk, L * dim * kv_dim, f16)?;
-    m.wv = upload(g, w.wv, L * dim * kv_dim, f16)?;
-    m.wo = upload(g, w.wo, L * dim * dim, f16)?;
-    m.w1 = upload(g, w.w1, L * dim * hid, f16)?;
-    m.w2 = upload(g, w.w2, L * hid * dim, f16)?;
-    m.w3 = upload(g, w.w3, L * dim * hid, f16)?;
     m.wcls = upload(g, w.wcls, (uint64)p.vocab_size * dim, f16)?;
     m.rms_final = g.nn_upload(w.rms_final, dim)?;
-    for (l in 0..L) {
+    for (l in 0..(uint64)p.n_layers) {
+        List_push(&m.wq, upload(g, w.wq + l * dim * dim, dim * dim, f16)?);
+        List_push(&m.wk, upload(g, w.wk + l * dim * kv_dim, dim * kv_dim, f16)?);
+        List_push(&m.wv, upload(g, w.wv + l * dim * kv_dim, dim * kv_dim, f16)?);
+        List_push(&m.wo, upload(g, w.wo + l * dim * dim, dim * dim, f16)?);
+        List_push(&m.w1, upload(g, w.w1 + l * dim * hid, dim * hid, f16)?);
+        List_push(&m.w2, upload(g, w.w2 + l * hid * dim, hid * dim, f16)?);
+        List_push(&m.w3, upload(g, w.w3 + l * dim * hid, dim * hid, f16)?);
         List_push(&m.rms_att, g.nn_upload(w.rms_att + l * dim, dim)?);
         List_push(&m.rms_ffn, g.nn_upload(w.rms_ffn + l * dim, dim)?);
     }
+    return Ok<int, string>(0);
+}
+
+// A GGUF tensor on the GPU: Q4_0 and Q8_0 as they are, anything else
+// dequantized (to f16 when as_f16 and the device has it).
+Result<NnTensor, string> gguf_upload(*Gpu g, *Gguf f, string name, bool as_f16) {
+    GgufTensor* t = f.tensor(name);
+    if (t == null) return Err<NnTensor, string>("missing tensor");
+    if (t.type == GGML_Q4_0) return g.nn_upload_q4_0(t.data, t.count);
+    if (t.type == GGML_Q8_0) return g.nn_upload_q8_0(t.data, t.count);
+    *float tmp = alloc<float>((int64)t.count);
+    defer free(tmp);
+    t.dequantize(tmp);
+    return upload(g, tmp, t.count, as_f16);
+}
+
+String name_buf;
+
+string layer_name(uint64 l, string suffix) {
+    String_clear(&name_buf);
+    String_appendf(&name_buf, "blk.%llu.%s", l, suffix);
+    return name_buf.data;
+}
+
+// Loads a llama GGUF model's configuration and weights.
+Result<int, string> gpu_load_gguf(GpuModelState* m, Transformer* t, *Gguf f, int max_seq) {
+    *Gpu g = &m.gpu;
+    string arch = f.string("general.architecture");
+    if (arch == null || strcmp(arch, "llama") != 0) return Err<int, string>("only llama-architecture GGUF models are supported");
+    Config* p = &t.c;
+    p.dim = (int)f.int("llama.embedding_length", 0);
+    p.hidden_dim = (int)f.int("llama.feed_forward_length", 0);
+    p.n_layers = (int)f.int("llama.block_count", 0);
+    p.n_heads = (int)f.int("llama.attention.head_count", 0);
+    p.n_kv_heads = (int)f.int("llama.attention.head_count_kv", (int64)p.n_heads);
+    p.seq_len = (int)f.int("llama.context_length", 2048);
+    if (max_seq > 0 && max_seq < p.seq_len) p.seq_len = max_seq;
+    if (p.seq_len > 4096) p.seq_len = 4096;
+    GgufTensor* emb = f.tensor("token_embd.weight");
+    if (p.dim <= 0 || p.n_heads <= 0 || p.n_layers <= 0 || emb == null) return Err<int, string>("incomplete llama metadata");
+    p.vocab_size = (int)emb.ne[1];
     m.prog = g.nn_program()?;
+    m.prog.eps = (float)f.float("llama.attention.layer_norm_rms_epsilon", 0.00001);
+    m.prog.rope_base = (float)f.float("llama.rope.freq_base", 10000.0);
+    *float tmp = alloc<float>((int64)emb.count);
+    emb.dequantize(tmp);
+    m.emb = g.nn_upload(tmp, emb.count)?;
+    free(tmp);
+    m.wcls = gguf_upload(g, f, f.tensor("output.weight") != null ? "output.weight" : "token_embd.weight", true)?;
+    m.rms_final = gguf_upload(g, f, "output_norm.weight", false)?;
+    for (l in 0..(uint64)p.n_layers) {
+        List_push(&m.wq, gguf_upload(g, f, layer_name(l, "attn_q.weight"), true)?);
+        List_push(&m.wk, gguf_upload(g, f, layer_name(l, "attn_k.weight"), true)?);
+        List_push(&m.wv, gguf_upload(g, f, layer_name(l, "attn_v.weight"), true)?);
+        List_push(&m.wo, gguf_upload(g, f, layer_name(l, "attn_output.weight"), true)?);
+        List_push(&m.w1, gguf_upload(g, f, layer_name(l, "ffn_gate.weight"), true)?);
+        List_push(&m.w2, gguf_upload(g, f, layer_name(l, "ffn_down.weight"), true)?);
+        List_push(&m.w3, gguf_upload(g, f, layer_name(l, "ffn_up.weight"), true)?);
+        List_push(&m.rms_att, gguf_upload(g, f, layer_name(l, "attn_norm.weight"), false)?);
+        List_push(&m.rms_ffn, gguf_upload(g, f, layer_name(l, "ffn_norm.weight"), false)?);
+    }
+    t.s.logits = alloc<float>(p.vocab_size);
+    return Ok<int, string>(0);
+}
+
+// Records the forward pass of one token.
+Result<int, string> gpu_record(GpuModelState* m, Config* p) {
+    gpu_buffers(m, p)?;
     NnProgram* pr = &m.prog;
-    uint32 d = (uint32)dim;
-    uint32 h = (uint32)hid;
+    uint64 kv_dim = (uint64)((p.dim * p.n_kv_heads) / p.n_heads);
+    uint32 d = (uint32)p.dim;
+    uint32 h = (uint32)p.hidden_dim;
     uint32 kv = (uint32)kv_dim;
+    uint32 head_size = d / (uint32)p.n_heads;
     pr.embed(&m.x, &m.emb, d);
-    for (l in 0..L) {
-        uint32 loff = (uint32)(l * (uint64)p.seq_len * kv_dim);
+    for (l in 0..p.n_layers) {
+        uint32 loff = (uint32)((uint64)l * (uint64)p.seq_len * kv_dim);
         pr.rmsnorm(&m.xb, &m.x, &m.rms_att.data[l], d);
-        pr.matvec_at(&m.q, 0, 0, &m.wq, l * dim * dim, &m.xb, d, d);
-        pr.matvec_at(&m.kcache, loff, kv, &m.wk, l * dim * kv_dim, &m.xb, kv, d);
-        pr.matvec_at(&m.vcache, loff, kv, &m.wv, l * dim * kv_dim, &m.xb, kv, d);
-        pr.rope(&m.q, &m.kcache, loff, kv, d, kv, (uint32)head_size);
-        pr.attention(&m.xb, &m.q, &m.kcache, &m.vcache, loff, (uint32)p.n_heads, (uint32)p.n_kv_heads, (uint32)head_size,
-            (uint32)p.seq_len);
-        pr.matvec_at(&m.xb2, 0, 0, &m.wo, l * dim * dim, &m.xb, d, d);
+        pr.matvec(&m.q, &m.wq.data[l], &m.xb, d, d);
+        pr.matvec_at(&m.kcache, loff, kv, &m.wk.data[l], 0, &m.xb, kv, d);
+        pr.matvec_at(&m.vcache, loff, kv, &m.wv.data[l], 0, &m.xb, kv, d);
+        pr.rope(&m.q, &m.kcache, loff, kv, d, kv, head_size);
+        pr.attention(&m.xb, &m.q, &m.kcache, &m.vcache, loff, (uint32)p.n_heads, (uint32)p.n_kv_heads, head_size, (uint32)p.seq_len);
+        pr.matvec(&m.xb2, &m.wo.data[l], &m.xb, d, d);
         pr.add(&m.x, &m.xb2, d);
         pr.rmsnorm(&m.xb, &m.x, &m.rms_ffn.data[l], d);
-        pr.matvec_at(&m.hb, 0, 0, &m.w1, l * dim * hid, &m.xb, h, d);
-        pr.matvec_at(&m.hb2, 0, 0, &m.w3, l * dim * hid, &m.xb, h, d);
+        pr.matvec(&m.hb, &m.w1.data[l], &m.xb, h, d);
+        pr.matvec(&m.hb2, &m.w3.data[l], &m.xb, h, d);
         pr.silu_mul(&m.hb, &m.hb2, h);
-        pr.matvec_at(&m.xb, 0, 0, &m.w2, l * hid * dim, &m.hb, d, h);
+        pr.matvec(&m.xb, &m.w2.data[l], &m.hb, d, h);
         pr.add(&m.x, &m.xb, d);
     }
     pr.rmsnorm(&m.x, &m.x, &m.rms_final, d);
@@ -393,6 +466,46 @@ string load_tokenizer(Tokenizer* t, string path, int vocab_size) {
         *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
         if (created != 0) *slot = i;
     }
+    return null;
+}
+
+// The tokenizer stored in a GGUF file (SentencePiece pieces, with U+2581 for
+// a space as llama2.c's tokenizer.bin writes a plain space).
+string load_tokenizer_gguf(Tokenizer* t, *Gguf f) {
+    List<String> toks;
+    f.strings("tokenizer.ggml.tokens", &toks);
+    if (toks.size == 0) return "the GGUF file has no tokenizer";
+    t.vocab_size = toks.size;
+    t.vocab = alloc<*char>(toks.size);
+    t.scores = alloc<float>(toks.size);
+    f.floats("tokenizer.ggml.scores", t.scores, (uint64)toks.size);
+    for (i in 0..256) {
+        t.byte_pieces[i * 2] = (uint8)i;
+        t.byte_pieces[i * 2 + 1] = 0;
+    }
+    Map_init(&t.lookup, toks.size * 2);
+    for (i in 0..toks.size) {
+        String* src = &toks.data[i];
+        String piece;
+        int64 k = 0;
+        while (k < src.len) {
+            if (k + 2 < src.len && (uint8)src.data[k] == 0xE2 && (uint8)src.data[k + 1] == 0x96 && (uint8)src.data[k + 2] == 0x81) {
+                String_push(&piece, ' ');
+                k += 3;
+            } else {
+                String_push(&piece, src.data[k]);
+                k++;
+            }
+        }
+        if (piece.data == null) String_append(&piece, "");
+        if ((int)piece.len > t.max_token_length) t.max_token_length = (int)piece.len;
+        t.vocab[i] = piece.data;
+        int created = 0;
+        *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
+        if (created != 0) *slot = i;
+        String_free(src);
+    }
+    List_free(&toks);
     return null;
 }
 
@@ -635,26 +748,61 @@ int main(int argc, string* argv) {
     }
     if (seed == 0) seed = (uint64)time_now_ms();
     Transformer t;
-    string err = load_transformer(&t, checkpoint);
+    Tokenizer tok;
+    GpuModelState gm;
+    int n = (int)strlen(checkpoint);
+    bool is_gguf = n > 5 && strcmp((string)((*char)checkpoint + n - 5), ".gguf") == 0;
+    string err = null;
+    if (is_gguf) {
+        if (cpu) {
+            printf("error: GGUF models run on the GPU only\n");
+            return 1;
+        }
+        Result<Gguf, string> fr = gguf_load(checkpoint);
+        if (!fr.ok) {
+            printf("error: %s\n", fr.error);
+            return 1;
+        }
+        Gguf file = fr.value;
+        Result<Gpu, string> go = gpu_open();
+        if (!go.ok) {
+            printf("error: %s\n", go.error);
+            return 1;
+        }
+        gm.gpu = go.value;
+        Result<int, string> ok = gpu_load_gguf(&gm, &t, &file, steps > 0 ? steps : 0);
+        if (ok.ok) ok = gpu_record(&gm, &t.c);
+        if (!ok.ok) {
+            printf("error: %s\n", ok.error);
+            return 1;
+        }
+        err = load_tokenizer_gguf(&tok, &file);
+        file.free();
+    } else {
+        err = load_transformer(&t, checkpoint);
+        if (err == null) err = load_tokenizer(&tok, tokenizer_path, t.c.vocab_size);
+        if (err == null && !cpu) {
+            Result<Gpu, string> go = gpu_open();
+            Result<int, string> ok = Ok<int, string>(0);
+            if (!go.ok) ok = Err<int, string>(go.error);
+            else {
+                gm.gpu = go.value;
+                Result<NnProgram, string> pr = gm.gpu.nn_program();
+                if (!pr.ok) ok = Err<int, string>(pr.error);
+                else {
+                    gm.prog = pr.value;
+                    ok = gpu_load_bin(&gm, &t, f16);
+                    if (ok.ok) ok = gpu_record(&gm, &t.c);
+                }
+            }
+            if (!ok.ok) err = ok.error;
+        }
+    }
     if (err != null) {
         printf("error: %s\n", err);
         return 1;
     }
     if (steps <= 0 || steps > t.c.seq_len) steps = t.c.seq_len;
-    Tokenizer tok;
-    err = load_tokenizer(&tok, tokenizer_path, t.c.vocab_size);
-    if (err != null) {
-        printf("error: %s\n", err);
-        return 1;
-    }
-    GpuModelState gm;
-    if (!cpu) {
-        Result<int, string> ok = gpu_setup(&gm, &t, f16);
-        if (!ok.ok) {
-            printf("error: %s\n", ok.error);
-            return 1;
-        }
-    }
     Sampler sampler = Sampler{t.c.vocab_size, alloc<ProbIndex>(t.c.vocab_size), temperature, topp, seed};
     *int prompt_tokens = alloc<int>((int64)strlen(prompt) + 3);
     int num_prompt = encode(&tok, prompt, prompt_tokens);
