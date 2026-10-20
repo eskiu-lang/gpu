@@ -1,0 +1,323 @@
+// gpu.esk: GPU compute and rendering over WebGPU (wgpu-native).
+//
+// gpu_open() picks an adapter and a device. Every fallible call returns a
+// Result whose error is a message from the WebGPU validation layer; the message
+// lives in a buffer that the next error reuses, so copy it to keep it.
+// Each object has a release method, meant to be paired with defer:
+//
+//     Gpu gpu = gpu_open()?;
+//     defer gpu.release();
+//     GpuBuffer v = gpu.storage(data, bytes)?;
+//     defer v.release();
+//
+// The raw WebGPU API is in <gpu/raw> for anything this layer does not cover.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <gpu/raw>;
+
+String _gpu_err;
+
+struct _GpuWait {
+    int done;
+    uint32 status;
+    *void handle;
+    String msg;
+}
+
+struct _GpuState {
+    String uncaptured;
+}
+
+struct Gpu {
+    WGPUInstance instance;
+    WGPUAdapter adapter;
+    WGPUDevice device;
+    WGPUQueue queue;
+    *_GpuState state;
+}
+
+struct GpuBuffer {
+    Gpu gpu;
+    WGPUBuffer handle;
+    uint64 size;
+}
+
+struct GpuKernel {
+    Gpu gpu;
+    WGPUShaderModule module;
+    WGPUComputePipeline pipeline;
+    WGPUBindGroupLayout layout;
+    List<WGPUBindGroupEntry> entries;
+}
+
+WGPUStringView gpu_str(string s) {
+    if (s == null) return WGPUStringView{null, 0};
+    return WGPUStringView{s, (uint64)strlen(s)};
+}
+
+string _gpu_fail(string what, String* detail) {
+    String_clear(&_gpu_err);
+    String_append(&_gpu_err, what);
+    if (detail != null && detail.len > 0) {
+        String_append(&_gpu_err, ": ");
+        String_append(&_gpu_err, detail.data);
+    }
+    return _gpu_err.data;
+}
+
+void _gpu_set_msg(String* s, WGPUStringView m) {
+    String_clear(s);
+    if (m.data != null && m.length > 0) String_appendf(s, "%.*s", (int)m.length, m.data);
+}
+
+void _gpu_on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status;
+    w.handle = adapter;
+    _gpu_set_msg(&w.msg, message);
+    w.done = 1;
+}
+
+void _gpu_on_device(WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status;
+    w.handle = device;
+    _gpu_set_msg(&w.msg, message);
+    w.done = 1;
+}
+
+void _gpu_on_scope(WGPUPopErrorScopeStatus status, WGPUErrorType kind, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status == WGPUPopErrorScopeStatus_Success ? kind : WGPUErrorType_Unknown;
+    _gpu_set_msg(&w.msg, message);
+    w.done = 1;
+}
+
+void _gpu_on_map(WGPUMapAsyncStatus status, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status;
+    _gpu_set_msg(&w.msg, message);
+    w.done = 1;
+}
+
+void _gpu_on_uncaptured(*WGPUDevice device, WGPUErrorType kind, WGPUStringView message, *void u1, *void u2) {
+    *_GpuState st = (*_GpuState)u1;
+    _gpu_set_msg(&st.uncaptured, message);
+}
+
+void _gpu_wait(*Gpu g, *_GpuWait w) {
+    for (i in 0..100000) {
+        if (w.done) return;
+        if (g.device != null) wgpuDevicePoll(g.device, 1, null);
+        else wgpuInstanceProcessEvents(g.instance);
+    }
+}
+
+Result<Gpu, string> gpu_open() {
+    Gpu g;
+    g.instance = wgpuCreateInstance(null);
+    if (g.instance == null) return Err<Gpu, string>(_gpu_fail("no WebGPU instance", null));
+    _GpuWait w;
+    defer String_free(&w.msg);
+    WGPURequestAdapterOptions opts = WGPURequestAdapterOptions{powerPreference: WGPUPowerPreference_HighPerformance};
+    WGPURequestAdapterCallbackInfo ai = WGPURequestAdapterCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_adapter, userdata1: &w};
+    wgpuInstanceRequestAdapter(g.instance, &opts, ai);
+    _gpu_wait(&g, &w);
+    if (w.status != WGPURequestAdapterStatus_Success || w.handle == null) {
+        wgpuInstanceRelease(g.instance);
+        return Err<Gpu, string>(_gpu_fail("no GPU adapter", &w.msg));
+    }
+    g.adapter = (WGPUAdapter)w.handle;
+    g.state = alloc<_GpuState>(1);
+    w.done = 0;
+    WGPUDeviceDescriptor dd = WGPUDeviceDescriptor{label: gpu_str("eskiu"),
+        uncapturedErrorCallbackInfo: WGPUUncapturedErrorCallbackInfo{callback: (*void)_gpu_on_uncaptured, userdata1: g.state}};
+    WGPURequestDeviceCallbackInfo di = WGPURequestDeviceCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_device, userdata1: &w};
+    wgpuAdapterRequestDevice(g.adapter, &dd, di);
+    _gpu_wait(&g, &w);
+    if (w.status != WGPURequestDeviceStatus_Success || w.handle == null) {
+        wgpuAdapterRelease(g.adapter);
+        wgpuInstanceRelease(g.instance);
+        free(g.state);
+        return Err<Gpu, string>(_gpu_fail("no GPU device", &w.msg));
+    }
+    g.device = (WGPUDevice)w.handle;
+    g.queue = wgpuDeviceGetQueue(g.device);
+    return Ok<Gpu, string>(g);
+}
+
+void Gpu_release(*Gpu self) {
+    if (self.queue != null) wgpuQueueRelease(self.queue);
+    if (self.device != null) wgpuDeviceRelease(self.device);
+    if (self.adapter != null) wgpuAdapterRelease(self.adapter);
+    if (self.instance != null) wgpuInstanceRelease(self.instance);
+    if (self.state != null) {
+        String_free(&self.state.uncaptured);
+        free(self.state);
+    }
+    *self = Gpu{};
+}
+
+// The adapter's name, as the driver reports it, appended to out.
+void Gpu_name(*Gpu self, String* out) {
+    WGPUAdapterInfo info;
+    wgpuAdapterGetInfo(self.adapter, &info);
+    String_appendf(out, "%.*s", (int)info.device.length, info.device.data);
+    wgpuAdapterInfoFreeMembers(info);
+}
+
+// Blocks until the work submitted so far has finished.
+void Gpu_wait(*Gpu self) {
+    wgpuDevicePoll(self.device, 1, null);
+}
+
+void _gpu_push(*Gpu g) {
+    wgpuDevicePushErrorScope(g.device, WGPUErrorFilter_Validation);
+}
+
+// Pops the validation scope pushed by _gpu_push: null when nothing failed,
+// else the message prefixed by what.
+string _gpu_pop(*Gpu g, string what) {
+    _GpuWait w;
+    defer String_free(&w.msg);
+    WGPUPopErrorScopeCallbackInfo pi = WGPUPopErrorScopeCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_scope, userdata1: &w};
+    wgpuDevicePopErrorScope(g.device, pi);
+    _gpu_wait(g, &w);
+    if (w.status == WGPUErrorType_NoError) return null;
+    return _gpu_fail(what, &w.msg);
+}
+
+Result<GpuBuffer, string> Gpu_buffer(*Gpu self, uint64 size, WGPUBufferUsage usage) {
+    _gpu_push(self);
+    WGPUBufferDescriptor d = WGPUBufferDescriptor{usage: usage, size: size};
+    WGPUBuffer b = wgpuDeviceCreateBuffer(self.device, &d);
+    string err = _gpu_pop(self, "buffer");
+    if (err != null || b == null) {
+        if (b != null) wgpuBufferRelease(b);
+        return Err<GpuBuffer, string>(err != null ? err : _gpu_fail("buffer", null));
+    }
+    return Ok<GpuBuffer, string>(GpuBuffer{*self, b, size});
+}
+
+// A storage buffer holding a copy of bytes bytes at data (data may be null for
+// a zeroed buffer), readable back with read().
+Result<GpuBuffer, string> Gpu_storage(*Gpu self, *void data, uint64 bytes) {
+    GpuBuffer b = Gpu_buffer(self, bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst)?;
+    if (data != null) GpuBuffer_write(&b, 0, data, bytes);
+    return Ok<GpuBuffer, string>(b);
+}
+
+void GpuBuffer_write(*GpuBuffer self, uint64 offset, *void data, uint64 bytes) {
+    wgpuQueueWriteBuffer(self.gpu.queue, self.handle, offset, data, bytes);
+}
+
+// Copies the first bytes bytes of the buffer to out, after the work submitted
+// so far has finished.
+Result<int, string> GpuBuffer_read(*GpuBuffer self, *void out, uint64 bytes) {
+    *Gpu g = &self.gpu;
+    GpuBuffer staging = Gpu_buffer(g, bytes, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
+    defer GpuBuffer_release(&staging);
+    _gpu_push(g);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, self.handle, 0, staging.handle, 0, bytes);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
+    wgpuQueueSubmit(g.queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(enc);
+    string err = _gpu_pop(g, "read");
+    if (err != null) return Err<int, string>(err);
+    _GpuWait w;
+    defer String_free(&w.msg);
+    WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: &w};
+    wgpuBufferMapAsync(staging.handle, WGPUMapMode_Read, 0, bytes, mi);
+    _gpu_wait(g, &w);
+    if (w.status != WGPUMapAsyncStatus_Success) return Err<int, string>(_gpu_fail("read", &w.msg));
+    memcpy(out, wgpuBufferGetConstMappedRange(staging.handle, 0, bytes), (int64)bytes);
+    wgpuBufferUnmap(staging.handle);
+    return Ok<int, string>(0);
+}
+
+void GpuBuffer_release(*GpuBuffer self) {
+    if (self.handle != null) wgpuBufferRelease(self.handle);
+    self.handle = null;
+}
+
+WGPUShaderModule _gpu_module(*Gpu g, string wgsl) {
+    WGPUShaderSourceWGSL src = WGPUShaderSourceWGSL{chain: WGPUChainedStruct{null, WGPUSType_ShaderSourceWGSL}, code: gpu_str(wgsl)};
+    WGPUShaderModuleDescriptor md = WGPUShaderModuleDescriptor{nextInChain: (*WGPUChainedStruct)&src};
+    return wgpuDeviceCreateShaderModule(g.device, &md);
+}
+
+// A compute kernel: the function entry of the WGSL source, with the layout
+// of its bind group 0 taken from the shader.
+Result<GpuKernel, string> Gpu_kernel(*Gpu self, string wgsl, string entry) {
+    GpuKernel k;
+    k.gpu = *self;
+    _gpu_push(self);
+    k.module = _gpu_module(self, wgsl);
+    string err = _gpu_pop(self, "shader");
+    if (err != null) {
+        GpuKernel_release(&k);
+        return Err<GpuKernel, string>(err);
+    }
+    _gpu_push(self);
+    WGPUComputePipelineDescriptor pd = WGPUComputePipelineDescriptor{compute: WGPUComputeState{module: k.module, entryPoint: gpu_str(entry)}};
+    k.pipeline = wgpuDeviceCreateComputePipeline(self.device, &pd);
+    if (k.pipeline != null) k.layout = wgpuComputePipelineGetBindGroupLayout(k.pipeline, 0);
+    err = _gpu_pop(self, "pipeline");
+    if (err != null) {
+        GpuKernel_release(&k);
+        return Err<GpuKernel, string>(err);
+    }
+    return Ok<GpuKernel, string>(k);
+}
+
+// Binds the whole of b to @binding(binding) of group 0, for the next dispatches.
+void GpuKernel_bind(*GpuKernel self, uint32 binding, *GpuBuffer b) {
+    WGPUBindGroupEntry e = WGPUBindGroupEntry{binding: binding, buffer: b.handle, size: b.size};
+    for (i in 0..self.entries.size) {
+        if (self.entries.data[i].binding == binding) {
+            self.entries.data[i] = e;
+            return;
+        }
+    }
+    List_push(&self.entries, e);
+}
+
+// Runs x * y * z workgroups. The work runs on the GPU after the call returns;
+// read() and wait() wait for it.
+Result<int, string> GpuKernel_dispatch(*GpuKernel self, uint32 x, uint32 y, uint32 z) {
+    *Gpu g = &self.gpu;
+    _gpu_push(g);
+    WGPUBindGroupDescriptor bd = WGPUBindGroupDescriptor{layout: self.layout, entryCount: (uint64)self.entries.size, entries: self.entries.data};
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(g.device, &bd);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, null);
+    wgpuComputePassEncoderSetPipeline(pass, self.pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, null);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, x, y, z);
+    wgpuComputePassEncoderEnd(pass);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
+    wgpuQueueSubmit(g.queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuComputePassEncoderRelease(pass);
+    wgpuCommandEncoderRelease(enc);
+    if (group != null) wgpuBindGroupRelease(group);
+    string err = _gpu_pop(g, "dispatch");
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+void GpuKernel_release(*GpuKernel self) {
+    if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
+    if (self.pipeline != null) wgpuComputePipelineRelease(self.pipeline);
+    if (self.module != null) wgpuShaderModuleRelease(self.module);
+    List_free(&self.entries);
+    self.layout = null;
+    self.pipeline = null;
+    self.module = null;
+}

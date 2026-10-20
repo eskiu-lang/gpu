@@ -1,0 +1,42 @@
+// Adds two arrays of a million floats on the GPU.
+import <io>;
+import <mem>;
+import <gpu>;
+
+string add = "@group(0) @binding(0) var<storage, read> a: array<f32>;\n"
+    "@group(0) @binding(1) var<storage, read> b: array<f32>;\n"
+    "@group(0) @binding(2) var<storage, read_write> sum: array<f32>;\n"
+    "@compute @workgroup_size(256)\n"
+    "fn main(@builtin(global_invocation_id) id: vec3<u32>) { sum[id.x] = a[id.x] + b[id.x]; }\n";
+
+Result<int, string> run(int n) {
+    uint64 bytes = (uint64)n * 4;
+    *float x = alloc<float>(n);
+    *float y = alloc<float>(n);
+    defer free(x);
+    defer free(y);
+    for (i in 0..n) {
+        x[i] = (float)i;
+        y[i] = 0.5;
+    }
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuBuffer a = gpu.storage(x, bytes)?;
+    GpuBuffer b = gpu.storage(y, bytes)?;
+    GpuBuffer sum = gpu.storage(null, bytes)?;
+    defer a.release();
+    defer b.release();
+    defer sum.release();
+    GpuKernel k = gpu.kernel(add, "main")?;
+    defer k.release();
+    k.bind(0, &a);
+    k.bind(1, &b);
+    k.bind(2, &sum);
+    k.dispatch((uint32)(n / 256), 1, 1)?;
+    sum.read(x, bytes)?;
+    printf("sum[0] = %.1f, sum[%d] = %.1f\n", (double)x[0], n - 1, (double)x[n - 1]);
+    return Ok<int, string>(0);
+}
+
+Result<int, string> r = run(1 << 20);
+if (!r.ok) printf("error: %s\n", r.error);

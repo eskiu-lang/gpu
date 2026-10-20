@@ -1,0 +1,53 @@
+import <io>;
+import <mem>;
+import <gpu>;
+
+string squares =
+    "@group(0) @binding(0) var<storage, read_write> v: array<f32>;\n"
+    "@compute @workgroup_size(64)\n"
+    "fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+    "    v[id.x] = v[id.x] * v[id.x];\n"
+    "}\n";
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    int n = 4096;
+    uint64 bytes = (uint64)n * 4;
+    *float data = alloc<float>(n);
+    defer free(data);
+    for (i in 0..n) data[i] = (float)(i % 100);
+    GpuBuffer v = gpu.storage(data, bytes)?;
+    defer v.release();
+    GpuKernel k = gpu.kernel(squares, "main")?;
+    defer k.release();
+    k.bind(0, &v);
+    k.dispatch((uint32)(n / 64), 1, 1)?;
+    v.read(data, bytes)?;
+    int bad = 0;
+    for (i in 0..n) {
+        float x = (float)(i % 100);
+        if (data[i] != x * x) bad++;
+    }
+    return Ok<int, string>(bad);
+}
+
+Result<int, string> bad_shader() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuKernel k = gpu.kernel("fn main( {", "main")?;
+    k.release();
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("compute: %d mismatches\n", r.value);
+    Result<int, string> e = bad_shader();
+    printf("bad shader rejected: %d\n", e.ok ? 0 : 1);
+    return r.value == 0 && !e.ok ? 0 : 1;
+}
