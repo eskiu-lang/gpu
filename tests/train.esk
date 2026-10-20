@@ -1,0 +1,125 @@
+// <gpu/train>: gradients against finite differences on the CPU, then a small
+// classifier that must learn a nonlinear problem (two interleaved spirals).
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu>;
+import <gpu/nn>;
+import <gpu/train>;
+
+int fails = 0;
+
+Result<int, string> gradients(*Gpu gpu) {
+    uint32 batch = 4;
+    NnGraph g = gpu.nn_graph(batch)?;
+    defer g.release();
+    NnVar x = g.input(3);
+    NnVar labels = g.labels();
+    NnVar w1 = g.param(3, 5, 0.5);
+    NnVar b1 = g.param(1, 5, 0.1);
+    NnVar w2 = g.param(5, 3, 0.5);
+    NnVar h = g.tanh(g.bias(g.matmul(x, w1), b1));
+    NnVar loss = g.cross_entropy(g.matmul(h, w2), labels);
+    g.backward(loss)?;
+    g.sgd(0.0);
+    float[12] xs = {0.5, -1.0, 0.25, 1.5, 0.3, -0.7, -0.2, 0.9, 1.1, 0.0, -0.4, 0.6};
+    int[4] ys = {0, 2, 1, 2};
+    g.set_input(x, &xs[0]);
+    g.set_labels(labels, &ys[0]);
+    g.run()?;
+    float[15] grad;
+    NnTensor_read(&g.nodes.data[w1.id].grad, &grad[0], 15)?;
+    float[15] w;
+    g.read(w1, &w[0])?;
+    float h_eps = 0.001;
+    float worst = 0.0;
+    for (i in 0..15) {
+        float keep = w[i];
+        w[i] = keep + h_eps;
+        g.set_param(w1, &w[0]);
+        g.forward()?;
+        float up = g.read_scalar(loss)?;
+        w[i] = keep - h_eps;
+        g.set_param(w1, &w[0]);
+        g.forward()?;
+        float down = g.read_scalar(loss)?;
+        w[i] = keep;
+        float numeric = (up - down) / (2.0 * h_eps);
+        float d = fabsf(numeric - grad[i]);
+        if (d > worst) worst = d;
+    }
+    g.set_param(w1, &w[0]);
+    if (worst > 0.002) {
+        printf("FAIL gradient check: max error %g\n", (double)worst);
+        fails++;
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> spirals(*Gpu gpu) {
+    uint32 n = 512;
+    *float xs = alloc<float>((int64)n * 2);
+    *int ys = alloc<int>((int64)n);
+    defer free(xs);
+    defer free(ys);
+    for (i in 0..n) {
+        int cls = (int)(i % 2);
+        float t = (float)(i / 2) / (float)(n / 2) * 3.0 * 3.14159 + 0.5;
+        float r = t / 10.0;
+        float s = cls == 0 ? 1.0 : -1.0;
+        xs[i * 2] = s * r * cosf(t);
+        xs[i * 2 + 1] = s * r * sinf(t);
+        ys[i] = cls;
+    }
+    NnGraph g = gpu.nn_graph(n)?;
+    defer g.release();
+    NnVar x = g.input(2);
+    NnVar labels = g.labels();
+    NnVar h1 = g.relu(g.bias(g.matmul(x, g.param(2, 64, 1.0)), g.param(1, 64, 0.0)));
+    NnVar h2 = g.relu(g.bias(g.matmul(h1, g.param(64, 64, 0.18)), g.param(1, 64, 0.0)));
+    NnVar logits = g.bias(g.matmul(h2, g.param(64, 2, 0.18)), g.param(1, 2, 0.0));
+    NnVar loss = g.cross_entropy(logits, labels);
+    g.backward(loss)?;
+    g.adam(0.01);
+    g.set_input(x, xs);
+    g.set_labels(labels, ys);
+    float first = 0.0;
+    for (step in 0..600) {
+        g.run()?;
+        if (step == 0) first = g.read_scalar(loss)?;
+    }
+    g.forward()?;
+    float last = g.read_scalar(loss)?;
+    *float out = alloc<float>((int64)n * 2);
+    defer free(out);
+    g.read(logits, out)?;
+    int right = 0;
+    for (i in 0..n) {
+        int pred = out[i * 2 + 1] > out[i * 2] ? 1 : 0;
+        if (pred == ys[i]) right++;
+    }
+    float acc = (float)right / (float)n;
+    printf("spirals: loss %.3f -> %.3f, accuracy %.1f%%\n", (double)first, (double)last, (double)(acc * 100.0));
+    if (acc < 0.95 || last > first * 0.2) {
+        printf("FAIL spirals did not learn\n");
+        fails++;
+    }
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<Gpu, string> gr = gpu_open();
+    if (!gr.ok) {
+        printf("error: %s\n", gr.error);
+        return 1;
+    }
+    Gpu gpu = gr.value;
+    Result<int, string> r = gradients(&gpu);
+    if (r.ok) r = spirals(&gpu);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("train: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

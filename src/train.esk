@@ -1,0 +1,513 @@
+// train.esk: training on the GPU with reverse-mode automatic differentiation.
+//
+// A graph is declared once: parameters, inputs and the operations between
+// them. backward() appends the gradient of every operation in reverse order,
+// and an optimizer appends its update, so one run() is a whole training step
+// in a single compute pass:
+//
+//     NnGraph g = gpu.nn_graph(batch)?;
+//     NnVar x = g.input(784);
+//     NnVar labels = g.labels();
+//     NnVar w = g.param(784, 10, 0.05);
+//     NnVar loss = g.cross_entropy(g.bias(g.matmul(x, w), g.param(1, 10, 0.0)), labels);
+//     g.backward(loss)?;
+//     g.adam(0.001);
+//     ...each step:
+//     g.set_input(x, images);
+//     g.set_labels(labels, digits);
+//     g.run()?;
+//     float l = g.read_scalar(loss)?;
+//
+// Every value is a matrix of rows x cols floats, row-major; inputs and the
+// activations derived from them have one row per example in the batch.
+// forward() runs only the forward pass, for evaluation.
+
+import <io>;
+import <mem>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/nn>;
+
+const int _NN_INPUT = 0;
+const int _NN_PARAM = 1;
+const int _NN_LABELS = 2;
+const int _NN_MATMUL = 3;
+const int _NN_BIAS = 4;
+const int _NN_RELU = 5;
+const int _NN_XENT = 6;
+const int _NN_TANH = 7;
+const int _NN_MSE = 8;
+
+struct _NnNode {
+    int op;
+    int a;
+    int b;
+    uint32 rows;
+    uint32 cols;
+    NnTensor value;
+    NnTensor grad;
+    bool has_grad;
+    NnTensor m;
+    NnTensor v;
+}
+
+// A value in a graph (an index into it).
+struct NnVar {
+    int id;
+}
+
+struct NnGraph {
+    Gpu gpu;
+    uint32 batch;
+    List<_NnNode> nodes;
+    NnProgram fwd;
+    NnProgram step;
+    NnTensor scratch;
+    bool built;
+    uint32 adam_t;
+    GpuBuffer adam_params;
+    uint64 seed;
+}
+
+Result<NnGraph, string> Gpu_nn_graph(*Gpu self, uint32 batch) {
+    NnGraph g;
+    g.gpu = *self;
+    g.batch = batch;
+    g.fwd = Gpu_nn_program(self)?;
+    g.step = Gpu_nn_program(self)?;
+    g.scratch = Gpu_nn_tensor(self, 4)?;
+    g.seed = 0x9E3779B97F4A7C15;
+    return Ok<NnGraph, string>(g);
+}
+
+NnVar _nn_node(*NnGraph self, int op, int a, int b, uint32 rows, uint32 cols, bool grad) {
+    _NnNode n;
+    n.op = op;
+    n.a = a;
+    n.b = b;
+    n.rows = rows;
+    n.cols = cols;
+    n.value = Gpu_nn_tensor(&self.gpu, (uint64)rows * cols).value;
+    n.has_grad = grad;
+    if (grad) n.grad = Gpu_nn_tensor(&self.gpu, (uint64)rows * cols).value;
+    List_push(&self.nodes, n);
+    return NnVar{self.nodes.size - 1};
+}
+
+bool _nn_grad(*NnGraph self, int id) {
+    return self.nodes.data[id].has_grad;
+}
+
+// An input of batch rows and cols columns, filled with set_input.
+NnVar NnGraph_input(*NnGraph self, uint32 cols) {
+    return _nn_node(self, _NN_INPUT, -1, -1, self.batch, cols, false);
+}
+
+// The class index of each example (batch values, as floats), for
+// cross_entropy.
+NnVar NnGraph_labels(*NnGraph self) {
+    return _nn_node(self, _NN_LABELS, -1, -1, self.batch, 1, false);
+}
+
+double _nn_gauss(*NnGraph self) {
+    double u = 0.0;
+    double v = 0.0;
+    while (u <= 0.0) {
+        self.seed = self.seed ^ (self.seed << 13);
+        self.seed = self.seed ^ (self.seed >> 7);
+        self.seed = self.seed ^ (self.seed << 17);
+        u = (double)(self.seed >> 11) / 9007199254740992.0;
+    }
+    self.seed = self.seed ^ (self.seed << 13);
+    self.seed = self.seed ^ (self.seed >> 7);
+    self.seed = self.seed ^ (self.seed << 17);
+    v = (double)(self.seed >> 11) / 9007199254740992.0;
+    return sqrt(-2.0 * log(u)) * cos(6.283185307179586 * v);
+}
+
+// A trainable rows x cols parameter, initialized with a normal distribution
+// of standard deviation scale (0 for zeros).
+NnVar NnGraph_param(*NnGraph self, uint32 rows, uint32 cols, float scale) {
+    NnVar p = _nn_node(self, _NN_PARAM, -1, -1, rows, cols, true);
+    _NnNode* n = &self.nodes.data[p.id];
+    uint64 count = (uint64)rows * cols;
+    *float init = alloc<float>((int64)count);
+    for (i in 0..count) init[i] = (float)(_nn_gauss(self) * (double)scale);
+    GpuBuffer_write(&n.value.buf, 0, init, count * 4);
+    free(init);
+    n.m = Gpu_nn_tensor(&self.gpu, count).value;
+    n.v = Gpu_nn_tensor(&self.gpu, count).value;
+    return p;
+}
+
+// Sets the parameter's values from rows * cols floats.
+void NnGraph_set_param(*NnGraph self, NnVar p, *float data) {
+    _NnNode* n = &self.nodes.data[p.id];
+    GpuBuffer_write(&n.value.buf, 0, data, (uint64)n.rows * n.cols * 4);
+}
+
+// a (r x k) times b (k x c).
+NnVar NnGraph_matmul(*NnGraph self, NnVar a, NnVar b) {
+    _NnNode* na = &self.nodes.data[a.id];
+    _NnNode* nb = &self.nodes.data[b.id];
+    return _nn_node(self, _NN_MATMUL, a.id, b.id, na.rows, nb.cols, _nn_grad(self, a.id) || _nn_grad(self, b.id));
+}
+
+// a plus the row vector b (1 x cols) added to every row.
+NnVar NnGraph_bias(*NnGraph self, NnVar a, NnVar b) {
+    _NnNode* na = &self.nodes.data[a.id];
+    return _nn_node(self, _NN_BIAS, a.id, b.id, na.rows, na.cols, true);
+}
+
+NnVar NnGraph_relu(*NnGraph self, NnVar a) {
+    _NnNode* na = &self.nodes.data[a.id];
+    return _nn_node(self, _NN_RELU, a.id, -1, na.rows, na.cols, _nn_grad(self, a.id));
+}
+
+NnVar NnGraph_tanh(*NnGraph self, NnVar a) {
+    _NnNode* na = &self.nodes.data[a.id];
+    return _nn_node(self, _NN_TANH, a.id, -1, na.rows, na.cols, _nn_grad(self, a.id));
+}
+
+// The mean over the batch of the softmax cross-entropy of logits (one row of
+// class scores per example) against labels. A 1 x 1 value.
+NnVar NnGraph_cross_entropy(*NnGraph self, NnVar logits, NnVar labels) {
+    return _nn_node(self, _NN_XENT, logits.id, labels.id, 1, 1, false);
+}
+
+// The mean squared error between a and target (same shape). A 1 x 1 value.
+NnVar NnGraph_mse(*NnGraph self, NnVar a, NnVar target) {
+    return _nn_node(self, _NN_MSE, a.id, target.id, 1, 1, false);
+}
+
+// The node's value tensor (to read activations, or to use it with <gpu/nn>).
+*NnTensor NnGraph_value(*NnGraph self, NnVar v) {
+    return &self.nodes.data[v.id].value;
+}
+
+void NnGraph_set_input(*NnGraph self, NnVar v, *float data) {
+    _NnNode* n = &self.nodes.data[v.id];
+    GpuBuffer_write(&n.value.buf, 0, data, (uint64)n.rows * n.cols * 4);
+}
+
+void NnGraph_set_labels(*NnGraph self, NnVar v, *int classes) {
+    _NnNode* n = &self.nodes.data[v.id];
+    *float f = alloc<float>((int64)n.rows);
+    for (i in 0..n.rows) f[i] = (float)classes[i];
+    GpuBuffer_write(&n.value.buf, 0, f, (uint64)n.rows * 4);
+    free(f);
+}
+
+// Copies the value of v (rows x cols floats) to out.
+Result<int, string> NnGraph_read(*NnGraph self, NnVar v, *float out) {
+    _NnNode* n = &self.nodes.data[v.id];
+    return NnTensor_read(&n.value, out, (uint64)n.rows * n.cols);
+}
+
+Result<float, string> NnGraph_read_scalar(*NnGraph self, NnVar v) {
+    float[4] x;
+    NnTensor_read(&self.nodes.data[v.id].value, &x[0], 1)?;
+    return Ok<float, string>(x[0]);
+}
+
+// ── Kernels ──────────────────────────────────────────────────────────────────
+
+// c (m x n) = a (m x k) * b (k x n), with a or b read transposed when ta or tb
+// (their stored shapes are then k x m and n x k), added to c when acc.
+void _nn_matmul(*NnProgram p, *NnTensor c, *NnTensor a, *NnTensor b, uint32 m, uint32 n, uint32 k, bool ta, bool tb, bool acc) {
+    string body =
+        "@group(0) @binding(2) var<storage, read_write> c: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> a: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> b: array<f32>;\n"
+        "var<workgroup> ta: array<array<f32, 16>, 16>;\n"
+        "var<workgroup> tb: array<array<f32, 16>, 16>;\n"
+        "@compute @workgroup_size(16, 16) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "    let m = prm.p0;\n"
+        "    let n = prm.p1;\n"
+        "    let k = prm.p2;\n"
+        "    let row = wid.y * 16u + lid.y;\n"
+        "    let col = wid.x * 16u + lid.x;\n"
+        "    var sum = 0.0;\n"
+        "    let tiles = (k + 15u) / 16u;\n"
+        "    for (var t = 0u; t < tiles; t++) {\n"
+        "        let ak = t * 16u + lid.x;\n"
+        "        var av = 0.0;\n"
+        "        if (row < m && ak < k) { if (prm.p3 != 0u) { av = a[ak * m + row]; } else { av = a[row * k + ak]; } }\n"
+        "        ta[lid.y][lid.x] = av;\n"
+        "        let bk = t * 16u + lid.y;\n"
+        "        var bv = 0.0;\n"
+        "        if (col < n && bk < k) { if (prm.p4 != 0u) { bv = b[col * k + bk]; } else { bv = b[bk * n + col]; } }\n"
+        "        tb[lid.y][lid.x] = bv;\n"
+        "        workgroupBarrier();\n"
+        "        for (var i = 0u; i < 16u; i++) { sum += ta[lid.y][i] * tb[i][lid.x]; }\n"
+        "        workgroupBarrier();\n"
+        "    }\n"
+        "    if (row < m && col < n) {\n"
+        "        if (prm.p5 != 0u) { c[row * n + col] += sum; } else { c[row * n + col] = sum; }\n"
+        "    }\n"
+        "}\n";
+    uint32[6] prm = {m, n, k, ta ? (uint32)1 : (uint32)0, tb ? (uint32)1 : (uint32)0, acc ? (uint32)1 : (uint32)0};
+    *NnTensor[3] ts = {c, a, b};
+    _nn_record(p, "train_matmul", _nn_wgsl("", body), &prm[0], 6, &ts[0], 3, (n + 15) / 16, (m + 15) / 16, 1);
+}
+
+// One elementwise kernel: mode 0 zero x; 1 out = a + bias (row broadcast);
+// 2 relu out = max(a, 0); 3 grad a += g * (a > 0); 4 grad a += g;
+// 5 bias grad b += column sums of g; 6 tanh out; 7 grad a += g * (1 - out^2).
+void _nn_elem(*NnProgram p, int mode, *NnTensor out, *NnTensor a, *NnTensor b, uint32 rows, uint32 cols) {
+    string body =
+        "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> a: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> b: array<f32>;\n"
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {\n"
+        "    let i = gid.y * nw.x * 256u + gid.x;\n"
+        "    let rows = prm.p1;\n"
+        "    let cols = prm.p2;\n"
+        "    let mode = prm.p0;\n"
+        "    if (mode == 5u) {\n"
+        "        if (i >= cols) { return; }\n"
+        "        var s = 0.0;\n"
+        "        for (var r = 0u; r < rows; r++) { s += b[r * cols + i]; }\n"
+        "        o[i] += s;\n"
+        "        return;\n"
+        "    }\n"
+        "    if (i >= rows * cols) { return; }\n"
+        "    if (mode == 0u) { o[i] = 0.0; }\n"
+        "    else if (mode == 1u) { o[i] = a[i] + b[i % cols]; }\n"
+        "    else if (mode == 2u) { o[i] = max(a[i], 0.0); }\n"
+        "    else if (mode == 3u) { if (a[i] > 0.0) { o[i] += b[i]; } }\n"
+        "    else if (mode == 4u) { o[i] += b[i]; }\n"
+        "    else if (mode == 6u) { o[i] = tanh(a[i]); }\n"
+        "    else if (mode == 7u) { o[i] += b[i] * (1.0 - a[i] * a[i]); }\n"
+        "}\n";
+    uint32[3] prm = {(uint32)mode, rows, cols};
+    *NnTensor[3] ts = {out, a, b};
+    uint64 total = mode == 5 ? (uint64)cols : (uint64)rows * cols;
+    uint32 groups = (uint32)((total + 255) / 256);
+    uint32 gx = groups < 65535 ? groups : 65535;
+    uint32 gy = (groups + gx - 1) / gx;
+    _nn_record(p, "train_elem", _nn_wgsl("", body), &prm[0], 3, &ts[0], 3, gx, gy, 1);
+}
+
+// Softmax cross-entropy: mode 0 writes the mean loss to out[0]; mode 1 adds
+// (softmax - onehot) / rows to the logits' gradient g. One thread per row
+// for the gradient, one workgroup reduction for the loss.
+void _nn_xent(*NnProgram p, int mode, *NnTensor out, *NnTensor logits, *NnTensor labels, uint32 rows, uint32 cols) {
+    string body =
+        "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> x: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> y: array<f32>;\n"
+        "var<workgroup> part: array<f32, 256>;\n"
+        "fn row_stats(r: u32, cols: u32) -> vec2<f32> {\n"
+        "    var mx = -3.4e38;\n"
+        "    for (var c = 0u; c < cols; c++) { mx = max(mx, x[r * cols + c]); }\n"
+        "    var s = 0.0;\n"
+        "    for (var c = 0u; c < cols; c++) { s += exp(x[r * cols + c] - mx); }\n"
+        "    return vec2<f32>(mx, s);\n"
+        "}\n"
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "    let rows = prm.p1;\n"
+        "    let cols = prm.p2;\n"
+        "    if (prm.p0 == 1u) {\n"
+        "        let r = gid.x;\n"
+        "        if (r >= rows) { return; }\n"
+        "        let st = row_stats(r, cols);\n"
+        "        let label = u32(y[r]);\n"
+        "        for (var c = 0u; c < cols; c++) {\n"
+        "            var g = exp(x[r * cols + c] - st.x) / st.y;\n"
+        "            if (c == label) { g -= 1.0; }\n"
+        "            o[r * cols + c] += g / f32(rows);\n"
+        "        }\n"
+        "        return;\n"
+        "    }\n"
+        "    var loss = 0.0;\n"
+        "    for (var r = lid.x; r < rows; r += 256u) {\n"
+        "        let st = row_stats(r, cols);\n"
+        "        loss += log(st.y) + st.x - x[r * cols + u32(y[r])];\n"
+        "    }\n"
+        "    part[lid.x] = loss;\n"
+        "    workgroupBarrier();\n"
+        "    for (var s = 128u; s > 0u; s >>= 1u) { if (lid.x < s) { part[lid.x] += part[lid.x + s]; } workgroupBarrier(); }\n"
+        "    if (lid.x == 0u) { o[0] = part[0] / f32(rows); }\n"
+        "}\n";
+    uint32[3] prm = {(uint32)mode, rows, cols};
+    *NnTensor[3] ts = {out, logits, labels};
+    _nn_record(p, "train_xent", _nn_wgsl("", body), &prm[0], 3, &ts[0], 3, mode == 1 ? (rows + 255) / 256 : (uint32)1, 1, 1);
+}
+
+// Mean squared error: mode 0 the loss into out[0]; mode 1 adds
+// 2 (a - t) / n to a's gradient.
+void _nn_mse(*NnProgram p, int mode, *NnTensor out, *NnTensor a, *NnTensor t, uint32 n) {
+    string body =
+        "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> a: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> t: array<f32>;\n"
+        "var<workgroup> part: array<f32, 256>;\n"
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "    let n = prm.p1;\n"
+        "    if (prm.p0 == 1u) {\n"
+        "        if (gid.x < n) { o[gid.x] += 2.0 * (a[gid.x] - t[gid.x]) / f32(n); }\n"
+        "        return;\n"
+        "    }\n"
+        "    var s = 0.0;\n"
+        "    for (var i = lid.x; i < n; i += 256u) { let d = a[i] - t[i]; s += d * d; }\n"
+        "    part[lid.x] = s;\n"
+        "    workgroupBarrier();\n"
+        "    for (var k = 128u; k > 0u; k >>= 1u) { if (lid.x < k) { part[lid.x] += part[lid.x + k]; } workgroupBarrier(); }\n"
+        "    if (lid.x == 0u) { o[0] = part[0] / f32(n); }\n"
+        "}\n";
+    uint32[2] prm = {(uint32)mode, n};
+    *NnTensor[3] ts = {out, a, t};
+    _nn_record(p, "train_mse", _nn_wgsl("", body), &prm[0], 2, &ts[0], 3, mode == 1 ? (n + 255) / 256 : (uint32)1, 1, 1);
+}
+
+// Adam (or SGD when beta1 and beta2 are 0): p -= lr * mhat / (sqrt(vhat) + eps),
+// with the step count from the step uniform's c.
+void _nn_adam(*NnProgram p, *NnTensor param, *NnTensor grad, *NnTensor m, *NnTensor v, uint32 n, float lr, float b1, float b2,
+    float wd) {
+    string body =
+        "@group(0) @binding(2) var<storage, read_write> w: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> g: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read_write> m: array<f32>;\n"
+        "@group(0) @binding(5) var<storage, read_write> v: array<f32>;\n"
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nw: vec3<u32>) {\n"
+        "    let i = gid.y * nw.x * 256u + gid.x;\n"
+        "    if (i >= prm.p0) { return; }\n"
+        "    let lr = bitcast<f32>(prm.p1);\n"
+        "    let b1 = bitcast<f32>(prm.p2);\n"
+        "    let b2 = bitcast<f32>(prm.p3);\n"
+        "    let wd = bitcast<f32>(prm.p4);\n"
+        "    let gi = g[i] + wd * w[i];\n"
+        "    if (b1 == 0.0) { w[i] -= lr * gi; return; }\n"
+        "    let t = f32(step.c);\n"
+        "    m[i] = b1 * m[i] + (1.0 - b1) * gi;\n"
+        "    v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;\n"
+        "    let mh = m[i] / (1.0 - pow(b1, t));\n"
+        "    let vh = v[i] / (1.0 - pow(b2, t));\n"
+        "    w[i] -= lr * mh / (sqrt(vh) + 1e-8);\n"
+        "}\n";
+    uint32[5] prm = {n, _nn_bits(lr), _nn_bits(b1), _nn_bits(b2), _nn_bits(wd)};
+    *NnTensor[4] ts = {param, grad, m, v};
+    uint32 groups = (n + 255) / 256;
+    uint32 gx = groups < 65535 ? groups : 65535;
+    uint32 gy = (groups + gx - 1) / gx;
+    _nn_record(p, "train_adam", _nn_wgsl("", body), &prm[0], 5, &ts[0], 4, gx, gy, 1);
+}
+
+// ── Building the programs ────────────────────────────────────────────────────
+
+void _nn_forward_op(*NnGraph self, *NnProgram p, int id) {
+    _NnNode* n = &self.nodes.data[id];
+    if (n.op == _NN_MATMUL) {
+        _NnNode* a = &self.nodes.data[n.a];
+        _nn_matmul(p, &n.value, &a.value, &self.nodes.data[n.b].value, n.rows, n.cols, a.cols, false, false, false);
+    } else if (n.op == _NN_BIAS) _nn_elem(p, 1, &n.value, &self.nodes.data[n.a].value, &self.nodes.data[n.b].value, n.rows, n.cols);
+    else if (n.op == _NN_RELU) _nn_elem(p, 2, &n.value, &self.nodes.data[n.a].value, &self.nodes.data[n.a].value, n.rows, n.cols);
+    else if (n.op == _NN_TANH) _nn_elem(p, 6, &n.value, &self.nodes.data[n.a].value, &self.nodes.data[n.a].value, n.rows, n.cols);
+    else if (n.op == _NN_XENT) {
+        _NnNode* a = &self.nodes.data[n.a];
+        _nn_xent(p, 0, &n.value, &a.value, &self.nodes.data[n.b].value, a.rows, a.cols);
+    } else if (n.op == _NN_MSE) {
+        _NnNode* a = &self.nodes.data[n.a];
+        _nn_mse(p, 0, &n.value, &a.value, &self.nodes.data[n.b].value, a.rows * a.cols);
+    }
+}
+
+// Appends the gradient of node id (its grad already complete) to the inputs'
+// grads.
+void _nn_backward_op(*NnGraph self, *NnProgram p, int id) {
+    _NnNode* n = &self.nodes.data[id];
+    if (n.op == _NN_MATMUL) {
+        _NnNode* a = &self.nodes.data[n.a];
+        _NnNode* b = &self.nodes.data[n.b];
+        if (a.has_grad) _nn_matmul(p, &a.grad, &n.grad, &b.value, a.rows, a.cols, n.cols, false, true, true);
+        if (b.has_grad) _nn_matmul(p, &b.grad, &a.value, &n.grad, b.rows, b.cols, a.rows, true, false, true);
+    } else if (n.op == _NN_BIAS) {
+        _NnNode* a = &self.nodes.data[n.a];
+        _NnNode* b = &self.nodes.data[n.b];
+        if (a.has_grad) _nn_elem(p, 4, &a.grad, &n.grad, &n.grad, n.rows, n.cols);
+        if (b.has_grad) _nn_elem(p, 5, &b.grad, &n.grad, &n.grad, n.rows, n.cols);
+    } else if (n.op == _NN_RELU) {
+        _NnNode* a = &self.nodes.data[n.a];
+        if (a.has_grad) _nn_elem(p, 3, &a.grad, &a.value, &n.grad, n.rows, n.cols);
+    } else if (n.op == _NN_TANH) {
+        _NnNode* a = &self.nodes.data[n.a];
+        if (a.has_grad) _nn_elem(p, 7, &a.grad, &n.value, &n.grad, n.rows, n.cols);
+    } else if (n.op == _NN_XENT) {
+        _NnNode* a = &self.nodes.data[n.a];
+        if (a.has_grad) _nn_xent(p, 1, &a.grad, &a.value, &self.nodes.data[n.b].value, a.rows, a.cols);
+    } else if (n.op == _NN_MSE) {
+        _NnNode* a = &self.nodes.data[n.a];
+        if (a.has_grad) _nn_mse(p, 1, &a.grad, &a.value, &self.nodes.data[n.b].value, a.rows * a.cols);
+    }
+}
+
+// Records the forward pass and, for loss, the backward pass: the training
+// program then computes every parameter's gradient. The forward program
+// (forward()) is recorded as well, for evaluation.
+Result<int, string> NnGraph_backward(*NnGraph self, NnVar loss) {
+    for (i in 0..self.nodes.size) _nn_forward_op(self, &self.fwd, i);
+    for (i in 0..self.nodes.size) {
+        _NnNode* n = &self.nodes.data[i];
+        if (n.has_grad) _nn_elem(&self.step, 0, &n.grad, &self.scratch, &self.scratch, n.rows, n.cols);
+    }
+    for (i in 0..self.nodes.size) _nn_forward_op(self, &self.step, i);
+    for (k in 0..loss.id + 1) {
+        int i = loss.id - k;
+        _nn_backward_op(self, &self.step, i);
+    }
+    self.built = true;
+    return Ok<int, string>(0);
+}
+
+// Appends an Adam update of every parameter (beta1 0.9, beta2 0.999).
+void NnGraph_adam(*NnGraph self, float lr) {
+    NnGraph_adam_with(self, lr, 0.9, 0.999, 0.0);
+}
+
+void NnGraph_adam_with(*NnGraph self, float lr, float beta1, float beta2, float weight_decay) {
+    for (i in 0..self.nodes.size) {
+        _NnNode* n = &self.nodes.data[i];
+        if (n.op != _NN_PARAM) continue;
+        _nn_adam(&self.step, &n.value, &n.grad, &n.m, &n.v, n.rows * n.cols, lr, beta1, beta2, weight_decay);
+    }
+}
+
+// Appends a plain gradient descent update of every parameter.
+void NnGraph_sgd(*NnGraph self, float lr) {
+    NnGraph_adam_with(self, lr, 0.0, 0.0, 0.0);
+}
+
+// One training step: forward, backward and the optimizer update.
+Result<int, string> NnGraph_run(*NnGraph self) {
+    if (!self.built) return Err<int, string>("call backward() before run()");
+    self.adam_t++;
+    self.step.step_values[2] = self.adam_t;
+    NnProgram_set_step(&self.step, 0, 0);
+    return NnProgram_run(&self.step);
+}
+
+// The forward pass only (no gradients, no update), for evaluation.
+Result<int, string> NnGraph_forward(*NnGraph self) {
+    if (!self.built) return Err<int, string>("call backward() before forward()");
+    return NnProgram_run(&self.fwd);
+}
+
+void NnGraph_release(*NnGraph self) {
+    NnProgram_release(&self.fwd);
+    NnProgram_release(&self.step);
+    for (i in 0..self.nodes.size) {
+        _NnNode* n = &self.nodes.data[i];
+        NnTensor_release(&n.value);
+        if (n.has_grad) NnTensor_release(&n.grad);
+        if (n.op == _NN_PARAM) {
+            NnTensor_release(&n.m);
+            NnTensor_release(&n.v);
+        }
+    }
+    NnTensor_release(&self.scratch);
+    List_free(&self.nodes);
+}
