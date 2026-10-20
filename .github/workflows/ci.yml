@@ -58,7 +58,9 @@ jobs:
       - name: Install Eskiu and wgpu-native
         run: |
           curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
-          unzip -q eskiu.zip -d $HOME/eskiu
+          # The archive's paths use backslashes; unzip extracts it and exits with 1 (a warning).
+          unzip -q eskiu.zip -d $HOME/eskiu || [ $? -eq 1 ]
+          test -x $HOME/eskiu/bin/eskiuc.exe
           curl -fsSL -o wgpu.zip https://github.com/gfx-rs/wgpu-native/releases/download/$WGPU_VERSION/wgpu-windows-x86_64-gnu-release.zip
           unzip -q wgpu.zip -d $HOME/wgpu
       - name: Layout check
