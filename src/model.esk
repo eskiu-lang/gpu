@@ -16,7 +16,8 @@
 // mask and blend, double-sided materials, KHR_materials_unlit and skinning,
 // lit by one directional light (GpuModel.light) and a hemisphere ambient term.
 // The Gltf must outlive the model: update() reads its node poses. A model is
-// drawn once per pass (its uniforms hold one pose and one camera).
+// drawn once per pass (its uniforms hold one pose and one camera). OBJ files
+// load into the same Gltf (obj_load, or model_load for either kind).
 
 import <io>;
 import <mem>;
@@ -29,6 +30,7 @@ import <gpu/core>;
 import <gpu/render>;
 import <gpu/math>;
 import <gpu/gltf>;
+import <gpu/obj>;
 import <gpu/image>;
 
 struct GpuCamera {
@@ -216,6 +218,16 @@ string _gpu_model_shader =
     "    let outc = select(color, to_srgb(color), frame.ambient.w > 0.5);\n"
     "    return vec4(outc, select(1.0, base.a, mat.misc.x > 1.5));\n"
     "}\n";
+
+// Loads a model file: Wavefront OBJ when the name ends in .obj (any case),
+// glTF (.gltf or .glb) otherwise.
+Result<Gltf, string> model_load(string path) {
+    int n = (int)strlen(path);
+    if (n > 4 && path[n - 4] == '.' && (path[n - 3] | 32) == 'o' && (path[n - 2] | 32) == 'b' && (path[n - 1] | 32) == 'j') {
+        return obj_load(path);
+    }
+    return gltf_load(path);
+}
 
 bool _gpu_is_srgb(WGPUTextureFormat f) {
     return f == WGPUTextureFormat_RGBA8UnormSrgb || f == WGPUTextureFormat_BGRA8UnormSrgb;
