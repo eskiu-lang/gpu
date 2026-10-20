@@ -32,8 +32,11 @@ struct _GpuState {
     String uncaptured;
 }
 
-// f16 and subgroups say whether shaders may use `enable f16;` and
-// `enable subgroups;`; max_buffer is the largest buffer the device allows.
+// f16 and subgroups say whether shaders may use f16 values and subgroup
+// operations; subgroup_min and subgroup_max bound the subgroup size (they
+// vary by GPU: 32 on Apple and NVIDIA, 64 on some AMD, 4 to 64 elsewhere;
+// Metal does not report them and Apple GPUs use 32);
+// max_buffer is the largest buffer the device allows.
 struct Gpu {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -43,6 +46,8 @@ struct Gpu {
     bool f16;
     bool subgroups;
     uint64 max_buffer;
+    uint32 subgroup_min;
+    uint32 subgroup_max;
 }
 
 struct GpuBuffer {
@@ -160,6 +165,15 @@ Result<Gpu, string> gpu_open() {
         g.subgroups = true;
     }
     g.max_buffer = limits.maxBufferSize;
+    WGPUAdapterInfo info;
+    wgpuAdapterGetInfo(g.adapter, &info);
+    g.subgroup_min = info.subgroupMinSize;
+    g.subgroup_max = info.subgroupMaxSize;
+    if (info.backendType == WGPUBackendType_Metal && g.subgroup_max == 0) {
+        g.subgroup_min = 32;
+        g.subgroup_max = 32;
+    }
+    wgpuAdapterInfoFreeMembers(info);
     WGPUDeviceDescriptor dd = WGPUDeviceDescriptor{label: gpu_str("eskiu"), requiredFeatureCount: nfeatures,
         requiredFeatures: &features[0], requiredLimits: &limits,
         uncapturedErrorCallbackInfo: WGPUUncapturedErrorCallbackInfo{callback: (*void)_gpu_on_uncaptured, userdata1: g.state}};

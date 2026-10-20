@@ -240,7 +240,10 @@ _NnPipe* _nn_pipe(*NnProgram self, string key, string wgsl) {
     p.pipeline = wgpuDeviceCreateComputePipeline(g.device, &pd);
     if (p.pipeline != null) p.layout = wgpuComputePipelineGetBindGroupLayout(p.pipeline, 0);
     string err = _gpu_pop(g, key);
-    if (err != null) printf("nn: %s\n", err);
+    if (err != null) {
+        print_err("nn: ");
+        println_err(err);
+    }
     List_push(&self.pipes, p);
     return &self.pipes.data[self.pipes.size - 1];
 }
@@ -264,7 +267,10 @@ void _nn_record(*NnProgram self, string key, string wgsl, *uint32 params, int np
     _gpu_push(g);
     WGPUBindGroup group = wgpuDeviceCreateBindGroup(g.device, &bd);
     string err = _gpu_pop(g, key);
-    if (err != null) printf("nn: %s\n", err);
+    if (err != null) {
+        print_err("nn: ");
+        println_err(err);
+    }
     List_push(&self.ops, _NnOp{pipe.pipeline, group, x, y, z});
 }
 
@@ -399,7 +405,7 @@ void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor we
 // subgroup (or a 32-thread slice of the workgroup) per row.
 void NnProgram_matvec_at(*NnProgram self, *NnTensor out, uint32 out_offset, uint32 out_pos_stride, *NnTensor w, uint64 w_offset,
     *NnTensor x, uint32 rows, uint32 cols) {
-    bool sg = self.gpu.subgroups;
+    bool sg = self.gpu.subgroups && self.gpu.subgroup_min == 32 && self.gpu.subgroup_max == 32;
     if (w.kind == NN_Q8_0 || w.kind == NN_Q4_0) {
         _nn_matvec_quant(self, out, out_offset, out_pos_stride, w, w_offset, x, rows, cols);
         return;
@@ -446,7 +452,7 @@ void NnProgram_matvec_at(*NnProgram self, *NnTensor out, uint32 out_offset, uint
 // blocks of 32 values (w_offset counts values and must be a multiple of 32).
 void _nn_matvec_quant(*NnProgram self, *NnTensor out, uint32 out_offset, uint32 out_pos_stride, *NnTensor w, uint64 w_offset,
     *NnTensor x, uint32 rows, uint32 cols) {
-    bool sg = self.gpu.subgroups;
+    bool sg = self.gpu.subgroups && self.gpu.subgroup_min == 32 && self.gpu.subgroup_max == 32;
     bool q8 = w.kind == NN_Q8_0;
     String body;
     defer String_free(&body);
