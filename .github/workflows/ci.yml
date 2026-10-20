@@ -54,7 +54,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc unzip
+          install: mingw-w64-x86_64-gcc unzip diffutils
       - name: Install Eskiu and wgpu-native
         run: |
           curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
