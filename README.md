@@ -106,7 +106,16 @@ while (running) {
 ```
 
 [`examples/cube.esk`](examples/cube.esk) adds a vertex and an index buffer, a texture, a
-depth buffer and a matrix uniform from `<gpu/math>`. Both quit with Escape, or after N frames
+depth buffer and a matrix uniform built with `<gpu/math>`:
+
+```eskiu
+Quat spin = quat_axis_angle(Vec3{0.4, 1.0, 0.2}, t);
+Mat4 mvp = proj * view * mat4_trs(position, spin, Vec3{1.0, 1.0, 1.0});
+ub.write(0, &mvp, sizeof(Mat4));
+```
+
+In a uniform or storage buffer a WGSL `vec3<f32>` takes 16 bytes, so a field the shader
+reads as `vec3` is a `Vec4` (or a `Vec3` and a `float`) on the Eskiu side. Both quit with Escape, or after N frames
 with `--frames N`.
 
 ## Install
@@ -138,7 +147,7 @@ to the executable.
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
 | `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window surfaces |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 (links SDL3) |
-| `<gpu/math>` | `Mat4`: perspective, look at, rotate, translate, multiply |
+| `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
 | `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
 | `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
 

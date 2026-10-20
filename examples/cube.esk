@@ -110,9 +110,7 @@ Result<int, string> run(int max_frames) {
         }
         float t = (float)window_ticks() / 1000.0;
         Mat4 proj = mat4_perspective(0.9, (float)surface.width / (float)surface.height, 0.1, 100.0);
-        Mat4 model = mat4_rotate(t, Vec3{0.4, 1.0, 0.2});
-        Mat4 vm = view.mul(&model);
-        mvp = proj.mul(&vm);
+        mvp = proj * view * quat_axis_angle(Vec3{0.4, 1.0, 0.2}, t).to_mat4();
         ub.write(0, &mvp, sizeof(Mat4));
         Result<GpuFrame, string> fr = surface.frame();
         if (!fr.ok) {

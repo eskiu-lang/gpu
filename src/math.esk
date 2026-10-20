@@ -1,16 +1,242 @@
-// math.esk: 4x4 matrices for shaders (column-major, as WGSL's mat4x4<f32>),
-// with WebGPU's clip space (depth from 0 to 1).
+// math.esk: vectors, quaternions and 4x4 matrices for 3D work.
+//
+// Matrices are column-major, as WGSL's mat4x4<f32>, and use WebGPU's clip
+// space (depth from 0 to 1). Vectors and quaternions have the arithmetic
+// operators, so a model matrix reads as
+//
+//     Mat4 mvp = proj * view * mat4_trs(pos, quat_axis_angle(up, t), scale);
+//
+// In a uniform or storage buffer a WGSL vec3<f32> takes 16 bytes, not 12:
+// put a Vec4 (or a Vec3 and a float) where the shader has a vec3.
 
 import <libc>;
 
-struct Mat4 {
-    float[16] m;
+struct Vec2 {
+    float x;
+    float y;
 }
 
 struct Vec3 {
     float x;
     float y;
     float z;
+}
+
+struct Vec4 {
+    float x;
+    float y;
+    float z;
+    float w;
+}
+
+// A rotation: x, y, z is the vector part and w the scalar part.
+struct Quat {
+    float x;
+    float y;
+    float z;
+    float w;
+}
+
+struct Mat4 {
+    float[16] m;
+}
+
+float _m_sqrt(float x) {
+    return (float)sqrt((double)x);
+}
+
+Vec2 operator +(Vec2 a, Vec2 b) {
+    return Vec2{a.x + b.x, a.y + b.y};
+}
+
+Vec2 operator -(Vec2 a, Vec2 b) {
+    return Vec2{a.x - b.x, a.y - b.y};
+}
+
+Vec2 operator *(Vec2 a, float s) {
+    return Vec2{a.x * s, a.y * s};
+}
+
+Vec2 operator /(Vec2 a, float s) {
+    return Vec2{a.x / s, a.y / s};
+}
+
+Vec2 operator -(Vec2 a) {
+    return Vec2{-a.x, -a.y};
+}
+
+float Vec2_dot(const Vec2* self, Vec2 b) {
+    return self.x * b.x + self.y * b.y;
+}
+
+float Vec2_length(const Vec2* self) {
+    return _m_sqrt(self.x * self.x + self.y * self.y);
+}
+
+Vec2 Vec2_normalize(const Vec2* self) {
+    float l = Vec2_length(self);
+    if (l == 0.0) return *self;
+    return Vec2{self.x / l, self.y / l};
+}
+
+Vec2 Vec2_lerp(const Vec2* self, Vec2 b, float t) {
+    return Vec2{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t};
+}
+
+Vec3 operator +(Vec3 a, Vec3 b) {
+    return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3 operator -(Vec3 a, Vec3 b) {
+    return Vec3{a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+Vec3 operator *(Vec3 a, float s) {
+    return Vec3{a.x * s, a.y * s, a.z * s};
+}
+
+Vec3 operator /(Vec3 a, float s) {
+    return Vec3{a.x / s, a.y / s, a.z / s};
+}
+
+Vec3 operator -(Vec3 a) {
+    return Vec3{-a.x, -a.y, -a.z};
+}
+
+float Vec3_dot(const Vec3* self, Vec3 b) {
+    return self.x * b.x + self.y * b.y + self.z * b.z;
+}
+
+Vec3 Vec3_cross(const Vec3* self, Vec3 b) {
+    return Vec3{self.y * b.z - self.z * b.y, self.z * b.x - self.x * b.z, self.x * b.y - self.y * b.x};
+}
+
+float Vec3_length(const Vec3* self) {
+    return _m_sqrt(Vec3_dot(self, *self));
+}
+
+// The vector scaled to length 1 (the zero vector stays zero).
+Vec3 Vec3_normalize(const Vec3* self) {
+    float l = Vec3_length(self);
+    if (l == 0.0) return *self;
+    return Vec3{self.x / l, self.y / l, self.z / l};
+}
+
+Vec3 Vec3_lerp(const Vec3* self, Vec3 b, float t) {
+    return Vec3{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t, self.z + (b.z - self.z) * t};
+}
+
+// Component-wise product.
+Vec3 Vec3_mul(const Vec3* self, Vec3 b) {
+    return Vec3{self.x * b.x, self.y * b.y, self.z * b.z};
+}
+
+Vec4 Vec3_to_vec4(const Vec3* self, float w) {
+    return Vec4{self.x, self.y, self.z, w};
+}
+
+Vec4 operator +(Vec4 a, Vec4 b) {
+    return Vec4{a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w};
+}
+
+Vec4 operator -(Vec4 a, Vec4 b) {
+    return Vec4{a.x - b.x, a.y - b.y, a.z - b.z, a.w - b.w};
+}
+
+Vec4 operator *(Vec4 a, float s) {
+    return Vec4{a.x * s, a.y * s, a.z * s, a.w * s};
+}
+
+Vec4 operator /(Vec4 a, float s) {
+    return Vec4{a.x / s, a.y / s, a.z / s, a.w / s};
+}
+
+Vec4 operator -(Vec4 a) {
+    return Vec4{-a.x, -a.y, -a.z, -a.w};
+}
+
+float Vec4_dot(const Vec4* self, Vec4 b) {
+    return self.x * b.x + self.y * b.y + self.z * b.z + self.w * b.w;
+}
+
+float Vec4_length(const Vec4* self) {
+    return _m_sqrt(Vec4_dot(self, *self));
+}
+
+Vec4 Vec4_lerp(const Vec4* self, Vec4 b, float t) {
+    return Vec4{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t,
+        self.z + (b.z - self.z) * t, self.w + (b.w - self.w) * t};
+}
+
+Vec3 Vec4_xyz(const Vec4* self) {
+    return Vec3{self.x, self.y, self.z};
+}
+
+Quat quat_identity() {
+    return Quat{0.0, 0.0, 0.0, 1.0};
+}
+
+// A rotation of angle radians around axis (normalized here).
+Quat quat_axis_angle(Vec3 axis, float angle) {
+    Vec3 a = axis.normalize();
+    float s = (float)sin((double)angle / 2.0);
+    return Quat{a.x * s, a.y * s, a.z * s, (float)cos((double)angle / 2.0)};
+}
+
+// a * b rotates by b first, then by a.
+Quat operator *(Quat a, Quat b) {
+    return Quat{a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+// A rotation by roll around z, then pitch around x, then yaw around y
+// (radians).
+Quat quat_euler(float pitch, float yaw, float roll) {
+    Quat qx = quat_axis_angle(Vec3{1.0, 0.0, 0.0}, pitch);
+    Quat qy = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, yaw);
+    Quat qz = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, roll);
+    return qy * qx * qz;
+}
+
+float Quat_dot(const Quat* self, Quat b) {
+    return self.x * b.x + self.y * b.y + self.z * b.z + self.w * b.w;
+}
+
+Quat Quat_normalize(const Quat* self) {
+    float l = _m_sqrt(Quat_dot(self, *self));
+    if (l == 0.0) return quat_identity();
+    return Quat{self.x / l, self.y / l, self.z / l, self.w / l};
+}
+
+// The inverse rotation of a unit quaternion.
+Quat Quat_conjugate(const Quat* self) {
+    return Quat{-self.x, -self.y, -self.z, self.w};
+}
+
+// v rotated by the (unit) quaternion.
+Vec3 Quat_rotate(const Quat* self, Vec3 v) {
+    Vec3 u = Vec3{self.x, self.y, self.z};
+    Vec3 t = u.cross(v) * 2.0;
+    return v + t * self.w + u.cross(t);
+}
+
+// Spherical interpolation from a (t = 0) to b (t = 1) along the shorter arc.
+Quat quat_slerp(Quat a, Quat b, float t) {
+    float d = a.dot(b);
+    if (d < 0.0) {
+        b = Quat{-b.x, -b.y, -b.z, -b.w};
+        d = -d;
+    }
+    if (d > 0.9995) {
+        Quat r = Quat{a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t};
+        return r.normalize();
+    }
+    double theta = acos((double)d);
+    float sa = (float)(sin((1.0 - (double)t) * theta) / sin(theta));
+    float sb = (float)(sin((double)t * theta) / sin(theta));
+    return Quat{a.x * sa + b.x * sb, a.y * sa + b.y * sb, a.z * sa + b.z * sb, a.w * sa + b.w * sb};
 }
 
 Mat4 mat4_identity() {
@@ -22,8 +248,27 @@ Mat4 mat4_identity() {
     return r;
 }
 
+// The rotation matrix of the (unit) quaternion.
+Mat4 Quat_to_mat4(const Quat* self) {
+    float x = self.x;
+    float y = self.y;
+    float z = self.z;
+    float w = self.w;
+    Mat4 r = mat4_identity();
+    r.m[0] = 1.0 - 2.0 * (y * y + z * z);
+    r.m[1] = 2.0 * (x * y + z * w);
+    r.m[2] = 2.0 * (x * z - y * w);
+    r.m[4] = 2.0 * (x * y - z * w);
+    r.m[5] = 1.0 - 2.0 * (x * x + z * z);
+    r.m[6] = 2.0 * (y * z + x * w);
+    r.m[8] = 2.0 * (x * z + y * w);
+    r.m[9] = 2.0 * (y * z - x * w);
+    r.m[10] = 1.0 - 2.0 * (x * x + y * y);
+    return r;
+}
+
 // self * b: b is applied first.
-Mat4 Mat4_mul(*Mat4 self, *Mat4 b) {
+Mat4 Mat4_mul(const Mat4* self, Mat4 b) {
     Mat4 r;
     for (c in 0..4) {
         for (row in 0..4) {
@@ -31,6 +276,32 @@ Mat4 Mat4_mul(*Mat4 self, *Mat4 b) {
             for (k in 0..4) s += self.m[k * 4 + row] * b.m[c * 4 + k];
             r.m[c * 4 + row] = s;
         }
+    }
+    return r;
+}
+
+Mat4 operator *(Mat4 a, Mat4 b) {
+    return a.mul(b);
+}
+
+Vec4 operator *(Mat4 a, Vec4 v) {
+    return Vec4{a.m[0] * v.x + a.m[4] * v.y + a.m[8] * v.z + a.m[12] * v.w,
+                a.m[1] * v.x + a.m[5] * v.y + a.m[9] * v.z + a.m[13] * v.w,
+                a.m[2] * v.x + a.m[6] * v.y + a.m[10] * v.z + a.m[14] * v.w,
+                a.m[3] * v.x + a.m[7] * v.y + a.m[11] * v.z + a.m[15] * v.w};
+}
+
+// A point transformed by the matrix (w = 1, then divided by w).
+Vec3 Mat4_point(const Mat4* self, Vec3 p) {
+    Vec4 r = *self * Vec4{p.x, p.y, p.z, 1.0};
+    if (r.w != 0.0 && r.w != 1.0) return Vec3{r.x / r.w, r.y / r.w, r.z / r.w};
+    return Vec3{r.x, r.y, r.z};
+}
+
+Mat4 Mat4_transpose(const Mat4* self) {
+    Mat4 r;
+    for (c in 0..4) {
+        for (row in 0..4) r.m[row * 4 + c] = self.m[c * 4 + row];
     }
     return r;
 }
@@ -47,28 +318,24 @@ Mat4 mat4_perspective(float fovy, float aspect, float near, float far) {
     return r;
 }
 
-Vec3 _v3_sub(Vec3 a, Vec3 b) {
-    return Vec3{a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-Vec3 _v3_cross(Vec3 a, Vec3 b) {
-    return Vec3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
-}
-
-float _v3_dot(Vec3 a, Vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-Vec3 _v3_norm(Vec3 a) {
-    float l = (float)sqrt((double)_v3_dot(a, a));
-    return Vec3{a.x / l, a.y / l, a.z / l};
+// An orthographic projection of the box from (left, bottom, near) to
+// (right, top, far).
+Mat4 mat4_ortho(float left, float right, float bottom, float top, float near, float far) {
+    Mat4 r = mat4_identity();
+    r.m[0] = 2.0 / (right - left);
+    r.m[5] = 2.0 / (top - bottom);
+    r.m[10] = 1.0 / (near - far);
+    r.m[12] = (left + right) / (left - right);
+    r.m[13] = (bottom + top) / (bottom - top);
+    r.m[14] = near / (near - far);
+    return r;
 }
 
 // A view matrix for a camera at eye looking at target.
 Mat4 mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) {
-    Vec3 f = _v3_norm(_v3_sub(target, eye));
-    Vec3 s = _v3_norm(_v3_cross(f, up));
-    Vec3 u = _v3_cross(s, f);
+    Vec3 f = (target - eye).normalize();
+    Vec3 s = f.cross(up).normalize();
+    Vec3 u = s.cross(f);
     Mat4 r = mat4_identity();
     r.m[0] = s.x;
     r.m[4] = s.y;
@@ -79,35 +346,44 @@ Mat4 mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) {
     r.m[2] = -f.x;
     r.m[6] = -f.y;
     r.m[10] = -f.z;
-    r.m[12] = -_v3_dot(s, eye);
-    r.m[13] = -_v3_dot(u, eye);
-    r.m[14] = _v3_dot(f, eye);
+    r.m[12] = -s.dot(eye);
+    r.m[13] = -u.dot(eye);
+    r.m[14] = f.dot(eye);
     return r;
 }
 
-// A rotation of angle radians around a unit axis.
+// A rotation of angle radians around axis.
 Mat4 mat4_rotate(float angle, Vec3 axis) {
-    float c = (float)cos((double)angle);
-    float s = (float)sin((double)angle);
-    float t = 1.0 - c;
-    Vec3 a = _v3_norm(axis);
+    Quat q = quat_axis_angle(axis, angle);
+    return q.to_mat4();
+}
+
+Mat4 mat4_translate(Vec3 t) {
     Mat4 r = mat4_identity();
-    r.m[0] = t * a.x * a.x + c;
-    r.m[1] = t * a.x * a.y + s * a.z;
-    r.m[2] = t * a.x * a.z - s * a.y;
-    r.m[4] = t * a.x * a.y - s * a.z;
-    r.m[5] = t * a.y * a.y + c;
-    r.m[6] = t * a.y * a.z + s * a.x;
-    r.m[8] = t * a.x * a.z + s * a.y;
-    r.m[9] = t * a.y * a.z - s * a.x;
-    r.m[10] = t * a.z * a.z + c;
+    r.m[12] = t.x;
+    r.m[13] = t.y;
+    r.m[14] = t.z;
     return r;
 }
 
-Mat4 mat4_translate(float x, float y, float z) {
+Mat4 mat4_scale(Vec3 s) {
     Mat4 r = mat4_identity();
-    r.m[12] = x;
-    r.m[13] = y;
-    r.m[14] = z;
+    r.m[0] = s.x;
+    r.m[5] = s.y;
+    r.m[10] = s.z;
     return r;
+}
+
+// Translation * rotation * scale: the usual model matrix.
+Mat4 mat4_trs(Vec3 t, Quat r, Vec3 s) {
+    Mat4 m = r.to_mat4();
+    for (i in 0..3) {
+        m.m[i] = m.m[i] * s.x;
+        m.m[4 + i] = m.m[4 + i] * s.y;
+        m.m[8 + i] = m.m[8 + i] * s.z;
+    }
+    m.m[12] = t.x;
+    m.m[13] = t.y;
+    m.m[14] = t.z;
+    return m;
 }

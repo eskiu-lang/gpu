@@ -77,9 +77,8 @@ Result<int, string> run() {
     defer samp.release();
     Mat4 view = mat4_look_at(Vec3{0.0, 1.5, 5.0}, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
     Mat4 proj = mat4_perspective(0.9, 1.0, 0.1, 100.0);
-    Mat4 model = mat4_rotate(0.6, Vec3{0.4, 1.0, 0.2});
-    Mat4 vm = view.mul(&model);
-    Mat4 mvp = proj.mul(&vm);
+    Quat spin = quat_axis_angle(Vec3{0.4, 1.0, 0.2}, 0.6);
+    Mat4 mvp = proj * view * mat4_trs(Vec3{0.0, 0.0, 0.0}, spin, Vec3{1.0, 1.0, 1.0});
     GpuBuffer ub = gpu.uniform(&mvp, sizeof(Mat4))?;
     defer ub.release();
     GpuVertexLayout layout = GpuVertexLayout{stride: 24};

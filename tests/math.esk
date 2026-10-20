@@ -1,0 +1,64 @@
+// Vectors, quaternions and matrices against known values (no GPU needed).
+import <io>;
+import <libc>;
+import <gpu/math>;
+
+int fails = 0;
+
+void near(string what, float got, float want) {
+    if (fabs((double)(got - want)) > 0.0001) {
+        printf("FAIL %s: %f, want %f\n", what, (double)got, (double)want);
+        fails++;
+    }
+}
+
+void near3(string what, Vec3 got, Vec3 want) {
+    near(what, got.x, want.x);
+    near(what, got.y, want.y);
+    near(what, got.z, want.z);
+}
+
+int main() {
+    float half_pi = 1.5707963;
+    Vec3 x = Vec3{1.0, 0.0, 0.0};
+    Vec3 y = Vec3{0.0, 1.0, 0.0};
+    Vec3 z = Vec3{0.0, 0.0, 1.0};
+
+    near3("add", x + y * 2.0 - z, Vec3{1.0, 2.0, -1.0});
+    near3("neg", -x, Vec3{-1.0, 0.0, 0.0});
+    near3("cross", x.cross(y), z);
+    near("dot", (x + y).dot(y), 1.0);
+    near("length", Vec3{3.0, 4.0, 0.0}.length(), 5.0);
+    near("normalize", (x * 7.0).normalize().length(), 1.0);
+    near3("lerp", x.lerp(y, 0.5), Vec3{0.5, 0.5, 0.0});
+    near("vec2", Vec2{3.0, 4.0}.length(), 5.0);
+    near("vec4", (Vec4{1.0, 2.0, 3.0, 4.0} * 2.0).dot(Vec4{0.0, 0.0, 0.0, 1.0}), 8.0);
+
+    Quat qy = quat_axis_angle(y, half_pi);
+    near3("rotate y 90", qy.rotate(x), Vec3{0.0, 0.0, -1.0});
+    Quat qz = quat_axis_angle(z, half_pi);
+    near3("compose", (qy * qz).rotate(x), qy.rotate(qz.rotate(x)));
+    near3("conjugate", qy.conjugate().rotate(qy.rotate(x)), x);
+    near3("euler yaw", quat_euler(0.0, half_pi, 0.0).rotate(x), Vec3{0.0, 0.0, -1.0});
+    Quat mid = quat_slerp(quat_identity(), quat_axis_angle(y, half_pi), 0.5);
+    near3("slerp angle", mid.rotate(x), Vec3{0.7071068, 0.0, -0.7071068});
+
+    Mat4 rq = qy.to_mat4();
+    near3("to_mat4", rq.point(x), qy.rotate(x));
+    near3("mat4_rotate", mat4_rotate(half_pi, y).point(x), Vec3{0.0, 0.0, -1.0});
+    Mat4 m = mat4_trs(Vec3{1.0, 2.0, 3.0}, qy, Vec3{2.0, 2.0, 2.0});
+    near3("trs", m.point(x), Vec3{1.0, 2.0, 1.0});
+    Mat4 m2 = mat4_translate(Vec3{1.0, 2.0, 3.0}) * qy.to_mat4() * mat4_scale(Vec3{2.0, 2.0, 2.0});
+    near3("trs product", m2.point(y), m.point(y));
+    Mat4 view = mat4_look_at(Vec3{0.0, 0.0, 5.0}, Vec3{0.0, 0.0, 0.0}, y);
+    near3("look_at", view.point(Vec3{0.0, 0.0, 0.0}), Vec3{0.0, 0.0, -5.0});
+    Mat4 proj = mat4_perspective(half_pi, 1.0, 1.0, 10.0);
+    near("perspective near", proj.point(Vec3{0.0, 0.0, -1.0}).z, 0.0);
+    near("perspective far", proj.point(Vec3{0.0, 0.0, -10.0}).z, 1.0);
+    Mat4 o = mat4_ortho(-2.0, 2.0, -1.0, 1.0, 0.0, 10.0);
+    near3("ortho", o.point(Vec3{2.0, 1.0, -10.0}), Vec3{1.0, 1.0, 1.0});
+    near("transpose", m.transpose().m[3], m.m[12]);
+
+    printf("math: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}
