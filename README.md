@@ -3,7 +3,7 @@
 </p>
 
 <h2 align="center">gpu</h2>
-<p align="center">GPU compute, rendering and glTF models for Eskiu, over WebGPU.</p>
+<p align="center">GPU compute, rendering, 3D models and machine learning for Eskiu, over WebGPU.</p>
 <p align="center"><sub>Part of the <a href="https://github.com/eskiu-lang">Eskiu</a> project</sub></p>
 <p align="center">
   <a href="https://eskiu-lang.org">eskiu-lang.org</a> &nbsp;&middot;&nbsp;
@@ -32,6 +32,9 @@ Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
 - **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
   OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
   based shading, normal maps, alpha modes, skinning and animation.
+- **Machine learning.** `<gpu/nn>` runs transformer inference (Llama 2 7B at 45 tokens per
+  second on an M4 Pro, from GGUF, safetensors or llama2.c files) and `<gpu/train>` trains
+  networks with automatic differentiation and Adam.
 - **Images.** `<gpu/image>` decodes PNG and JPEG (baseline and progressive) in pure Eskiu;
   textures can be sRGB and mipmapped.
 - **Windows and input.** `<gpu/window>` opens a window over SDL3 and gives its surface
@@ -173,6 +176,46 @@ metallic, `illum 0` unlit, and `-clamp on`. Vertex colors (`v x y z r g b`) are 
 Not supported yet: morph targets, image-based lighting and shadows, Draco and meshopt
 compression, and KTX2 textures.
 
+## Machine learning
+
+[`examples/llama2.esk`](examples/llama2.esk) is Llama 2 inference after Andrej Karpathy's
+llama2.c. It reads llama2.c checkpoints, llama GGUF files (Q4_0 and Q8_0 run quantized on
+the GPU, other types are converted to f16) and Hugging Face model directories:
+
+```
+$ eskiuc build -L/opt/homebrew/lib && ./build/llama2 llama-2-7b.Q4_0.gguf -t 0 -i "The capital of France is"
+```
+
+| Model | Eskiu | Reference |
+|---|---|---|
+| stories110M (llama2.c, f16) | 350 tokens/s | llama2.c on the CPU: 22 tokens/s |
+| TinyLlama 1.1B Q4_0 (GGUF) | 178 tokens/s | llama.cpp (Metal): 260 tokens/s |
+| Llama 2 7B Q4_0 (GGUF) | 45 tokens/s | llama.cpp (Metal): 58 tokens/s |
+
+<sub>Apple M4 Pro, greedy decoding. The outputs match llama2.c byte for byte and llama.cpp
+and Hugging Face transformers token for token on the prompts tested.</sub>
+
+The forward pass is a program of `<gpu/nn>` operations recorded once and replayed as one
+compute pass per token: matrix-vector products in f32, f16, Q8_0 and Q4_0 (with subgroup
+reductions when the device has them), RMSNorm, rotary embeddings, attention over a KV cache,
+SwiGLU and argmax.
+
+[`examples/mnist.esk`](examples/mnist.esk) trains a two-layer network on MNIST with
+`<gpu/train>` (97% test accuracy in three epochs, about 0.4 s per epoch) and saves the
+weights as safetensors, which PyTorch loads with the same accuracy:
+
+```eskiu
+NnGraph g = gpu.nn_graph(100)?;
+NnVar x = g.input(784);
+NnVar labels = g.labels();
+NnVar h = g.relu(g.bias(g.matmul(x, g.param(784, 128, 0.05)), g.param(1, 128, 0.0)));
+NnVar logits = g.bias(g.matmul(h, g.param(128, 10, 0.125)), g.param(1, 10, 0.0));
+NnVar loss = g.cross_entropy(logits, labels);
+g.backward(loss)?;   // records the gradients of every operation
+g.adam(0.001);       // and the optimizer step
+// each batch: g.set_input(x, images); g.set_labels(labels, digits); g.run()?;
+```
+
 ## Install
 
 The package needs wgpu-native 29, and SDL3 for `<gpu/window>`:
@@ -207,6 +250,10 @@ to the executable.
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
 | `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight` |
 | `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
+| `<gpu/nn>` | `NnTensor` (f32, f16, Q8_0, Q4_0), `NnProgram` with matvec, RMSNorm, RoPE, attention, SwiGLU, argmax |
+| `<gpu/train>` | `NnGraph`: inputs, parameters, matmul, bias, ReLU, tanh, cross entropy, MSE, `backward`, Adam, SGD |
+| `<gpu/gguf>` | `gguf_load`, metadata, tensors, dequantization of F32, F16, BF16, Q4_0 to Q8_0 and Q2_K to Q6_K |
+| `<gpu/safetensors>` | `safetensors_load`, `SafeTensor_floats`, `SafetensorsWriter` |
 | `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
 | `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
 
