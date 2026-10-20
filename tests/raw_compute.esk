@@ -1,0 +1,83 @@
+// Doubles 1024 floats with a WGSL compute shader through the raw bindings.
+import <io>;
+import <mem>;
+import <gpu/raw>;
+
+WGPUAdapter g_adapter = null;
+WGPUDevice g_device = null;
+int g_map_status = 0;
+
+WGPUStringView sv(string s) {
+    return WGPUStringView{s, (uint64)strlen(s)};
+}
+
+void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView message, *void u1, *void u2) {
+    if (status == WGPURequestAdapterStatus_Success) g_adapter = adapter;
+    else printf("adapter: %.*s\n", (int)message.length, message.data);
+}
+
+void on_device(WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView message, *void u1, *void u2) {
+    if (status == WGPURequestDeviceStatus_Success) g_device = device;
+    else printf("device: %.*s\n", (int)message.length, message.data);
+}
+
+void on_map(WGPUMapAsyncStatus status, WGPUStringView message, *void u1, *void u2) {
+    g_map_status = status;
+}
+
+int main() {
+    WGPUInstance instance = wgpuCreateInstance(null);
+    WGPURequestAdapterCallbackInfo ai = WGPURequestAdapterCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)on_adapter};
+    wgpuInstanceRequestAdapter(instance, null, ai);
+    if (g_adapter == null) return 1;
+    WGPURequestDeviceCallbackInfo di = WGPURequestDeviceCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)on_device};
+    wgpuAdapterRequestDevice(g_adapter, null, di);
+    if (g_device == null) return 1;
+    WGPUQueue queue = wgpuDeviceGetQueue(g_device);
+
+    int n = 1024;
+    uint64 bytes = (uint64)n * 4;
+    *float data = alloc<float>(n);
+    defer free(data);
+    for (i in 0..n) data[i] = (float)i;
+
+    WGPUBufferDescriptor sd = WGPUBufferDescriptor{label: sv("storage"), usage: WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst, size: bytes};
+    WGPUBuffer storage = wgpuDeviceCreateBuffer(g_device, &sd);
+    WGPUBufferDescriptor rd = WGPUBufferDescriptor{label: sv("readback"), usage: WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst, size: bytes};
+    WGPUBuffer readback = wgpuDeviceCreateBuffer(g_device, &rd);
+    wgpuQueueWriteBuffer(queue, storage, 0, data, bytes);
+
+    string code = "@group(0) @binding(0) var<storage, read_write> v: array<f32>;\n@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3<u32>) { v[id.x] = v[id.x] * 2.0; }\n";
+    WGPUShaderSourceWGSL wgsl = WGPUShaderSourceWGSL{chain: WGPUChainedStruct{null, WGPUSType_ShaderSourceWGSL}, code: sv(code)};
+    WGPUShaderModuleDescriptor md = WGPUShaderModuleDescriptor{nextInChain: (*WGPUChainedStruct)&wgsl, label: sv("double")};
+    WGPUShaderModule module = wgpuDeviceCreateShaderModule(g_device, &md);
+
+    WGPUComputePipelineDescriptor pd = WGPUComputePipelineDescriptor{label: sv("pipe"), compute: WGPUComputeState{module: module, entryPoint: sv("main")}};
+    WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(g_device, &pd);
+    WGPUBindGroupEntry entry = WGPUBindGroupEntry{binding: 0, buffer: storage, size: bytes};
+    WGPUBindGroupDescriptor bd = WGPUBindGroupDescriptor{layout: wgpuComputePipelineGetBindGroupLayout(pipeline, 0), entryCount: 1, entries: &entry};
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(g_device, &bd);
+
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g_device, null);
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(enc, null);
+    wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, null);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, (uint32)(n / 64), 1, 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuCommandEncoderCopyBufferToBuffer(enc, storage, 0, readback, 0, bytes);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
+    wgpuQueueSubmit(queue, 1, &cmd);
+
+    WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)on_map};
+    wgpuBufferMapAsync(readback, WGPUMapMode_Read, 0, bytes, mi);
+    wgpuDevicePoll(g_device, 1, null);
+    if (g_map_status != WGPUMapAsyncStatus_Success) return 1;
+    *float out = (*float)wgpuBufferGetConstMappedRange(readback, 0, bytes);
+    int bad = 0;
+    for (i in 0..n) {
+        if (out[i] != (float)(i * 2)) bad++;
+    }
+    wgpuBufferUnmap(readback);
+    printf("raw_compute: %d mismatches\n", bad);
+    return bad == 0 ? 0 : 1;
+}

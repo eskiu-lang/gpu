@@ -1,0 +1,868 @@
+import <io>;
+import <gpu/raw>;
+
+int main() {
+    printf("WGPUStringView %d\n", (int)sizeof(WGPUStringView));
+    { WGPUStringView v;
+      printf("WGPUStringView.data %d\n", (int)((*uint8)&v.data - (*uint8)&v)); 
+      printf("WGPUStringView.length %d\n", (int)((*uint8)&v.length - (*uint8)&v)); 
+    }
+    printf("WGPUChainedStruct %d\n", (int)sizeof(WGPUChainedStruct));
+    { WGPUChainedStruct v;
+      printf("WGPUChainedStruct.next %d\n", (int)((*uint8)&v.next - (*uint8)&v)); 
+      printf("WGPUChainedStruct.sType %d\n", (int)((*uint8)&v.sType - (*uint8)&v)); 
+    }
+    printf("WGPUBufferMapCallbackInfo %d\n", (int)sizeof(WGPUBufferMapCallbackInfo));
+    { WGPUBufferMapCallbackInfo v;
+      printf("WGPUBufferMapCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBufferMapCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUBufferMapCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUBufferMapCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUBufferMapCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUCompilationInfoCallbackInfo %d\n", (int)sizeof(WGPUCompilationInfoCallbackInfo));
+    { WGPUCompilationInfoCallbackInfo v;
+      printf("WGPUCompilationInfoCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCompilationInfoCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUCompilationInfoCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUCompilationInfoCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUCompilationInfoCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUCreateComputePipelineAsyncCallbackInfo %d\n", (int)sizeof(WGPUCreateComputePipelineAsyncCallbackInfo));
+    { WGPUCreateComputePipelineAsyncCallbackInfo v;
+      printf("WGPUCreateComputePipelineAsyncCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCreateComputePipelineAsyncCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUCreateComputePipelineAsyncCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUCreateComputePipelineAsyncCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUCreateComputePipelineAsyncCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUCreateRenderPipelineAsyncCallbackInfo %d\n", (int)sizeof(WGPUCreateRenderPipelineAsyncCallbackInfo));
+    { WGPUCreateRenderPipelineAsyncCallbackInfo v;
+      printf("WGPUCreateRenderPipelineAsyncCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCreateRenderPipelineAsyncCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUCreateRenderPipelineAsyncCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUCreateRenderPipelineAsyncCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUCreateRenderPipelineAsyncCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUDeviceLostCallbackInfo %d\n", (int)sizeof(WGPUDeviceLostCallbackInfo));
+    { WGPUDeviceLostCallbackInfo v;
+      printf("WGPUDeviceLostCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUDeviceLostCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUDeviceLostCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUDeviceLostCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUDeviceLostCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUPopErrorScopeCallbackInfo %d\n", (int)sizeof(WGPUPopErrorScopeCallbackInfo));
+    { WGPUPopErrorScopeCallbackInfo v;
+      printf("WGPUPopErrorScopeCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUPopErrorScopeCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUPopErrorScopeCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUPopErrorScopeCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUPopErrorScopeCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUQueueWorkDoneCallbackInfo %d\n", (int)sizeof(WGPUQueueWorkDoneCallbackInfo));
+    { WGPUQueueWorkDoneCallbackInfo v;
+      printf("WGPUQueueWorkDoneCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUQueueWorkDoneCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPUQueueWorkDoneCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUQueueWorkDoneCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUQueueWorkDoneCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPURequestAdapterCallbackInfo %d\n", (int)sizeof(WGPURequestAdapterCallbackInfo));
+    { WGPURequestAdapterCallbackInfo v;
+      printf("WGPURequestAdapterCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURequestAdapterCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPURequestAdapterCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPURequestAdapterCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPURequestAdapterCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPURequestDeviceCallbackInfo %d\n", (int)sizeof(WGPURequestDeviceCallbackInfo));
+    { WGPURequestDeviceCallbackInfo v;
+      printf("WGPURequestDeviceCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURequestDeviceCallbackInfo.mode %d\n", (int)((*uint8)&v.mode - (*uint8)&v)); 
+      printf("WGPURequestDeviceCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPURequestDeviceCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPURequestDeviceCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUUncapturedErrorCallbackInfo %d\n", (int)sizeof(WGPUUncapturedErrorCallbackInfo));
+    { WGPUUncapturedErrorCallbackInfo v;
+      printf("WGPUUncapturedErrorCallbackInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUUncapturedErrorCallbackInfo.callback %d\n", (int)((*uint8)&v.callback - (*uint8)&v)); 
+      printf("WGPUUncapturedErrorCallbackInfo.userdata1 %d\n", (int)((*uint8)&v.userdata1 - (*uint8)&v)); 
+      printf("WGPUUncapturedErrorCallbackInfo.userdata2 %d\n", (int)((*uint8)&v.userdata2 - (*uint8)&v)); 
+    }
+    printf("WGPUAdapterInfo %d\n", (int)sizeof(WGPUAdapterInfo));
+    { WGPUAdapterInfo v;
+      printf("WGPUAdapterInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.vendor %d\n", (int)((*uint8)&v.vendor - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.architecture %d\n", (int)((*uint8)&v.architecture - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.device %d\n", (int)((*uint8)&v.device - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.description %d\n", (int)((*uint8)&v.description - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.backendType %d\n", (int)((*uint8)&v.backendType - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.adapterType %d\n", (int)((*uint8)&v.adapterType - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.vendorID %d\n", (int)((*uint8)&v.vendorID - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.deviceID %d\n", (int)((*uint8)&v.deviceID - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.subgroupMinSize %d\n", (int)((*uint8)&v.subgroupMinSize - (*uint8)&v)); 
+      printf("WGPUAdapterInfo.subgroupMaxSize %d\n", (int)((*uint8)&v.subgroupMaxSize - (*uint8)&v)); 
+    }
+    printf("WGPUBlendComponent %d\n", (int)sizeof(WGPUBlendComponent));
+    { WGPUBlendComponent v;
+      printf("WGPUBlendComponent.operation %d\n", (int)((*uint8)&v.operation - (*uint8)&v)); 
+      printf("WGPUBlendComponent.srcFactor %d\n", (int)((*uint8)&v.srcFactor - (*uint8)&v)); 
+      printf("WGPUBlendComponent.dstFactor %d\n", (int)((*uint8)&v.dstFactor - (*uint8)&v)); 
+    }
+    printf("WGPUBufferBindingLayout %d\n", (int)sizeof(WGPUBufferBindingLayout));
+    { WGPUBufferBindingLayout v;
+      printf("WGPUBufferBindingLayout.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBufferBindingLayout.type %d\n", (int)((*uint8)&v.type_ - (*uint8)&v)); 
+      printf("WGPUBufferBindingLayout.hasDynamicOffset %d\n", (int)((*uint8)&v.hasDynamicOffset - (*uint8)&v)); 
+      printf("WGPUBufferBindingLayout.minBindingSize %d\n", (int)((*uint8)&v.minBindingSize - (*uint8)&v)); 
+    }
+    printf("WGPUBufferDescriptor %d\n", (int)sizeof(WGPUBufferDescriptor));
+    { WGPUBufferDescriptor v;
+      printf("WGPUBufferDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBufferDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUBufferDescriptor.usage %d\n", (int)((*uint8)&v.usage - (*uint8)&v)); 
+      printf("WGPUBufferDescriptor.size %d\n", (int)((*uint8)&v.size - (*uint8)&v)); 
+      printf("WGPUBufferDescriptor.mappedAtCreation %d\n", (int)((*uint8)&v.mappedAtCreation - (*uint8)&v)); 
+    }
+    printf("WGPUColor %d\n", (int)sizeof(WGPUColor));
+    { WGPUColor v;
+      printf("WGPUColor.r %d\n", (int)((*uint8)&v.r - (*uint8)&v)); 
+      printf("WGPUColor.g %d\n", (int)((*uint8)&v.g - (*uint8)&v)); 
+      printf("WGPUColor.b %d\n", (int)((*uint8)&v.b - (*uint8)&v)); 
+      printf("WGPUColor.a %d\n", (int)((*uint8)&v.a - (*uint8)&v)); 
+    }
+    printf("WGPUCommandBufferDescriptor %d\n", (int)sizeof(WGPUCommandBufferDescriptor));
+    { WGPUCommandBufferDescriptor v;
+      printf("WGPUCommandBufferDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCommandBufferDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPUCommandEncoderDescriptor %d\n", (int)sizeof(WGPUCommandEncoderDescriptor));
+    { WGPUCommandEncoderDescriptor v;
+      printf("WGPUCommandEncoderDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCommandEncoderDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPUCompatibilityModeLimits %d\n", (int)sizeof(WGPUCompatibilityModeLimits));
+    { WGPUCompatibilityModeLimits v;
+      printf("WGPUCompatibilityModeLimits.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUCompatibilityModeLimits.maxStorageBuffersInVertexStage %d\n", (int)((*uint8)&v.maxStorageBuffersInVertexStage - (*uint8)&v)); 
+      printf("WGPUCompatibilityModeLimits.maxStorageTexturesInVertexStage %d\n", (int)((*uint8)&v.maxStorageTexturesInVertexStage - (*uint8)&v)); 
+      printf("WGPUCompatibilityModeLimits.maxStorageBuffersInFragmentStage %d\n", (int)((*uint8)&v.maxStorageBuffersInFragmentStage - (*uint8)&v)); 
+      printf("WGPUCompatibilityModeLimits.maxStorageTexturesInFragmentStage %d\n", (int)((*uint8)&v.maxStorageTexturesInFragmentStage - (*uint8)&v)); 
+    }
+    printf("WGPUCompilationMessage %d\n", (int)sizeof(WGPUCompilationMessage));
+    { WGPUCompilationMessage v;
+      printf("WGPUCompilationMessage.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.message %d\n", (int)((*uint8)&v.message - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.type %d\n", (int)((*uint8)&v.type_ - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.lineNum %d\n", (int)((*uint8)&v.lineNum - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.linePos %d\n", (int)((*uint8)&v.linePos - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.offset %d\n", (int)((*uint8)&v.offset - (*uint8)&v)); 
+      printf("WGPUCompilationMessage.length %d\n", (int)((*uint8)&v.length - (*uint8)&v)); 
+    }
+    printf("WGPUConstantEntry %d\n", (int)sizeof(WGPUConstantEntry));
+    { WGPUConstantEntry v;
+      printf("WGPUConstantEntry.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUConstantEntry.key %d\n", (int)((*uint8)&v.key - (*uint8)&v)); 
+      printf("WGPUConstantEntry.value %d\n", (int)((*uint8)&v.value - (*uint8)&v)); 
+    }
+    printf("WGPUExtent3D %d\n", (int)sizeof(WGPUExtent3D));
+    { WGPUExtent3D v;
+      printf("WGPUExtent3D.width %d\n", (int)((*uint8)&v.width - (*uint8)&v)); 
+      printf("WGPUExtent3D.height %d\n", (int)((*uint8)&v.height - (*uint8)&v)); 
+      printf("WGPUExtent3D.depthOrArrayLayers %d\n", (int)((*uint8)&v.depthOrArrayLayers - (*uint8)&v)); 
+    }
+    printf("WGPUExternalTextureBindingEntry %d\n", (int)sizeof(WGPUExternalTextureBindingEntry));
+    { WGPUExternalTextureBindingEntry v;
+      printf("WGPUExternalTextureBindingEntry.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUExternalTextureBindingEntry.externalTexture %d\n", (int)((*uint8)&v.externalTexture - (*uint8)&v)); 
+    }
+    printf("WGPUExternalTextureBindingLayout %d\n", (int)sizeof(WGPUExternalTextureBindingLayout));
+    { WGPUExternalTextureBindingLayout v;
+      printf("WGPUExternalTextureBindingLayout.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+    }
+    printf("WGPUFuture %d\n", (int)sizeof(WGPUFuture));
+    { WGPUFuture v;
+      printf("WGPUFuture.id %d\n", (int)((*uint8)&v.id - (*uint8)&v)); 
+    }
+    printf("WGPUInstanceLimits %d\n", (int)sizeof(WGPUInstanceLimits));
+    { WGPUInstanceLimits v;
+      printf("WGPUInstanceLimits.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUInstanceLimits.timedWaitAnyMaxCount %d\n", (int)((*uint8)&v.timedWaitAnyMaxCount - (*uint8)&v)); 
+    }
+    printf("WGPUMultisampleState %d\n", (int)sizeof(WGPUMultisampleState));
+    { WGPUMultisampleState v;
+      printf("WGPUMultisampleState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUMultisampleState.count %d\n", (int)((*uint8)&v.count - (*uint8)&v)); 
+      printf("WGPUMultisampleState.mask %d\n", (int)((*uint8)&v.mask - (*uint8)&v)); 
+      printf("WGPUMultisampleState.alphaToCoverageEnabled %d\n", (int)((*uint8)&v.alphaToCoverageEnabled - (*uint8)&v)); 
+    }
+    printf("WGPUOrigin3D %d\n", (int)sizeof(WGPUOrigin3D));
+    { WGPUOrigin3D v;
+      printf("WGPUOrigin3D.x %d\n", (int)((*uint8)&v.x - (*uint8)&v)); 
+      printf("WGPUOrigin3D.y %d\n", (int)((*uint8)&v.y - (*uint8)&v)); 
+      printf("WGPUOrigin3D.z %d\n", (int)((*uint8)&v.z - (*uint8)&v)); 
+    }
+    printf("WGPUPassTimestampWrites %d\n", (int)sizeof(WGPUPassTimestampWrites));
+    { WGPUPassTimestampWrites v;
+      printf("WGPUPassTimestampWrites.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUPassTimestampWrites.querySet %d\n", (int)((*uint8)&v.querySet - (*uint8)&v)); 
+      printf("WGPUPassTimestampWrites.beginningOfPassWriteIndex %d\n", (int)((*uint8)&v.beginningOfPassWriteIndex - (*uint8)&v)); 
+      printf("WGPUPassTimestampWrites.endOfPassWriteIndex %d\n", (int)((*uint8)&v.endOfPassWriteIndex - (*uint8)&v)); 
+    }
+    printf("WGPUPipelineLayoutDescriptor %d\n", (int)sizeof(WGPUPipelineLayoutDescriptor));
+    { WGPUPipelineLayoutDescriptor v;
+      printf("WGPUPipelineLayoutDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUPipelineLayoutDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUPipelineLayoutDescriptor.bindGroupLayoutCount %d\n", (int)((*uint8)&v.bindGroupLayoutCount - (*uint8)&v)); 
+      printf("WGPUPipelineLayoutDescriptor.bindGroupLayouts %d\n", (int)((*uint8)&v.bindGroupLayouts - (*uint8)&v)); 
+      printf("WGPUPipelineLayoutDescriptor.immediateSize %d\n", (int)((*uint8)&v.immediateSize - (*uint8)&v)); 
+    }
+    printf("WGPUPrimitiveState %d\n", (int)sizeof(WGPUPrimitiveState));
+    { WGPUPrimitiveState v;
+      printf("WGPUPrimitiveState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUPrimitiveState.topology %d\n", (int)((*uint8)&v.topology - (*uint8)&v)); 
+      printf("WGPUPrimitiveState.stripIndexFormat %d\n", (int)((*uint8)&v.stripIndexFormat - (*uint8)&v)); 
+      printf("WGPUPrimitiveState.frontFace %d\n", (int)((*uint8)&v.frontFace - (*uint8)&v)); 
+      printf("WGPUPrimitiveState.cullMode %d\n", (int)((*uint8)&v.cullMode - (*uint8)&v)); 
+      printf("WGPUPrimitiveState.unclippedDepth %d\n", (int)((*uint8)&v.unclippedDepth - (*uint8)&v)); 
+    }
+    printf("WGPUQuerySetDescriptor %d\n", (int)sizeof(WGPUQuerySetDescriptor));
+    { WGPUQuerySetDescriptor v;
+      printf("WGPUQuerySetDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUQuerySetDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUQuerySetDescriptor.type %d\n", (int)((*uint8)&v.type_ - (*uint8)&v)); 
+      printf("WGPUQuerySetDescriptor.count %d\n", (int)((*uint8)&v.count - (*uint8)&v)); 
+    }
+    printf("WGPUQueueDescriptor %d\n", (int)sizeof(WGPUQueueDescriptor));
+    { WGPUQueueDescriptor v;
+      printf("WGPUQueueDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUQueueDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPURenderBundleDescriptor %d\n", (int)sizeof(WGPURenderBundleDescriptor));
+    { WGPURenderBundleDescriptor v;
+      printf("WGPURenderBundleDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderBundleDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPURenderBundleEncoderDescriptor %d\n", (int)sizeof(WGPURenderBundleEncoderDescriptor));
+    { WGPURenderBundleEncoderDescriptor v;
+      printf("WGPURenderBundleEncoderDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.colorFormatCount %d\n", (int)((*uint8)&v.colorFormatCount - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.colorFormats %d\n", (int)((*uint8)&v.colorFormats - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.depthStencilFormat %d\n", (int)((*uint8)&v.depthStencilFormat - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.sampleCount %d\n", (int)((*uint8)&v.sampleCount - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.depthReadOnly %d\n", (int)((*uint8)&v.depthReadOnly - (*uint8)&v)); 
+      printf("WGPURenderBundleEncoderDescriptor.stencilReadOnly %d\n", (int)((*uint8)&v.stencilReadOnly - (*uint8)&v)); 
+    }
+    printf("WGPURenderPassDepthStencilAttachment %d\n", (int)sizeof(WGPURenderPassDepthStencilAttachment));
+    { WGPURenderPassDepthStencilAttachment v;
+      printf("WGPURenderPassDepthStencilAttachment.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.view %d\n", (int)((*uint8)&v.view - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.depthLoadOp %d\n", (int)((*uint8)&v.depthLoadOp - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.depthStoreOp %d\n", (int)((*uint8)&v.depthStoreOp - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.depthClearValue %d\n", (int)((*uint8)&v.depthClearValue - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.depthReadOnly %d\n", (int)((*uint8)&v.depthReadOnly - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.stencilLoadOp %d\n", (int)((*uint8)&v.stencilLoadOp - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.stencilStoreOp %d\n", (int)((*uint8)&v.stencilStoreOp - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.stencilClearValue %d\n", (int)((*uint8)&v.stencilClearValue - (*uint8)&v)); 
+      printf("WGPURenderPassDepthStencilAttachment.stencilReadOnly %d\n", (int)((*uint8)&v.stencilReadOnly - (*uint8)&v)); 
+    }
+    printf("WGPURenderPassMaxDrawCount %d\n", (int)sizeof(WGPURenderPassMaxDrawCount));
+    { WGPURenderPassMaxDrawCount v;
+      printf("WGPURenderPassMaxDrawCount.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPURenderPassMaxDrawCount.maxDrawCount %d\n", (int)((*uint8)&v.maxDrawCount - (*uint8)&v)); 
+    }
+    printf("WGPURequestAdapterWebXROptions %d\n", (int)sizeof(WGPURequestAdapterWebXROptions));
+    { WGPURequestAdapterWebXROptions v;
+      printf("WGPURequestAdapterWebXROptions.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPURequestAdapterWebXROptions.xrCompatible %d\n", (int)((*uint8)&v.xrCompatible - (*uint8)&v)); 
+    }
+    printf("WGPUSamplerBindingLayout %d\n", (int)sizeof(WGPUSamplerBindingLayout));
+    { WGPUSamplerBindingLayout v;
+      printf("WGPUSamplerBindingLayout.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSamplerBindingLayout.type %d\n", (int)((*uint8)&v.type_ - (*uint8)&v)); 
+    }
+    printf("WGPUSamplerDescriptor %d\n", (int)sizeof(WGPUSamplerDescriptor));
+    { WGPUSamplerDescriptor v;
+      printf("WGPUSamplerDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.addressModeU %d\n", (int)((*uint8)&v.addressModeU - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.addressModeV %d\n", (int)((*uint8)&v.addressModeV - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.addressModeW %d\n", (int)((*uint8)&v.addressModeW - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.magFilter %d\n", (int)((*uint8)&v.magFilter - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.minFilter %d\n", (int)((*uint8)&v.minFilter - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.mipmapFilter %d\n", (int)((*uint8)&v.mipmapFilter - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.lodMinClamp %d\n", (int)((*uint8)&v.lodMinClamp - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.lodMaxClamp %d\n", (int)((*uint8)&v.lodMaxClamp - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.compare %d\n", (int)((*uint8)&v.compare - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptor.maxAnisotropy %d\n", (int)((*uint8)&v.maxAnisotropy - (*uint8)&v)); 
+    }
+    printf("WGPUShaderSourceSPIRV %d\n", (int)sizeof(WGPUShaderSourceSPIRV));
+    { WGPUShaderSourceSPIRV v;
+      printf("WGPUShaderSourceSPIRV.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUShaderSourceSPIRV.codeSize %d\n", (int)((*uint8)&v.codeSize - (*uint8)&v)); 
+      printf("WGPUShaderSourceSPIRV.code %d\n", (int)((*uint8)&v.code - (*uint8)&v)); 
+    }
+    printf("WGPUShaderSourceWGSL %d\n", (int)sizeof(WGPUShaderSourceWGSL));
+    { WGPUShaderSourceWGSL v;
+      printf("WGPUShaderSourceWGSL.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUShaderSourceWGSL.code %d\n", (int)((*uint8)&v.code - (*uint8)&v)); 
+    }
+    printf("WGPUStencilFaceState %d\n", (int)sizeof(WGPUStencilFaceState));
+    { WGPUStencilFaceState v;
+      printf("WGPUStencilFaceState.compare %d\n", (int)((*uint8)&v.compare - (*uint8)&v)); 
+      printf("WGPUStencilFaceState.failOp %d\n", (int)((*uint8)&v.failOp - (*uint8)&v)); 
+      printf("WGPUStencilFaceState.depthFailOp %d\n", (int)((*uint8)&v.depthFailOp - (*uint8)&v)); 
+      printf("WGPUStencilFaceState.passOp %d\n", (int)((*uint8)&v.passOp - (*uint8)&v)); 
+    }
+    printf("WGPUStorageTextureBindingLayout %d\n", (int)sizeof(WGPUStorageTextureBindingLayout));
+    { WGPUStorageTextureBindingLayout v;
+      printf("WGPUStorageTextureBindingLayout.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUStorageTextureBindingLayout.access %d\n", (int)((*uint8)&v.access - (*uint8)&v)); 
+      printf("WGPUStorageTextureBindingLayout.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUStorageTextureBindingLayout.viewDimension %d\n", (int)((*uint8)&v.viewDimension - (*uint8)&v)); 
+    }
+    printf("WGPUSupportedFeatures %d\n", (int)sizeof(WGPUSupportedFeatures));
+    { WGPUSupportedFeatures v;
+      printf("WGPUSupportedFeatures.featureCount %d\n", (int)((*uint8)&v.featureCount - (*uint8)&v)); 
+      printf("WGPUSupportedFeatures.features %d\n", (int)((*uint8)&v.features - (*uint8)&v)); 
+    }
+    printf("WGPUSupportedInstanceFeatures %d\n", (int)sizeof(WGPUSupportedInstanceFeatures));
+    { WGPUSupportedInstanceFeatures v;
+      printf("WGPUSupportedInstanceFeatures.featureCount %d\n", (int)((*uint8)&v.featureCount - (*uint8)&v)); 
+      printf("WGPUSupportedInstanceFeatures.features %d\n", (int)((*uint8)&v.features - (*uint8)&v)); 
+    }
+    printf("WGPUSupportedWGSLLanguageFeatures %d\n", (int)sizeof(WGPUSupportedWGSLLanguageFeatures));
+    { WGPUSupportedWGSLLanguageFeatures v;
+      printf("WGPUSupportedWGSLLanguageFeatures.featureCount %d\n", (int)((*uint8)&v.featureCount - (*uint8)&v)); 
+      printf("WGPUSupportedWGSLLanguageFeatures.features %d\n", (int)((*uint8)&v.features - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceCapabilities %d\n", (int)sizeof(WGPUSurfaceCapabilities));
+    { WGPUSurfaceCapabilities v;
+      printf("WGPUSurfaceCapabilities.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.usages %d\n", (int)((*uint8)&v.usages - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.formatCount %d\n", (int)((*uint8)&v.formatCount - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.formats %d\n", (int)((*uint8)&v.formats - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.presentModeCount %d\n", (int)((*uint8)&v.presentModeCount - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.presentModes %d\n", (int)((*uint8)&v.presentModes - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.alphaModeCount %d\n", (int)((*uint8)&v.alphaModeCount - (*uint8)&v)); 
+      printf("WGPUSurfaceCapabilities.alphaModes %d\n", (int)((*uint8)&v.alphaModes - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceColorManagement %d\n", (int)sizeof(WGPUSurfaceColorManagement));
+    { WGPUSurfaceColorManagement v;
+      printf("WGPUSurfaceColorManagement.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceColorManagement.colorSpace %d\n", (int)((*uint8)&v.colorSpace - (*uint8)&v)); 
+      printf("WGPUSurfaceColorManagement.toneMappingMode %d\n", (int)((*uint8)&v.toneMappingMode - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceConfiguration %d\n", (int)sizeof(WGPUSurfaceConfiguration));
+    { WGPUSurfaceConfiguration v;
+      printf("WGPUSurfaceConfiguration.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.device %d\n", (int)((*uint8)&v.device - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.usage %d\n", (int)((*uint8)&v.usage - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.width %d\n", (int)((*uint8)&v.width - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.height %d\n", (int)((*uint8)&v.height - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.viewFormatCount %d\n", (int)((*uint8)&v.viewFormatCount - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.viewFormats %d\n", (int)((*uint8)&v.viewFormats - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.alphaMode %d\n", (int)((*uint8)&v.alphaMode - (*uint8)&v)); 
+      printf("WGPUSurfaceConfiguration.presentMode %d\n", (int)((*uint8)&v.presentMode - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceAndroidNativeWindow %d\n", (int)sizeof(WGPUSurfaceSourceAndroidNativeWindow));
+    { WGPUSurfaceSourceAndroidNativeWindow v;
+      printf("WGPUSurfaceSourceAndroidNativeWindow.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceAndroidNativeWindow.window %d\n", (int)((*uint8)&v.window - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceMetalLayer %d\n", (int)sizeof(WGPUSurfaceSourceMetalLayer));
+    { WGPUSurfaceSourceMetalLayer v;
+      printf("WGPUSurfaceSourceMetalLayer.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceMetalLayer.layer %d\n", (int)((*uint8)&v.layer - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceWaylandSurface %d\n", (int)sizeof(WGPUSurfaceSourceWaylandSurface));
+    { WGPUSurfaceSourceWaylandSurface v;
+      printf("WGPUSurfaceSourceWaylandSurface.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceWaylandSurface.display %d\n", (int)((*uint8)&v.display - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceWaylandSurface.surface %d\n", (int)((*uint8)&v.surface - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceWindowsHWND %d\n", (int)sizeof(WGPUSurfaceSourceWindowsHWND));
+    { WGPUSurfaceSourceWindowsHWND v;
+      printf("WGPUSurfaceSourceWindowsHWND.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceWindowsHWND.hinstance %d\n", (int)((*uint8)&v.hinstance - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceWindowsHWND.hwnd %d\n", (int)((*uint8)&v.hwnd - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceXCBWindow %d\n", (int)sizeof(WGPUSurfaceSourceXCBWindow));
+    { WGPUSurfaceSourceXCBWindow v;
+      printf("WGPUSurfaceSourceXCBWindow.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceXCBWindow.connection %d\n", (int)((*uint8)&v.connection - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceXCBWindow.window %d\n", (int)((*uint8)&v.window - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceXlibWindow %d\n", (int)sizeof(WGPUSurfaceSourceXlibWindow));
+    { WGPUSurfaceSourceXlibWindow v;
+      printf("WGPUSurfaceSourceXlibWindow.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceXlibWindow.display %d\n", (int)((*uint8)&v.display - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceXlibWindow.window %d\n", (int)((*uint8)&v.window - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceTexture %d\n", (int)sizeof(WGPUSurfaceTexture));
+    { WGPUSurfaceTexture v;
+      printf("WGPUSurfaceTexture.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSurfaceTexture.texture %d\n", (int)((*uint8)&v.texture - (*uint8)&v)); 
+      printf("WGPUSurfaceTexture.status %d\n", (int)((*uint8)&v.status - (*uint8)&v)); 
+    }
+    printf("WGPUTexelCopyBufferLayout %d\n", (int)sizeof(WGPUTexelCopyBufferLayout));
+    { WGPUTexelCopyBufferLayout v;
+      printf("WGPUTexelCopyBufferLayout.offset %d\n", (int)((*uint8)&v.offset - (*uint8)&v)); 
+      printf("WGPUTexelCopyBufferLayout.bytesPerRow %d\n", (int)((*uint8)&v.bytesPerRow - (*uint8)&v)); 
+      printf("WGPUTexelCopyBufferLayout.rowsPerImage %d\n", (int)((*uint8)&v.rowsPerImage - (*uint8)&v)); 
+    }
+    printf("WGPUTextureBindingLayout %d\n", (int)sizeof(WGPUTextureBindingLayout));
+    { WGPUTextureBindingLayout v;
+      printf("WGPUTextureBindingLayout.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUTextureBindingLayout.sampleType %d\n", (int)((*uint8)&v.sampleType - (*uint8)&v)); 
+      printf("WGPUTextureBindingLayout.viewDimension %d\n", (int)((*uint8)&v.viewDimension - (*uint8)&v)); 
+      printf("WGPUTextureBindingLayout.multisampled %d\n", (int)((*uint8)&v.multisampled - (*uint8)&v)); 
+    }
+    printf("WGPUTextureBindingViewDimension %d\n", (int)sizeof(WGPUTextureBindingViewDimension));
+    { WGPUTextureBindingViewDimension v;
+      printf("WGPUTextureBindingViewDimension.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUTextureBindingViewDimension.textureBindingViewDimension %d\n", (int)((*uint8)&v.textureBindingViewDimension - (*uint8)&v)); 
+    }
+    printf("WGPUTextureComponentSwizzle %d\n", (int)sizeof(WGPUTextureComponentSwizzle));
+    { WGPUTextureComponentSwizzle v;
+      printf("WGPUTextureComponentSwizzle.r %d\n", (int)((*uint8)&v.r - (*uint8)&v)); 
+      printf("WGPUTextureComponentSwizzle.g %d\n", (int)((*uint8)&v.g - (*uint8)&v)); 
+      printf("WGPUTextureComponentSwizzle.b %d\n", (int)((*uint8)&v.b - (*uint8)&v)); 
+      printf("WGPUTextureComponentSwizzle.a %d\n", (int)((*uint8)&v.a - (*uint8)&v)); 
+    }
+    printf("WGPUVertexAttribute %d\n", (int)sizeof(WGPUVertexAttribute));
+    { WGPUVertexAttribute v;
+      printf("WGPUVertexAttribute.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUVertexAttribute.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUVertexAttribute.offset %d\n", (int)((*uint8)&v.offset - (*uint8)&v)); 
+      printf("WGPUVertexAttribute.shaderLocation %d\n", (int)((*uint8)&v.shaderLocation - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupEntry %d\n", (int)sizeof(WGPUBindGroupEntry));
+    { WGPUBindGroupEntry v;
+      printf("WGPUBindGroupEntry.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.binding %d\n", (int)((*uint8)&v.binding - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.buffer %d\n", (int)((*uint8)&v.buffer - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.offset %d\n", (int)((*uint8)&v.offset - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.size %d\n", (int)((*uint8)&v.size - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.sampler %d\n", (int)((*uint8)&v.sampler - (*uint8)&v)); 
+      printf("WGPUBindGroupEntry.textureView %d\n", (int)((*uint8)&v.textureView - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupLayoutEntry %d\n", (int)sizeof(WGPUBindGroupLayoutEntry));
+    { WGPUBindGroupLayoutEntry v;
+      printf("WGPUBindGroupLayoutEntry.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.binding %d\n", (int)((*uint8)&v.binding - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.visibility %d\n", (int)((*uint8)&v.visibility - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.bindingArraySize %d\n", (int)((*uint8)&v.bindingArraySize - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.buffer %d\n", (int)((*uint8)&v.buffer - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.sampler %d\n", (int)((*uint8)&v.sampler - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.texture %d\n", (int)((*uint8)&v.texture - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntry.storageTexture %d\n", (int)((*uint8)&v.storageTexture - (*uint8)&v)); 
+    }
+    printf("WGPUBlendState %d\n", (int)sizeof(WGPUBlendState));
+    { WGPUBlendState v;
+      printf("WGPUBlendState.color %d\n", (int)((*uint8)&v.color - (*uint8)&v)); 
+      printf("WGPUBlendState.alpha %d\n", (int)((*uint8)&v.alpha - (*uint8)&v)); 
+    }
+    printf("WGPUCompilationInfo %d\n", (int)sizeof(WGPUCompilationInfo));
+    { WGPUCompilationInfo v;
+      printf("WGPUCompilationInfo.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUCompilationInfo.messageCount %d\n", (int)((*uint8)&v.messageCount - (*uint8)&v)); 
+      printf("WGPUCompilationInfo.messages %d\n", (int)((*uint8)&v.messages - (*uint8)&v)); 
+    }
+    printf("WGPUComputePassDescriptor %d\n", (int)sizeof(WGPUComputePassDescriptor));
+    { WGPUComputePassDescriptor v;
+      printf("WGPUComputePassDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUComputePassDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUComputePassDescriptor.timestampWrites %d\n", (int)((*uint8)&v.timestampWrites - (*uint8)&v)); 
+    }
+    printf("WGPUComputeState %d\n", (int)sizeof(WGPUComputeState));
+    { WGPUComputeState v;
+      printf("WGPUComputeState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUComputeState.module %d\n", (int)((*uint8)&v.module - (*uint8)&v)); 
+      printf("WGPUComputeState.entryPoint %d\n", (int)((*uint8)&v.entryPoint - (*uint8)&v)); 
+      printf("WGPUComputeState.constantCount %d\n", (int)((*uint8)&v.constantCount - (*uint8)&v)); 
+      printf("WGPUComputeState.constants %d\n", (int)((*uint8)&v.constants - (*uint8)&v)); 
+    }
+    printf("WGPUDepthStencilState %d\n", (int)sizeof(WGPUDepthStencilState));
+    { WGPUDepthStencilState v;
+      printf("WGPUDepthStencilState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.depthWriteEnabled %d\n", (int)((*uint8)&v.depthWriteEnabled - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.depthCompare %d\n", (int)((*uint8)&v.depthCompare - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.stencilFront %d\n", (int)((*uint8)&v.stencilFront - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.stencilBack %d\n", (int)((*uint8)&v.stencilBack - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.stencilReadMask %d\n", (int)((*uint8)&v.stencilReadMask - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.stencilWriteMask %d\n", (int)((*uint8)&v.stencilWriteMask - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.depthBias %d\n", (int)((*uint8)&v.depthBias - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.depthBiasSlopeScale %d\n", (int)((*uint8)&v.depthBiasSlopeScale - (*uint8)&v)); 
+      printf("WGPUDepthStencilState.depthBiasClamp %d\n", (int)((*uint8)&v.depthBiasClamp - (*uint8)&v)); 
+    }
+    printf("WGPUFutureWaitInfo %d\n", (int)sizeof(WGPUFutureWaitInfo));
+    { WGPUFutureWaitInfo v;
+      printf("WGPUFutureWaitInfo.future %d\n", (int)((*uint8)&v.future - (*uint8)&v)); 
+      printf("WGPUFutureWaitInfo.completed %d\n", (int)((*uint8)&v.completed - (*uint8)&v)); 
+    }
+    printf("WGPUInstanceDescriptor %d\n", (int)sizeof(WGPUInstanceDescriptor));
+    { WGPUInstanceDescriptor v;
+      printf("WGPUInstanceDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUInstanceDescriptor.requiredFeatureCount %d\n", (int)((*uint8)&v.requiredFeatureCount - (*uint8)&v)); 
+      printf("WGPUInstanceDescriptor.requiredFeatures %d\n", (int)((*uint8)&v.requiredFeatures - (*uint8)&v)); 
+      printf("WGPUInstanceDescriptor.requiredLimits %d\n", (int)((*uint8)&v.requiredLimits - (*uint8)&v)); 
+    }
+    printf("WGPULimits %d\n", (int)sizeof(WGPULimits));
+    { WGPULimits v;
+      printf("WGPULimits.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPULimits.maxTextureDimension1D %d\n", (int)((*uint8)&v.maxTextureDimension1D - (*uint8)&v)); 
+      printf("WGPULimits.maxTextureDimension2D %d\n", (int)((*uint8)&v.maxTextureDimension2D - (*uint8)&v)); 
+      printf("WGPULimits.maxTextureDimension3D %d\n", (int)((*uint8)&v.maxTextureDimension3D - (*uint8)&v)); 
+      printf("WGPULimits.maxTextureArrayLayers %d\n", (int)((*uint8)&v.maxTextureArrayLayers - (*uint8)&v)); 
+      printf("WGPULimits.maxBindGroups %d\n", (int)((*uint8)&v.maxBindGroups - (*uint8)&v)); 
+      printf("WGPULimits.maxBindGroupsPlusVertexBuffers %d\n", (int)((*uint8)&v.maxBindGroupsPlusVertexBuffers - (*uint8)&v)); 
+      printf("WGPULimits.maxBindingsPerBindGroup %d\n", (int)((*uint8)&v.maxBindingsPerBindGroup - (*uint8)&v)); 
+      printf("WGPULimits.maxDynamicUniformBuffersPerPipelineLayout %d\n", (int)((*uint8)&v.maxDynamicUniformBuffersPerPipelineLayout - (*uint8)&v)); 
+      printf("WGPULimits.maxDynamicStorageBuffersPerPipelineLayout %d\n", (int)((*uint8)&v.maxDynamicStorageBuffersPerPipelineLayout - (*uint8)&v)); 
+      printf("WGPULimits.maxSampledTexturesPerShaderStage %d\n", (int)((*uint8)&v.maxSampledTexturesPerShaderStage - (*uint8)&v)); 
+      printf("WGPULimits.maxSamplersPerShaderStage %d\n", (int)((*uint8)&v.maxSamplersPerShaderStage - (*uint8)&v)); 
+      printf("WGPULimits.maxStorageBuffersPerShaderStage %d\n", (int)((*uint8)&v.maxStorageBuffersPerShaderStage - (*uint8)&v)); 
+      printf("WGPULimits.maxStorageTexturesPerShaderStage %d\n", (int)((*uint8)&v.maxStorageTexturesPerShaderStage - (*uint8)&v)); 
+      printf("WGPULimits.maxUniformBuffersPerShaderStage %d\n", (int)((*uint8)&v.maxUniformBuffersPerShaderStage - (*uint8)&v)); 
+      printf("WGPULimits.maxUniformBufferBindingSize %d\n", (int)((*uint8)&v.maxUniformBufferBindingSize - (*uint8)&v)); 
+      printf("WGPULimits.maxStorageBufferBindingSize %d\n", (int)((*uint8)&v.maxStorageBufferBindingSize - (*uint8)&v)); 
+      printf("WGPULimits.minUniformBufferOffsetAlignment %d\n", (int)((*uint8)&v.minUniformBufferOffsetAlignment - (*uint8)&v)); 
+      printf("WGPULimits.minStorageBufferOffsetAlignment %d\n", (int)((*uint8)&v.minStorageBufferOffsetAlignment - (*uint8)&v)); 
+      printf("WGPULimits.maxVertexBuffers %d\n", (int)((*uint8)&v.maxVertexBuffers - (*uint8)&v)); 
+      printf("WGPULimits.maxBufferSize %d\n", (int)((*uint8)&v.maxBufferSize - (*uint8)&v)); 
+      printf("WGPULimits.maxVertexAttributes %d\n", (int)((*uint8)&v.maxVertexAttributes - (*uint8)&v)); 
+      printf("WGPULimits.maxVertexBufferArrayStride %d\n", (int)((*uint8)&v.maxVertexBufferArrayStride - (*uint8)&v)); 
+      printf("WGPULimits.maxInterStageShaderVariables %d\n", (int)((*uint8)&v.maxInterStageShaderVariables - (*uint8)&v)); 
+      printf("WGPULimits.maxColorAttachments %d\n", (int)((*uint8)&v.maxColorAttachments - (*uint8)&v)); 
+      printf("WGPULimits.maxColorAttachmentBytesPerSample %d\n", (int)((*uint8)&v.maxColorAttachmentBytesPerSample - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeWorkgroupStorageSize %d\n", (int)((*uint8)&v.maxComputeWorkgroupStorageSize - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeInvocationsPerWorkgroup %d\n", (int)((*uint8)&v.maxComputeInvocationsPerWorkgroup - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeWorkgroupSizeX %d\n", (int)((*uint8)&v.maxComputeWorkgroupSizeX - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeWorkgroupSizeY %d\n", (int)((*uint8)&v.maxComputeWorkgroupSizeY - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeWorkgroupSizeZ %d\n", (int)((*uint8)&v.maxComputeWorkgroupSizeZ - (*uint8)&v)); 
+      printf("WGPULimits.maxComputeWorkgroupsPerDimension %d\n", (int)((*uint8)&v.maxComputeWorkgroupsPerDimension - (*uint8)&v)); 
+      printf("WGPULimits.maxImmediateSize %d\n", (int)((*uint8)&v.maxImmediateSize - (*uint8)&v)); 
+    }
+    printf("WGPURenderPassColorAttachment %d\n", (int)sizeof(WGPURenderPassColorAttachment));
+    { WGPURenderPassColorAttachment v;
+      printf("WGPURenderPassColorAttachment.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.view %d\n", (int)((*uint8)&v.view - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.depthSlice %d\n", (int)((*uint8)&v.depthSlice - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.resolveTarget %d\n", (int)((*uint8)&v.resolveTarget - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.loadOp %d\n", (int)((*uint8)&v.loadOp - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.storeOp %d\n", (int)((*uint8)&v.storeOp - (*uint8)&v)); 
+      printf("WGPURenderPassColorAttachment.clearValue %d\n", (int)((*uint8)&v.clearValue - (*uint8)&v)); 
+    }
+    printf("WGPURequestAdapterOptions %d\n", (int)sizeof(WGPURequestAdapterOptions));
+    { WGPURequestAdapterOptions v;
+      printf("WGPURequestAdapterOptions.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURequestAdapterOptions.featureLevel %d\n", (int)((*uint8)&v.featureLevel - (*uint8)&v)); 
+      printf("WGPURequestAdapterOptions.powerPreference %d\n", (int)((*uint8)&v.powerPreference - (*uint8)&v)); 
+      printf("WGPURequestAdapterOptions.forceFallbackAdapter %d\n", (int)((*uint8)&v.forceFallbackAdapter - (*uint8)&v)); 
+      printf("WGPURequestAdapterOptions.backendType %d\n", (int)((*uint8)&v.backendType - (*uint8)&v)); 
+      printf("WGPURequestAdapterOptions.compatibleSurface %d\n", (int)((*uint8)&v.compatibleSurface - (*uint8)&v)); 
+    }
+    printf("WGPUShaderModuleDescriptor %d\n", (int)sizeof(WGPUShaderModuleDescriptor));
+    { WGPUShaderModuleDescriptor v;
+      printf("WGPUShaderModuleDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUShaderModuleDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceDescriptor %d\n", (int)sizeof(WGPUSurfaceDescriptor));
+    { WGPUSurfaceDescriptor v;
+      printf("WGPUSurfaceDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUSurfaceDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+    }
+    printf("WGPUTexelCopyBufferInfo %d\n", (int)sizeof(WGPUTexelCopyBufferInfo));
+    { WGPUTexelCopyBufferInfo v;
+      printf("WGPUTexelCopyBufferInfo.layout %d\n", (int)((*uint8)&v.layout - (*uint8)&v)); 
+      printf("WGPUTexelCopyBufferInfo.buffer %d\n", (int)((*uint8)&v.buffer - (*uint8)&v)); 
+    }
+    printf("WGPUTexelCopyTextureInfo %d\n", (int)sizeof(WGPUTexelCopyTextureInfo));
+    { WGPUTexelCopyTextureInfo v;
+      printf("WGPUTexelCopyTextureInfo.texture %d\n", (int)((*uint8)&v.texture - (*uint8)&v)); 
+      printf("WGPUTexelCopyTextureInfo.mipLevel %d\n", (int)((*uint8)&v.mipLevel - (*uint8)&v)); 
+      printf("WGPUTexelCopyTextureInfo.origin %d\n", (int)((*uint8)&v.origin - (*uint8)&v)); 
+      printf("WGPUTexelCopyTextureInfo.aspect %d\n", (int)((*uint8)&v.aspect - (*uint8)&v)); 
+    }
+    printf("WGPUTextureComponentSwizzleDescriptor %d\n", (int)sizeof(WGPUTextureComponentSwizzleDescriptor));
+    { WGPUTextureComponentSwizzleDescriptor v;
+      printf("WGPUTextureComponentSwizzleDescriptor.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUTextureComponentSwizzleDescriptor.swizzle %d\n", (int)((*uint8)&v.swizzle - (*uint8)&v)); 
+    }
+    printf("WGPUTextureDescriptor %d\n", (int)sizeof(WGPUTextureDescriptor));
+    { WGPUTextureDescriptor v;
+      printf("WGPUTextureDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.usage %d\n", (int)((*uint8)&v.usage - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.dimension %d\n", (int)((*uint8)&v.dimension - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.size %d\n", (int)((*uint8)&v.size - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.mipLevelCount %d\n", (int)((*uint8)&v.mipLevelCount - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.sampleCount %d\n", (int)((*uint8)&v.sampleCount - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.viewFormatCount %d\n", (int)((*uint8)&v.viewFormatCount - (*uint8)&v)); 
+      printf("WGPUTextureDescriptor.viewFormats %d\n", (int)((*uint8)&v.viewFormats - (*uint8)&v)); 
+    }
+    printf("WGPUVertexBufferLayout %d\n", (int)sizeof(WGPUVertexBufferLayout));
+    { WGPUVertexBufferLayout v;
+      printf("WGPUVertexBufferLayout.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUVertexBufferLayout.stepMode %d\n", (int)((*uint8)&v.stepMode - (*uint8)&v)); 
+      printf("WGPUVertexBufferLayout.arrayStride %d\n", (int)((*uint8)&v.arrayStride - (*uint8)&v)); 
+      printf("WGPUVertexBufferLayout.attributeCount %d\n", (int)((*uint8)&v.attributeCount - (*uint8)&v)); 
+      printf("WGPUVertexBufferLayout.attributes %d\n", (int)((*uint8)&v.attributes - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupDescriptor %d\n", (int)sizeof(WGPUBindGroupDescriptor));
+    { WGPUBindGroupDescriptor v;
+      printf("WGPUBindGroupDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBindGroupDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUBindGroupDescriptor.layout %d\n", (int)((*uint8)&v.layout - (*uint8)&v)); 
+      printf("WGPUBindGroupDescriptor.entryCount %d\n", (int)((*uint8)&v.entryCount - (*uint8)&v)); 
+      printf("WGPUBindGroupDescriptor.entries %d\n", (int)((*uint8)&v.entries - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupLayoutDescriptor %d\n", (int)sizeof(WGPUBindGroupLayoutDescriptor));
+    { WGPUBindGroupLayoutDescriptor v;
+      printf("WGPUBindGroupLayoutDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutDescriptor.entryCount %d\n", (int)((*uint8)&v.entryCount - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutDescriptor.entries %d\n", (int)((*uint8)&v.entries - (*uint8)&v)); 
+    }
+    printf("WGPUColorTargetState %d\n", (int)sizeof(WGPUColorTargetState));
+    { WGPUColorTargetState v;
+      printf("WGPUColorTargetState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUColorTargetState.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUColorTargetState.blend %d\n", (int)((*uint8)&v.blend - (*uint8)&v)); 
+      printf("WGPUColorTargetState.writeMask %d\n", (int)((*uint8)&v.writeMask - (*uint8)&v)); 
+    }
+    printf("WGPUComputePipelineDescriptor %d\n", (int)sizeof(WGPUComputePipelineDescriptor));
+    { WGPUComputePipelineDescriptor v;
+      printf("WGPUComputePipelineDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUComputePipelineDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUComputePipelineDescriptor.layout %d\n", (int)((*uint8)&v.layout - (*uint8)&v)); 
+      printf("WGPUComputePipelineDescriptor.compute %d\n", (int)((*uint8)&v.compute - (*uint8)&v)); 
+    }
+    printf("WGPUDeviceDescriptor %d\n", (int)sizeof(WGPUDeviceDescriptor));
+    { WGPUDeviceDescriptor v;
+      printf("WGPUDeviceDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.requiredFeatureCount %d\n", (int)((*uint8)&v.requiredFeatureCount - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.requiredFeatures %d\n", (int)((*uint8)&v.requiredFeatures - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.requiredLimits %d\n", (int)((*uint8)&v.requiredLimits - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.defaultQueue %d\n", (int)((*uint8)&v.defaultQueue - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.deviceLostCallbackInfo %d\n", (int)((*uint8)&v.deviceLostCallbackInfo - (*uint8)&v)); 
+      printf("WGPUDeviceDescriptor.uncapturedErrorCallbackInfo %d\n", (int)((*uint8)&v.uncapturedErrorCallbackInfo - (*uint8)&v)); 
+    }
+    printf("WGPURenderPassDescriptor %d\n", (int)sizeof(WGPURenderPassDescriptor));
+    { WGPURenderPassDescriptor v;
+      printf("WGPURenderPassDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.colorAttachmentCount %d\n", (int)((*uint8)&v.colorAttachmentCount - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.colorAttachments %d\n", (int)((*uint8)&v.colorAttachments - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.depthStencilAttachment %d\n", (int)((*uint8)&v.depthStencilAttachment - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.occlusionQuerySet %d\n", (int)((*uint8)&v.occlusionQuerySet - (*uint8)&v)); 
+      printf("WGPURenderPassDescriptor.timestampWrites %d\n", (int)((*uint8)&v.timestampWrites - (*uint8)&v)); 
+    }
+    printf("WGPUTextureViewDescriptor %d\n", (int)sizeof(WGPUTextureViewDescriptor));
+    { WGPUTextureViewDescriptor v;
+      printf("WGPUTextureViewDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.format %d\n", (int)((*uint8)&v.format - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.dimension %d\n", (int)((*uint8)&v.dimension - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.baseMipLevel %d\n", (int)((*uint8)&v.baseMipLevel - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.mipLevelCount %d\n", (int)((*uint8)&v.mipLevelCount - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.baseArrayLayer %d\n", (int)((*uint8)&v.baseArrayLayer - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.arrayLayerCount %d\n", (int)((*uint8)&v.arrayLayerCount - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.aspect %d\n", (int)((*uint8)&v.aspect - (*uint8)&v)); 
+      printf("WGPUTextureViewDescriptor.usage %d\n", (int)((*uint8)&v.usage - (*uint8)&v)); 
+    }
+    printf("WGPUVertexState %d\n", (int)sizeof(WGPUVertexState));
+    { WGPUVertexState v;
+      printf("WGPUVertexState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUVertexState.module %d\n", (int)((*uint8)&v.module - (*uint8)&v)); 
+      printf("WGPUVertexState.entryPoint %d\n", (int)((*uint8)&v.entryPoint - (*uint8)&v)); 
+      printf("WGPUVertexState.constantCount %d\n", (int)((*uint8)&v.constantCount - (*uint8)&v)); 
+      printf("WGPUVertexState.constants %d\n", (int)((*uint8)&v.constants - (*uint8)&v)); 
+      printf("WGPUVertexState.bufferCount %d\n", (int)((*uint8)&v.bufferCount - (*uint8)&v)); 
+      printf("WGPUVertexState.buffers %d\n", (int)((*uint8)&v.buffers - (*uint8)&v)); 
+    }
+    printf("WGPUFragmentState %d\n", (int)sizeof(WGPUFragmentState));
+    { WGPUFragmentState v;
+      printf("WGPUFragmentState.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUFragmentState.module %d\n", (int)((*uint8)&v.module - (*uint8)&v)); 
+      printf("WGPUFragmentState.entryPoint %d\n", (int)((*uint8)&v.entryPoint - (*uint8)&v)); 
+      printf("WGPUFragmentState.constantCount %d\n", (int)((*uint8)&v.constantCount - (*uint8)&v)); 
+      printf("WGPUFragmentState.constants %d\n", (int)((*uint8)&v.constants - (*uint8)&v)); 
+      printf("WGPUFragmentState.targetCount %d\n", (int)((*uint8)&v.targetCount - (*uint8)&v)); 
+      printf("WGPUFragmentState.targets %d\n", (int)((*uint8)&v.targets - (*uint8)&v)); 
+    }
+    printf("WGPURenderPipelineDescriptor %d\n", (int)sizeof(WGPURenderPipelineDescriptor));
+    { WGPURenderPipelineDescriptor v;
+      printf("WGPURenderPipelineDescriptor.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.layout %d\n", (int)((*uint8)&v.layout - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.vertex %d\n", (int)((*uint8)&v.vertex - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.primitive %d\n", (int)((*uint8)&v.primitive - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.depthStencil %d\n", (int)((*uint8)&v.depthStencil - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.multisample %d\n", (int)((*uint8)&v.multisample - (*uint8)&v)); 
+      printf("WGPURenderPipelineDescriptor.fragment %d\n", (int)((*uint8)&v.fragment - (*uint8)&v)); 
+    }
+    printf("WGPUXlibDisplayHandle %d\n", (int)sizeof(WGPUXlibDisplayHandle));
+    { WGPUXlibDisplayHandle v;
+      printf("WGPUXlibDisplayHandle.display %d\n", (int)((*uint8)&v.display - (*uint8)&v)); 
+      printf("WGPUXlibDisplayHandle.screen %d\n", (int)((*uint8)&v.screen - (*uint8)&v)); 
+    }
+    printf("WGPUXcbDisplayHandle %d\n", (int)sizeof(WGPUXcbDisplayHandle));
+    { WGPUXcbDisplayHandle v;
+      printf("WGPUXcbDisplayHandle.connection %d\n", (int)((*uint8)&v.connection - (*uint8)&v)); 
+      printf("WGPUXcbDisplayHandle.screen %d\n", (int)((*uint8)&v.screen - (*uint8)&v)); 
+    }
+    printf("WGPUWaylandDisplayHandle %d\n", (int)sizeof(WGPUWaylandDisplayHandle));
+    { WGPUWaylandDisplayHandle v;
+      printf("WGPUWaylandDisplayHandle.display %d\n", (int)((*uint8)&v.display - (*uint8)&v)); 
+    }
+    printf("WGPUNativeDisplayHandle %d\n", (int)sizeof(WGPUNativeDisplayHandle));
+    { WGPUNativeDisplayHandle v;
+      printf("WGPUNativeDisplayHandle.type %d\n", (int)((*uint8)&v.type_ - (*uint8)&v)); 
+      printf("WGPUNativeDisplayHandle.data %d\n", (int)((*uint8)&v.data - (*uint8)&v)); 
+    }
+    printf("WGPUInstanceExtras %d\n", (int)sizeof(WGPUInstanceExtras));
+    { WGPUInstanceExtras v;
+      printf("WGPUInstanceExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.backends %d\n", (int)((*uint8)&v.backends - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.flags %d\n", (int)((*uint8)&v.flags - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.dx12ShaderCompiler %d\n", (int)((*uint8)&v.dx12ShaderCompiler - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.gles3MinorVersion %d\n", (int)((*uint8)&v.gles3MinorVersion - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.glFenceBehaviour %d\n", (int)((*uint8)&v.glFenceBehaviour - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.dxcPath %d\n", (int)((*uint8)&v.dxcPath - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.dxcMaxShaderModel %d\n", (int)((*uint8)&v.dxcMaxShaderModel - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.dx12PresentationSystem %d\n", (int)((*uint8)&v.dx12PresentationSystem - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.budgetForDeviceCreation %d\n", (int)((*uint8)&v.budgetForDeviceCreation - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.budgetForDeviceLoss %d\n", (int)((*uint8)&v.budgetForDeviceLoss - (*uint8)&v)); 
+      printf("WGPUInstanceExtras.displayHandle %d\n", (int)((*uint8)&v.displayHandle - (*uint8)&v)); 
+    }
+    printf("WGPUDeviceExtras %d\n", (int)sizeof(WGPUDeviceExtras));
+    { WGPUDeviceExtras v;
+      printf("WGPUDeviceExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUDeviceExtras.tracePath %d\n", (int)((*uint8)&v.tracePath - (*uint8)&v)); 
+    }
+    printf("WGPUNativeLimits %d\n", (int)sizeof(WGPUNativeLimits));
+    { WGPUNativeLimits v;
+      printf("WGPUNativeLimits.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUNativeLimits.maxNonSamplerBindings %d\n", (int)((*uint8)&v.maxNonSamplerBindings - (*uint8)&v)); 
+      printf("WGPUNativeLimits.maxBindingArrayElementsPerShaderStage %d\n", (int)((*uint8)&v.maxBindingArrayElementsPerShaderStage - (*uint8)&v)); 
+      printf("WGPUNativeLimits.maxBindingArraySamplerElementsPerShaderStage %d\n", (int)((*uint8)&v.maxBindingArraySamplerElementsPerShaderStage - (*uint8)&v)); 
+      printf("WGPUNativeLimits.maxMultiviewViewCount %d\n", (int)((*uint8)&v.maxMultiviewViewCount - (*uint8)&v)); 
+    }
+    printf("WGPUShaderDefine %d\n", (int)sizeof(WGPUShaderDefine));
+    { WGPUShaderDefine v;
+      printf("WGPUShaderDefine.name %d\n", (int)((*uint8)&v.name - (*uint8)&v)); 
+      printf("WGPUShaderDefine.value %d\n", (int)((*uint8)&v.value - (*uint8)&v)); 
+    }
+    printf("WGPUShaderSourceGLSL %d\n", (int)sizeof(WGPUShaderSourceGLSL));
+    { WGPUShaderSourceGLSL v;
+      printf("WGPUShaderSourceGLSL.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUShaderSourceGLSL.stage %d\n", (int)((*uint8)&v.stage - (*uint8)&v)); 
+      printf("WGPUShaderSourceGLSL.code %d\n", (int)((*uint8)&v.code - (*uint8)&v)); 
+      printf("WGPUShaderSourceGLSL.defineCount %d\n", (int)((*uint8)&v.defineCount - (*uint8)&v)); 
+      printf("WGPUShaderSourceGLSL.defines %d\n", (int)((*uint8)&v.defines - (*uint8)&v)); 
+    }
+    printf("WGPUShaderModuleDescriptorSpirV %d\n", (int)sizeof(WGPUShaderModuleDescriptorSpirV));
+    { WGPUShaderModuleDescriptorSpirV v;
+      printf("WGPUShaderModuleDescriptorSpirV.label %d\n", (int)((*uint8)&v.label - (*uint8)&v)); 
+      printf("WGPUShaderModuleDescriptorSpirV.sourceSize %d\n", (int)((*uint8)&v.sourceSize - (*uint8)&v)); 
+      printf("WGPUShaderModuleDescriptorSpirV.source %d\n", (int)((*uint8)&v.source - (*uint8)&v)); 
+    }
+    printf("WGPURegistryReport %d\n", (int)sizeof(WGPURegistryReport));
+    { WGPURegistryReport v;
+      printf("WGPURegistryReport.numAllocated %d\n", (int)((*uint8)&v.numAllocated - (*uint8)&v)); 
+      printf("WGPURegistryReport.numKeptFromUser %d\n", (int)((*uint8)&v.numKeptFromUser - (*uint8)&v)); 
+      printf("WGPURegistryReport.numReleasedFromUser %d\n", (int)((*uint8)&v.numReleasedFromUser - (*uint8)&v)); 
+      printf("WGPURegistryReport.elementSize %d\n", (int)((*uint8)&v.elementSize - (*uint8)&v)); 
+    }
+    printf("WGPUHubReport %d\n", (int)sizeof(WGPUHubReport));
+    { WGPUHubReport v;
+      printf("WGPUHubReport.adapters %d\n", (int)((*uint8)&v.adapters - (*uint8)&v)); 
+      printf("WGPUHubReport.devices %d\n", (int)((*uint8)&v.devices - (*uint8)&v)); 
+      printf("WGPUHubReport.queues %d\n", (int)((*uint8)&v.queues - (*uint8)&v)); 
+      printf("WGPUHubReport.pipelineLayouts %d\n", (int)((*uint8)&v.pipelineLayouts - (*uint8)&v)); 
+      printf("WGPUHubReport.shaderModules %d\n", (int)((*uint8)&v.shaderModules - (*uint8)&v)); 
+      printf("WGPUHubReport.bindGroupLayouts %d\n", (int)((*uint8)&v.bindGroupLayouts - (*uint8)&v)); 
+      printf("WGPUHubReport.bindGroups %d\n", (int)((*uint8)&v.bindGroups - (*uint8)&v)); 
+      printf("WGPUHubReport.commandBuffers %d\n", (int)((*uint8)&v.commandBuffers - (*uint8)&v)); 
+      printf("WGPUHubReport.renderBundles %d\n", (int)((*uint8)&v.renderBundles - (*uint8)&v)); 
+      printf("WGPUHubReport.renderPipelines %d\n", (int)((*uint8)&v.renderPipelines - (*uint8)&v)); 
+      printf("WGPUHubReport.computePipelines %d\n", (int)((*uint8)&v.computePipelines - (*uint8)&v)); 
+      printf("WGPUHubReport.pipelineCaches %d\n", (int)((*uint8)&v.pipelineCaches - (*uint8)&v)); 
+      printf("WGPUHubReport.querySets %d\n", (int)((*uint8)&v.querySets - (*uint8)&v)); 
+      printf("WGPUHubReport.buffers %d\n", (int)((*uint8)&v.buffers - (*uint8)&v)); 
+      printf("WGPUHubReport.textures %d\n", (int)((*uint8)&v.textures - (*uint8)&v)); 
+      printf("WGPUHubReport.textureViews %d\n", (int)((*uint8)&v.textureViews - (*uint8)&v)); 
+      printf("WGPUHubReport.samplers %d\n", (int)((*uint8)&v.samplers - (*uint8)&v)); 
+    }
+    printf("WGPUGlobalReport %d\n", (int)sizeof(WGPUGlobalReport));
+    { WGPUGlobalReport v;
+      printf("WGPUGlobalReport.surfaces %d\n", (int)((*uint8)&v.surfaces - (*uint8)&v)); 
+      printf("WGPUGlobalReport.hub %d\n", (int)((*uint8)&v.hub - (*uint8)&v)); 
+    }
+    printf("WGPUInstanceEnumerateAdapterOptions %d\n", (int)sizeof(WGPUInstanceEnumerateAdapterOptions));
+    { WGPUInstanceEnumerateAdapterOptions v;
+      printf("WGPUInstanceEnumerateAdapterOptions.nextInChain %d\n", (int)((*uint8)&v.nextInChain - (*uint8)&v)); 
+      printf("WGPUInstanceEnumerateAdapterOptions.backends %d\n", (int)((*uint8)&v.backends - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupEntryExtras %d\n", (int)sizeof(WGPUBindGroupEntryExtras));
+    { WGPUBindGroupEntryExtras v;
+      printf("WGPUBindGroupEntryExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.buffers %d\n", (int)((*uint8)&v.buffers - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.bufferCount %d\n", (int)((*uint8)&v.bufferCount - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.samplers %d\n", (int)((*uint8)&v.samplers - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.samplerCount %d\n", (int)((*uint8)&v.samplerCount - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.textureViews %d\n", (int)((*uint8)&v.textureViews - (*uint8)&v)); 
+      printf("WGPUBindGroupEntryExtras.textureViewCount %d\n", (int)((*uint8)&v.textureViewCount - (*uint8)&v)); 
+    }
+    printf("WGPUBindGroupLayoutEntryExtras %d\n", (int)sizeof(WGPUBindGroupLayoutEntryExtras));
+    { WGPUBindGroupLayoutEntryExtras v;
+      printf("WGPUBindGroupLayoutEntryExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUBindGroupLayoutEntryExtras.count %d\n", (int)((*uint8)&v.count - (*uint8)&v)); 
+    }
+    printf("WGPUQuerySetDescriptorExtras %d\n", (int)sizeof(WGPUQuerySetDescriptorExtras));
+    { WGPUQuerySetDescriptorExtras v;
+      printf("WGPUQuerySetDescriptorExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUQuerySetDescriptorExtras.pipelineStatistics %d\n", (int)((*uint8)&v.pipelineStatistics - (*uint8)&v)); 
+      printf("WGPUQuerySetDescriptorExtras.pipelineStatisticCount %d\n", (int)((*uint8)&v.pipelineStatisticCount - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceConfigurationExtras %d\n", (int)sizeof(WGPUSurfaceConfigurationExtras));
+    { WGPUSurfaceConfigurationExtras v;
+      printf("WGPUSurfaceConfigurationExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceConfigurationExtras.desiredMaximumFrameLatency %d\n", (int)((*uint8)&v.desiredMaximumFrameLatency - (*uint8)&v)); 
+    }
+    printf("WGPUSurfaceSourceSwapChainPanel %d\n", (int)sizeof(WGPUSurfaceSourceSwapChainPanel));
+    { WGPUSurfaceSourceSwapChainPanel v;
+      printf("WGPUSurfaceSourceSwapChainPanel.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSurfaceSourceSwapChainPanel.panelNative %d\n", (int)((*uint8)&v.panelNative - (*uint8)&v)); 
+    }
+    printf("WGPUPrimitiveStateExtras %d\n", (int)sizeof(WGPUPrimitiveStateExtras));
+    { WGPUPrimitiveStateExtras v;
+      printf("WGPUPrimitiveStateExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUPrimitiveStateExtras.polygonMode %d\n", (int)((*uint8)&v.polygonMode - (*uint8)&v)); 
+      printf("WGPUPrimitiveStateExtras.conservative %d\n", (int)((*uint8)&v.conservative - (*uint8)&v)); 
+    }
+    printf("WGPUImageSubresourceRange %d\n", (int)sizeof(WGPUImageSubresourceRange));
+    { WGPUImageSubresourceRange v;
+      printf("WGPUImageSubresourceRange.aspect %d\n", (int)((*uint8)&v.aspect - (*uint8)&v)); 
+      printf("WGPUImageSubresourceRange.baseMipLevel %d\n", (int)((*uint8)&v.baseMipLevel - (*uint8)&v)); 
+      printf("WGPUImageSubresourceRange.mipLevelCount %d\n", (int)((*uint8)&v.mipLevelCount - (*uint8)&v)); 
+      printf("WGPUImageSubresourceRange.baseArrayLayer %d\n", (int)((*uint8)&v.baseArrayLayer - (*uint8)&v)); 
+      printf("WGPUImageSubresourceRange.arrayLayerCount %d\n", (int)((*uint8)&v.arrayLayerCount - (*uint8)&v)); 
+    }
+    printf("WGPUSamplerDescriptorExtras %d\n", (int)sizeof(WGPUSamplerDescriptorExtras));
+    { WGPUSamplerDescriptorExtras v;
+      printf("WGPUSamplerDescriptorExtras.chain %d\n", (int)((*uint8)&v.chain - (*uint8)&v)); 
+      printf("WGPUSamplerDescriptorExtras.samplerBorderColor %d\n", (int)((*uint8)&v.samplerBorderColor - (*uint8)&v)); 
+    }
+    printf("WGPUNativeDisplayHandleData %d\n", (int)sizeof(WGPUNativeDisplayHandleData));
+    return 0;
+}
