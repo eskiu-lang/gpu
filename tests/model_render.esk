@@ -1,0 +1,84 @@
+// Renders the test models offscreen: the unlit textured quad must show its
+// four texture colors in place, and the skinned strip must move when its
+// animation bends it.
+import <io>;
+import <mem>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/model>;
+
+int fails = 0;
+
+uint32 pixel(*uint8 px, int x, int y) {
+    *uint8 p = px + (y * 64 + x) * 4;
+    return (uint32)p[0] << 16 | (uint32)p[1] << 8 | (uint32)p[2];
+}
+
+Result<int, string> render(*Gpu gpu, *Gltf data, float t, *uint8 out, bool frame_it) {
+    GpuTexture target = gpu.target(64, 64)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(64, 64)?;
+    defer depth.release();
+    GpuModel model = gpu.model(data, target.format)?;
+    defer model.release();
+    if (data.animations.size > 0) data.animate(0, t);
+    model.update(mat4_identity());
+    GpuCamera cam = gpu_camera(Vec3{0.0, 0.0, 2.5}, Vec3{0.0, 0.0, 0.0}, 0.8, 1.0, 0.1, 10.0);
+    if (frame_it) cam = gpu_camera(Vec3{0.0, 1.0, 6.0}, Vec3{0.0, 1.0, 0.0}, 0.8, 1.0, 0.1, 20.0);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &depth);
+    model.draw(&pass, &cam);
+    pass.end()?;
+    target.read(out)?;
+    return Ok<int, string>(0);
+}
+
+void expect(string what, uint32 got, uint32 want) {
+    if (got != want) {
+        printf("FAIL %s: %06x, want %06x\n", what, got, want);
+        fails++;
+    }
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    Gltf quad = gltf_load("tests/data/textured_quad.glb")?;
+    defer quad.free();
+    render(&gpu, &quad, 0.0, px, false)?;
+    expect("top left is red", pixel(px, 16, 16), 0xff0000);
+    expect("top right is green", pixel(px, 48, 16), 0x00ff00);
+    expect("bottom left is blue", pixel(px, 16, 48), 0x0000ff);
+    expect("bottom right is white", pixel(px, 48, 48), 0xffffff);
+    expect("outside is the clear color", pixel(px, 0, 0), 0x000000);
+
+    Gltf strip = gltf_load("tests/data/skin_anim.gltf")?;
+    defer strip.free();
+    *uint8 bent = alloc<uint8>(64 * 64 * 4);
+    defer free(bent);
+    render(&gpu, &strip, 0.0, px, true)?;
+    render(&gpu, &strip, 1.0, bent, true)?;
+    int lit = 0;
+    int changed = 0;
+    for (i in 0..64 * 64) {
+        if (px[i * 4] != 0) lit++;
+        if (px[i * 4] != bent[i * 4]) changed++;
+    }
+    if (lit < 50 || changed < 50) {
+        printf("FAIL skinned strip: %d lit pixels, %d changed by the animation\n", lit, changed);
+        fails++;
+    }
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("model render: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}

@@ -1,0 +1,99 @@
+// A glTF viewer: eskiuc run -L/opt/homebrew/lib examples/model.esk model.glb
+// Drag to orbit, scroll to zoom, space pauses the animation, the number keys
+// pick another animation, Escape quits; --frames N quits after N frames.
+import <io>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/model>;
+import <gpu/window>;
+
+Result<int, string> run(string path, int max_frames) {
+    Gltf data = gltf_load(path)?;
+    defer data.free();
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Window win = window_open("Eskiu model viewer", 1024, 768)?;
+    defer win.release();
+    GpuSurface surface = win.surface(&gpu)?;
+    defer surface.release();
+    GpuTexture depth = gpu.depth(surface.width, surface.height)?;
+    defer depth.release();
+    GpuModel model = gpu.model(&data, surface.format)?;
+    defer model.release();
+
+    Vec3 lo;
+    Vec3 hi;
+    data.bounds(&lo, &hi);
+    Vec3 center = (lo + hi) * 0.5;
+    float radius = (hi - lo).length() * 0.5;
+    if (radius <= 0.0) radius = 1.0;
+    float yaw = 0.0;
+    float pitch = 0.2;
+    float dist = radius * 2.6;
+    bool dragging = false;
+    bool playing = true;
+    int anim = 0;
+    float t = 0.0;
+    uint64 last = window_ticks();
+    int frames = 0;
+    bool running = true;
+    WindowEvent ev;
+    while (running) {
+        while (win.poll(&ev)) {
+            if (ev.kind == WINDOW_QUIT || (ev.kind == WINDOW_KEY_DOWN && ev.key == KEY_ESCAPE)) running = false;
+            if (ev.kind == WINDOW_RESIZE) {
+                surface.configure(ev.width, ev.height);
+                depth.release();
+                depth = gpu.depth(ev.width, ev.height)?;
+            }
+            if (ev.kind == WINDOW_MOUSE_DOWN && ev.button == 1) dragging = true;
+            if (ev.kind == WINDOW_MOUSE_UP && ev.button == 1) dragging = false;
+            if (ev.kind == WINDOW_MOUSE_MOVE && dragging) {
+                yaw = yaw - ev.dx * 0.01;
+                pitch = pitch + ev.dy * 0.01;
+                if (pitch > 1.5) pitch = 1.5;
+                if (pitch < -1.5) pitch = -1.5;
+            }
+            if (ev.kind == WINDOW_WHEEL) dist = dist * (float)pow(0.9, (double)ev.y);
+            if (ev.kind == WINDOW_KEY_DOWN && ev.key == ' ') playing = !playing;
+            if (ev.kind == WINDOW_KEY_DOWN && ev.key >= '1' && ev.key <= '9' && ev.key - '1' < data.animations.size) {
+                anim = ev.key - '1';
+                t = 0.0;
+            }
+        }
+        uint64 now = window_ticks();
+        if (playing) t = t + (float)(now - last) / 1000.0;
+        last = now;
+        if (data.animations.size > 0) data.animate(anim, t);
+        model.update(mat4_identity());
+        Vec3 eye = center + Vec3{(float)(sin((double)yaw) * cos((double)pitch)), (float)sin((double)pitch),
+            (float)(cos((double)yaw) * cos((double)pitch))} * dist;
+        GpuCamera cam = gpu_camera(eye, center, 0.8, (float)surface.width / (float)surface.height, radius * 0.02, radius * 50.0);
+        Result<GpuFrame, string> fr = surface.frame();
+        if (!fr.ok) {
+            surface.configure(surface.width, surface.height);
+            continue;
+        }
+        GpuFrame frame = fr.value;
+        GpuPass pass = gpu.pass(frame.view, GpuColor{0.12, 0.13, 0.16, 1.0}, &depth);
+        model.draw(&pass, &cam);
+        pass.end()?;
+        surface.present(&frame);
+        frames++;
+        if (max_frames > 0 && frames >= max_frames) running = false;
+    }
+    return Ok<int, string>(frames);
+}
+
+if (argc < 2) {
+    printf("usage: model FILE.gltf|FILE.glb [--frames N]\n");
+    return 2;
+}
+
+int max_frames = 0;
+if (argc > 3 && strcmp(argv[2], "--frames") == 0) max_frames = atoi(argv[3]);
+Result<int, string> r = run(argv[1], max_frames);
+if (r.ok) printf("%d frames\n", r.value);
+else printf("error: %s\n", r.error);

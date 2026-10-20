@@ -1,0 +1,627 @@
+// model.esk: drawing glTF models with physically based shading.
+//
+//     Gltf data = gltf_load("helmet.glb")?;
+//     defer data.free();
+//     GpuModel model = gpu.model(&data, surface.format)?;
+//     defer model.release();
+//     ...each frame:
+//     data.animate(0, seconds);                 // optional
+//     model.update(mat4_identity());
+//     GpuPass pass = gpu.pass(frame.view, clear, &depth);
+//     model.draw(&pass, &camera);
+//     pass.end()?;
+//
+// The shading is glTF's metallic-roughness model with base color, metallic-
+// roughness, normal, occlusion and emissive textures, vertex colors, alpha
+// mask and blend, double-sided materials, KHR_materials_unlit and skinning,
+// lit by one directional light (GpuModel.light) and a hemisphere ambient term.
+// The Gltf must outlive the model: update() reads its node poses. A model is
+// drawn once per pass (its uniforms hold one pose and one camera).
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <libc>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/image>;
+
+struct GpuCamera {
+    Mat4 view;
+    Mat4 proj;
+    Vec3 eye;
+}
+
+// direction points from the light toward the scene; ambient is the sky color
+// of the hemisphere term (the ground gets a third of it).
+struct GpuLight {
+    Vec3 direction;
+    Vec3 color;
+    float intensity;
+    Vec3 ambient;
+}
+
+struct _GpuDraw {
+    int node;
+    int mesh;
+    int prim;
+    int material;
+    int pipeline;
+    GpuBuffer uniforms;
+    GpuBuffer joints;
+    bool skinned;
+    float depth;
+}
+
+struct _GpuPrim {
+    GpuBuffer vertices;
+    GpuBuffer indices;
+    uint32 index_count;
+    bool drawable;
+}
+
+struct _GpuMat {
+    GpuBuffer uniforms;
+    int[5] tex;
+    int[5] samp;
+    int pipeline;
+    bool blend;
+}
+
+struct _GpuTexKey {
+    int image;
+    bool srgb;
+    int slot;
+}
+
+struct GpuModel {
+    Gpu gpu;
+    *Gltf data;
+    GpuLight light;
+    GpuBuffer frame;
+    List<GpuPipeline> pipelines;
+    List<GpuTexture> textures;
+    List<_GpuTexKey> texture_keys;
+    List<GpuSampler> samplers;
+    List<_GpuMat> materials;
+    List<_GpuPrim> prims;
+    List<int> prim_start;
+    List<_GpuDraw> draws;
+    *Mat4 world;
+    Mat4 transform;
+    bool encode_srgb;
+}
+
+const int _GM_VERTEX_FLOATS = 26;
+
+string _gpu_model_shader =
+    "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, light_dir: vec4<f32>, light_color: vec4<f32>, ambient: vec4<f32> };\n"
+    "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, flags: vec4<f32> };\n"
+    "struct Material { base: vec4<f32>, emissive: vec4<f32>, params: vec4<f32>, tc: vec4<f32>, misc: vec4<f32> };\n"
+    "@group(0) @binding(0) var<uniform> frame: Frame;\n"
+    "@group(0) @binding(1) var<uniform> draw: Draw;\n"
+    "@group(0) @binding(2) var<uniform> mat: Material;\n"
+    "@group(0) @binding(3) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(0) @binding(4) var base_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(5) var base_samp: sampler;\n"
+    "@group(0) @binding(6) var mr_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(7) var mr_samp: sampler;\n"
+    "@group(0) @binding(8) var normal_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(9) var normal_samp: sampler;\n"
+    "@group(0) @binding(10) var occ_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(11) var occ_samp: sampler;\n"
+    "@group(0) @binding(12) var em_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(13) var em_samp: sampler;\n"
+    "struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv0: vec2<f32>,\n"
+    "    @location(3) uv1: vec2<f32>, @location(4) tangent: vec4<f32>, @location(5) color: vec4<f32>,\n"
+    "    @location(6) joint: vec4<f32>, @location(7) weight: vec4<f32> };\n"
+    "struct V { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>,\n"
+    "    @location(2) uv0: vec2<f32>, @location(3) uv1: vec2<f32>, @location(4) tangent: vec4<f32>, @location(5) color: vec4<f32> };\n"
+    "@vertex fn vs(v: In) -> V {\n"
+    "    var skin = mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));\n"
+    "    if (draw.flags.x > 0.5) {\n"
+    "        skin = joints[u32(v.joint.x)] * v.weight.x + joints[u32(v.joint.y)] * v.weight.y\n"
+    "             + joints[u32(v.joint.z)] * v.weight.z + joints[u32(v.joint.w)] * v.weight.w;\n"
+    "    }\n"
+    "    let local = skin * vec4(v.pos, 1.0);\n"
+    "    let world = draw.model * local;\n"
+    "    var out: V;\n"
+    "    out.clip = frame.view_proj * world;\n"
+    "    out.world = world.xyz;\n"
+    "    let nm = mat3x3<f32>(draw.normal[0].xyz, draw.normal[1].xyz, draw.normal[2].xyz);\n"
+    "    let sm = mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz);\n"
+    "    out.normal = nm * (sm * v.normal);\n"
+    "    let mm = mat3x3<f32>(draw.model[0].xyz, draw.model[1].xyz, draw.model[2].xyz);\n"
+    "    out.tangent = vec4(mm * (sm * v.tangent.xyz), v.tangent.w);\n"
+    "    out.uv0 = v.uv0;\n"
+    "    out.uv1 = v.uv1;\n"
+    "    out.color = v.color;\n"
+    "    return out;\n"
+    "}\n"
+    "const PI = 3.14159265;\n"
+    "fn pick(v: V, which: f32) -> vec2<f32> { return select(v.uv0, v.uv1, which > 0.5); }\n"
+    "fn to_srgb(c: vec3<f32>) -> vec3<f32> {\n"
+    "    let lo = c * 12.92;\n"
+    "    let hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
+    "    return select(hi, lo, c <= vec3(0.0031308));\n"
+    "}\n"
+    "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
+    "    let base_s = textureSample(base_tex, base_samp, pick(v, mat.tc.x));\n"
+    "    let mr_s = textureSample(mr_tex, mr_samp, pick(v, mat.tc.y));\n"
+    "    let n_s = textureSample(normal_tex, normal_samp, pick(v, mat.tc.z)).xyz;\n"
+    "    let occ_s = textureSample(occ_tex, occ_samp, pick(v, mat.tc.w)).r;\n"
+    "    let em_s = textureSample(em_tex, em_samp, pick(v, mat.misc.z)).rgb;\n"
+    "    let uv = pick(v, mat.tc.z);\n"
+    "    let dp1 = dpdx(v.world);\n"
+    "    let dp2 = dpdy(v.world);\n"
+    "    let duv1 = dpdx(uv);\n"
+    "    let duv2 = dpdy(uv);\n"
+    "    var n = normalize(v.normal);\n"
+    "    if (!front) { n = -n; }\n"
+    "    let dp2perp = cross(dp2, n);\n"
+    "    let dp1perp = cross(n, dp1);\n"
+    "    var t = dp2perp * duv1.x + dp1perp * duv2.x;\n"
+    "    var b = dp2perp * duv1.y + dp1perp * duv2.y;\n"
+    "    let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));\n"
+    "    t = t * inv;\n"
+    "    b = b * inv;\n"
+    "    if (abs(v.tangent.w) > 0.5) {\n"
+    "        t = normalize(v.tangent.xyz - n * dot(n, v.tangent.xyz));\n"
+    "        b = cross(n, t) * v.tangent.w;\n"
+    "    }\n"
+    "    var base = mat.base * v.color * base_s;\n"
+    "    if (mat.misc.x > 0.5 && mat.misc.x < 1.5 && base.a < mat.emissive.w) { discard; }\n"
+    "    if (mat.misc.y > 0.5) {\n"
+    "        let c = select(base.rgb, to_srgb(base.rgb), frame.ambient.w > 0.5);\n"
+    "        return vec4(c, select(1.0, base.a, mat.misc.x > 1.5));\n"
+    "    }\n"
+    "    if (mat.params.z > 0.0) {\n"
+    "        let tn = (n_s * 2.0 - 1.0) * vec3(mat.params.z, mat.params.z, 1.0);\n"
+    "        n = normalize(t * tn.x + b * tn.y + n * tn.z);\n"
+    "    }\n"
+    "    let metallic = clamp(mat.params.x * mr_s.b, 0.0, 1.0);\n"
+    "    let rough = clamp(mat.params.y * mr_s.g, 0.04, 1.0);\n"
+    "    let a = rough * rough;\n"
+    "    let view = normalize(frame.eye.xyz - v.world);\n"
+    "    let l = normalize(-frame.light_dir.xyz);\n"
+    "    let h = normalize(view + l);\n"
+    "    let nl = max(dot(n, l), 0.0);\n"
+    "    let nv = max(dot(n, view), 1e-4);\n"
+    "    let nh = max(dot(n, h), 0.0);\n"
+    "    let vh = max(dot(view, h), 0.0);\n"
+    "    let f0 = mix(vec3(0.04), base.rgb, metallic);\n"
+    "    let f = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);\n"
+    "    let a2 = a * a;\n"
+    "    let dn = nh * nh * (a2 - 1.0) + 1.0;\n"
+    "    let d = a2 / (PI * dn * dn);\n"
+    "    let gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);\n"
+    "    let gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);\n"
+    "    let vis = 0.5 / max(gv + gl, 1e-5);\n"
+    "    let spec = f * d * vis;\n"
+    "    let diffuse = (1.0 - f) * (1.0 - metallic) * base.rgb / PI;\n"
+    "    let radiance = frame.light_color.rgb * frame.light_dir.w;\n"
+    "    var color = (diffuse + spec) * radiance * nl;\n"
+    "    let sky = mix(frame.ambient.rgb / 3.0, frame.ambient.rgb, n.y * 0.5 + 0.5);\n"
+    "    let fa = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);\n"
+    "    let occ = 1.0 + mat.params.w * (occ_s - 1.0);\n"
+    "    color = color + (base.rgb * (1.0 - metallic) * (1.0 - fa) + fa * 0.5) * sky * occ;\n"
+    "    color = color + em_s * mat.emissive.rgb;\n"
+    "    color = color / (1.0 + max(max(color.r, color.g), color.b) * 0.0) ;\n"
+    "    color = clamp(color, vec3(0.0), vec3(1.0));\n"
+    "    let outc = select(color, to_srgb(color), frame.ambient.w > 0.5);\n"
+    "    return vec4(outc, select(1.0, base.a, mat.misc.x > 1.5));\n"
+    "}\n";
+
+bool _gpu_is_srgb(WGPUTextureFormat f) {
+    return f == WGPUTextureFormat_RGBA8UnormSrgb || f == WGPUTextureFormat_BGRA8UnormSrgb;
+}
+
+GpuSamplerOptions _gpu_gltf_sampler(*GltfSampler s) {
+    GpuSamplerOptions o = GpuSamplerOptions{mipmaps: true, anisotropy: 8};
+    if (s == null) return o;
+    if (s.mag_filter == 9728) o.nearest = true;
+    if (s.min_filter == 9728 || s.min_filter == 9729) o.mipmaps = false;
+    WGPUAddressMode[2] w;
+    int[2] wraps = {s.wrap_s, s.wrap_t};
+    for (i in 0..2) {
+        w[i] = WGPUAddressMode_Repeat;
+        if (wraps[i] == 33071) w[i] = WGPUAddressMode_ClampToEdge;
+        if (wraps[i] == 33648) w[i] = WGPUAddressMode_MirrorRepeat;
+    }
+    o.wrap_u = w[0];
+    o.wrap_v = w[1];
+    return o;
+}
+
+// The model's texture slot for image (decoded on first use), or the fallback
+// slot when the image is missing or does not decode.
+int _gpu_model_texture(*GpuModel self, int image, bool srgb, int fallback) {
+    if (image < 0 || image >= self.data.images.size) return fallback;
+    for (i in 0..self.texture_keys.size) {
+        if (self.texture_keys.data[i].image == image && self.texture_keys.data[i].srgb == srgb) return self.texture_keys.data[i].slot;
+    }
+    GltfImage* img = &self.data.images.data[image];
+    if (img.data == null || img.len == 0) return fallback;
+    Result<Image, string> dec = image_decode(img.data, img.len);
+    if (!dec.ok) return fallback;
+    Image pic = dec.value;
+    GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: true};
+    Result<GpuTexture, string> t = Gpu_image_with(&self.gpu, pic.width, pic.height, pic.rgba, &o);
+    Image_free(&pic);
+    if (!t.ok) return fallback;
+    List_push(&self.textures, t.value);
+    int slot = self.textures.size - 1;
+    List_push(&self.texture_keys, _GpuTexKey{image, srgb, slot});
+    return slot;
+}
+
+// Interleaves a primitive's attributes (missing ones get defaults; missing
+// normals are averaged from the faces around each vertex).
+*float _gpu_model_vertices(*GltfPrimitive p) {
+    uint32 n = p.vertex_count;
+    *float v = alloc<float>((int64)n * _GM_VERTEX_FLOATS + 1);
+    *float normals = p.normals;
+    *float made = null;
+    if (normals == null) {
+        made = alloc<float>((int64)n * 3 + 1);
+        for (t in 0..p.index_count / 3) {
+            uint32 i0 = p.indices[t * 3];
+            uint32 i1 = p.indices[t * 3 + 1];
+            uint32 i2 = p.indices[t * 3 + 2];
+            Vec3 a = Vec3{p.positions[i0 * 3], p.positions[i0 * 3 + 1], p.positions[i0 * 3 + 2]};
+            Vec3 b = Vec3{p.positions[i1 * 3], p.positions[i1 * 3 + 1], p.positions[i1 * 3 + 2]};
+            Vec3 c = Vec3{p.positions[i2 * 3], p.positions[i2 * 3 + 1], p.positions[i2 * 3 + 2]};
+            Vec3 fn_ = (b - a).cross(c - a);
+            uint32[3] ids = {i0, i1, i2};
+            for (k in 0..3) {
+                made[ids[k] * 3] += fn_.x;
+                made[ids[k] * 3 + 1] += fn_.y;
+                made[ids[k] * 3 + 2] += fn_.z;
+            }
+        }
+        for (i in 0..n) {
+            Vec3 m = Vec3{made[i * 3], made[i * 3 + 1], made[i * 3 + 2]}.normalize();
+            made[i * 3] = m.x;
+            made[i * 3 + 1] = m.y;
+            made[i * 3 + 2] = m.z;
+        }
+        normals = made;
+    }
+    for (i in 0..n) {
+        *float o = v + (int64)i * _GM_VERTEX_FLOATS;
+        for (k in 0..3) o[k] = p.positions[i * 3 + k];
+        for (k in 0..3) o[3 + k] = normals[i * 3 + k];
+        if (p.uvs != null) {
+            o[6] = p.uvs[i * 2];
+            o[7] = p.uvs[i * 2 + 1];
+        }
+        if (p.uvs1 != null) {
+            o[8] = p.uvs1[i * 2];
+            o[9] = p.uvs1[i * 2 + 1];
+        }
+        if (p.tangents != null) {
+            for (k in 0..4) o[10 + k] = p.tangents[i * 4 + k];
+        }
+        for (k in 0..4) o[14 + k] = p.colors != null ? p.colors[i * 4 + k] : 1.0;
+        if (p.joints != null && p.weights != null) {
+            for (k in 0..4) {
+                o[18 + k] = (float)p.joints[i * 4 + k];
+                o[22 + k] = p.weights[i * 4 + k];
+            }
+        }
+    }
+    if (made != null) free(made);
+    return v;
+}
+
+Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat format) {
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
+    defer layout.release();
+    layout.add(WGPUVertexFormat_Float32x3, 0);
+    layout.add(WGPUVertexFormat_Float32x3, 12);
+    layout.add(WGPUVertexFormat_Float32x2, 24);
+    layout.add(WGPUVertexFormat_Float32x2, 32);
+    layout.add(WGPUVertexFormat_Float32x4, 40);
+    layout.add(WGPUVertexFormat_Float32x4, 56);
+    layout.add(WGPUVertexFormat_Float32x4, 72);
+    layout.add(WGPUVertexFormat_Float32x4, 88);
+    for (i in 0..4) {
+        bool blend = i >= 2;
+        bool two_sided = i % 2 == 1;
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_shader, vertex: "vs", fragment: "fs", format: format,
+            layout: &layout, depth: true, depth_read_only: blend, blend: blend,
+            cull: two_sided ? WGPUCullMode_None : WGPUCullMode_Back};
+        GpuPipeline p = Gpu_pipeline(&self.gpu, &d)?;
+        List_push(&self.pipelines, p);
+    }
+    return Ok<int, string>(0);
+}
+
+Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat format) {
+    GpuModel m;
+    m.gpu = *self;
+    m.data = data;
+    m.light = GpuLight{Vec3{-0.4, -1.0, -0.6}, Vec3{1.0, 0.97, 0.92}, 3.0, Vec3{0.35, 0.38, 0.42}};
+    m.transform = mat4_identity();
+    m.encode_srgb = !_gpu_is_srgb(format);
+    Result<int, string> pr = _gpu_model_pipelines(&m, format);
+    if (!pr.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(pr.error);
+    }
+    Result<GpuBuffer, string> fb = Gpu_uniform(self, null, 128);
+    if (!fb.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(fb.error);
+    }
+    m.frame = fb.value;
+
+    uint8[4] white = {255, 255, 255, 255};
+    uint8[4] flat = {128, 128, 255, 255};
+    GpuImageOptions srgb = GpuImageOptions{srgb: true};
+    List_push(&m.textures, Gpu_image_with(self, 1, 1, &white, &srgb).value);
+    List_push(&m.textures, Gpu_image(self, 1, 1, &white).value);
+    List_push(&m.textures, Gpu_image(self, 1, 1, &flat).value);
+    GpuSamplerOptions dso = _gpu_gltf_sampler(null);
+    List_push(&m.samplers, Gpu_sampler_with(self, &dso).value);
+    for (i in 0..data.samplers.size) {
+        GpuSamplerOptions so = _gpu_gltf_sampler(&data.samplers.data[i]);
+        List_push(&m.samplers, Gpu_sampler_with(self, &so).value);
+    }
+
+    int nmat = data.materials.size;
+    for (i in 0..nmat + 1) {
+        GltfMaterial gm;
+        if (i < nmat) gm = data.materials.data[i];
+        else gm = GltfMaterial{base_color: Vec4{1.0, 1.0, 1.0, 1.0}, metallic: 0.0, roughness: 0.8,
+            base_color_texture: GltfTextureRef{-1, 0, 1.0}, metallic_roughness_texture: GltfTextureRef{-1, 0, 1.0},
+            normal_texture: GltfTextureRef{-1, 0, 1.0}, occlusion_texture: GltfTextureRef{-1, 0, 1.0},
+            emissive_texture: GltfTextureRef{-1, 0, 1.0}, alpha_cutoff: 0.5};
+        _GpuMat mat;
+        GltfTextureRef[5] refs = {gm.base_color_texture, gm.metallic_roughness_texture, gm.normal_texture,
+            gm.occlusion_texture, gm.emissive_texture};
+        bool[5] is_srgb = {true, false, false, false, true};
+        int[5] fallback = {0, 1, 2, 1, 0};
+        for (k in 0..5) {
+            mat.tex[k] = fallback[k];
+            mat.samp[k] = 0;
+            int ti = refs[k].texture;
+            if (ti >= 0 && ti < data.textures.size) {
+                GltfTexture* tx = &data.textures.data[ti];
+                mat.tex[k] = _gpu_model_texture(&m, tx.image, is_srgb[k], fallback[k]);
+                if (tx.sampler >= 0) mat.samp[k] = tx.sampler + 1;
+            }
+        }
+        float normal_scale = refs[2].texture >= 0 ? refs[2].scale : 0.0;
+        float occlusion = refs[3].texture >= 0 ? refs[3].scale : 0.0;
+        float[20] u = {gm.base_color.x, gm.base_color.y, gm.base_color.z, gm.base_color.w,
+            gm.emissive.x, gm.emissive.y, gm.emissive.z, gm.alpha_cutoff,
+            gm.metallic, gm.roughness, normal_scale, occlusion,
+            (float)refs[0].texcoord, (float)refs[1].texcoord, (float)refs[2].texcoord, (float)refs[3].texcoord,
+            (float)gm.alpha_mode, gm.unlit ? 1.0 : 0.0, (float)refs[4].texcoord, 0.0};
+        Result<GpuBuffer, string> ub = Gpu_uniform(self, &u, sizeof(u));
+        if (!ub.ok) {
+            GpuModel_release(&m);
+            return Err<GpuModel, string>(ub.error);
+        }
+        mat.uniforms = ub.value;
+        mat.blend = gm.alpha_mode == GLTF_BLEND;
+        mat.pipeline = (mat.blend ? 2 : 0) + (gm.double_sided ? 1 : 0);
+        List_push(&m.materials, mat);
+    }
+
+    for (i in 0..data.meshes.size) {
+        List_push(&m.prim_start, m.prims.size);
+        GltfMesh* mesh = &data.meshes.data[i];
+        for (p in 0..mesh.primitives.size) {
+            GltfPrimitive* gp = &mesh.primitives.data[p];
+            _GpuPrim prim;
+            prim.drawable = gp.mode == GLTF_TRIANGLES && gp.index_count >= 3 && gp.vertex_count > 0;
+            if (prim.drawable) {
+                *float verts = _gpu_model_vertices(gp);
+                Result<GpuBuffer, string> vb = Gpu_vertices(self, verts, (uint64)gp.vertex_count * _GM_VERTEX_FLOATS * 4);
+                free(verts);
+                Result<GpuBuffer, string> ib = Gpu_indices(self, gp.indices, (uint64)gp.index_count);
+                if (!vb.ok || !ib.ok) {
+                    GpuModel_release(&m);
+                    return Err<GpuModel, string>(!vb.ok ? vb.error : ib.error);
+                }
+                prim.vertices = vb.value;
+                prim.indices = ib.value;
+                prim.index_count = gp.index_count;
+            }
+            List_push(&m.prims, prim);
+        }
+    }
+
+    Mat4 ident = mat4_identity();
+    for (i in 0..data.nodes.size) {
+        GltfNode* node = &data.nodes.data[i];
+        if (node.mesh < 0) continue;
+        GltfMesh* mesh = &data.meshes.data[node.mesh];
+        for (p in 0..mesh.primitives.size) {
+            int pi = m.prim_start.data[node.mesh] + p;
+            if (!m.prims.data[pi].drawable) continue;
+            _GpuDraw d;
+            d.node = i;
+            d.mesh = node.mesh;
+            d.prim = pi;
+            int mi = mesh.primitives.data[p].material;
+            d.material = mi >= 0 && mi < nmat ? mi : nmat;
+            d.pipeline = m.materials.data[d.material].pipeline;
+            Result<GpuBuffer, string> ub = Gpu_uniform(self, null, 144);
+            int njoints = 1;
+            d.skinned = node.skin >= 0 && node.skin < data.skins.size && mesh.primitives.data[p].joints != null;
+            if (d.skinned) njoints = data.skins.data[node.skin].joints.size;
+            if (njoints < 1) njoints = 1;
+            Result<GpuBuffer, string> jb = Gpu_buffer(self, (uint64)njoints * 64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+            if (!ub.ok || !jb.ok) {
+                GpuModel_release(&m);
+                return Err<GpuModel, string>(!ub.ok ? ub.error : jb.error);
+            }
+            d.uniforms = ub.value;
+            d.joints = jb.value;
+            if (!d.skinned) d.joints.write(0, &ident, 64);
+            List_push(&m.draws, d);
+        }
+    }
+    m.world = alloc<Mat4>(data.nodes.size + 1);
+    GpuModel_update(&m, ident);
+    return Ok<GpuModel, string>(m);
+}
+
+// Recomputes the node and joint matrices from the Gltf's current pose (after
+// Gltf_animate, or after changing nodes by hand) and places the whole model
+// with transform.
+void GpuModel_update(*GpuModel self, Mat4 transform) {
+    self.transform = transform;
+    Gltf_world(self.data, self.world);
+    *Mat4 jm = null;
+    int jcap = 0;
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        Mat4 model = transform * self.world[d.node];
+        float skinned = 0.0;
+        if (d.skinned) {
+            model = transform;
+            skinned = 1.0;
+            int skin = self.data.nodes.data[d.node].skin;
+            int n = self.data.skins.data[skin].joints.size;
+            if (n > jcap) {
+                if (jm != null) free(jm);
+                jm = alloc<Mat4>(n);
+                jcap = n;
+            }
+            Gltf_joint_matrices(self.data, skin, self.world, jm);
+            d.joints.write(0, jm, (uint64)n * 64);
+        }
+        Mat4 normal = model.inverse().transpose();
+        float[36] u;
+        for (k in 0..16) {
+            u[k] = model.m[k];
+            u[16 + k] = normal.m[k];
+        }
+        u[32] = skinned;
+        d.uniforms.write(0, &u, 144);
+    }
+    if (jm != null) free(jm);
+}
+
+void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
+    _GpuMat* mat = &self.materials.data[d.material];
+    pipe.bind(0, &self.frame);
+    pipe.bind(1, &d.uniforms);
+    pipe.bind(2, &mat.uniforms);
+    pipe.bind(3, &d.joints);
+    for (k in 0..5) {
+        pipe.bind_texture((uint32)(4 + k * 2), &self.textures.data[mat.tex[k]]);
+        pipe.bind_sampler((uint32)(5 + k * 2), &self.samplers.data[mat.samp[k]]);
+    }
+}
+
+// Draws the model into pass (which needs a depth texture) as seen by camera:
+// opaque and masked parts first, then blended parts from back to front.
+void GpuModel_draw(*GpuModel self, *GpuPass pass, *GpuCamera camera) {
+    Mat4 vp = camera.proj * camera.view;
+    Vec3 dir = self.light.direction.normalize();
+    float[32] f;
+    for (k in 0..16) f[k] = vp.m[k];
+    f[16] = camera.eye.x;
+    f[17] = camera.eye.y;
+    f[18] = camera.eye.z;
+    f[19] = 1.0;
+    f[20] = dir.x;
+    f[21] = dir.y;
+    f[22] = dir.z;
+    f[23] = self.light.intensity;
+    f[24] = self.light.color.x;
+    f[25] = self.light.color.y;
+    f[26] = self.light.color.z;
+    f[27] = 1.0;
+    f[28] = self.light.ambient.x;
+    f[29] = self.light.ambient.y;
+    f[30] = self.light.ambient.z;
+    f[31] = self.encode_srgb ? 1.0 : 0.0;
+    self.frame.write(0, &f, sizeof(f));
+    List<int> blended;
+    defer List_free(&blended);
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (self.materials.data[d.material].blend) {
+            Vec3 c = (self.transform * self.world[d.node]).point(Vec3{0.0, 0.0, 0.0});
+            d.depth = (camera.view.point(c)).z;
+            List_push(&blended, i);
+            continue;
+        }
+        GpuPipeline* pipe = &self.pipelines.data[d.pipeline];
+        _gpu_model_bind(self, pipe, d);
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+    for (a in 0..blended.size) {
+        for (b in a + 1..blended.size) {
+            if (self.draws.data[blended.data[b]].depth < self.draws.data[blended.data[a]].depth) {
+                int t = blended.data[a];
+                blended.data[a] = blended.data[b];
+                blended.data[b] = t;
+            }
+        }
+    }
+    for (i in 0..blended.size) {
+        _GpuDraw* d = &self.draws.data[blended.data[i]];
+        GpuPipeline* pipe = &self.pipelines.data[d.pipeline];
+        _gpu_model_bind(self, pipe, d);
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+}
+
+// A camera at eye looking at target, with a perspective of fovy radians.
+GpuCamera gpu_camera(Vec3 eye, Vec3 target, float fovy, float aspect, float near, float far) {
+    return GpuCamera{mat4_look_at(eye, target, Vec3{0.0, 1.0, 0.0}), mat4_perspective(fovy, aspect, near, far), eye};
+}
+
+// A camera that frames the whole model from the front, a little above.
+GpuCamera GpuModel_camera(*GpuModel self, float aspect) {
+    Vec3 lo;
+    Vec3 hi;
+    Gltf_bounds(self.data, &lo, &hi);
+    Vec3 center = self.transform.point((lo + hi) * 0.5);
+    float radius = (hi - lo).length() * 0.5;
+    if (radius <= 0.0) radius = 1.0;
+    Vec3 eye = center + Vec3{0.0, radius * 0.35, radius * 2.4};
+    return gpu_camera(eye, center, 0.8, aspect, radius * 0.05, radius * 20.0);
+}
+
+void GpuModel_release(*GpuModel self) {
+    for (i in 0..self.pipelines.size) self.pipelines.data[i].release();
+    for (i in 0..self.textures.size) self.textures.data[i].release();
+    for (i in 0..self.samplers.size) self.samplers.data[i].release();
+    for (i in 0..self.materials.size) self.materials.data[i].uniforms.release();
+    for (i in 0..self.prims.size) {
+        if (self.prims.data[i].drawable) {
+            self.prims.data[i].vertices.release();
+            self.prims.data[i].indices.release();
+        }
+    }
+    for (i in 0..self.draws.size) {
+        self.draws.data[i].uniforms.release();
+        self.draws.data[i].joints.release();
+    }
+    self.frame.release();
+    List_free(&self.pipelines);
+    List_free(&self.textures);
+    List_free(&self.texture_keys);
+    List_free(&self.samplers);
+    List_free(&self.materials);
+    List_free(&self.prims);
+    List_free(&self.prim_start);
+    List_free(&self.draws);
+    if (self.world != null) free(self.world);
+    self.world = null;
+}
