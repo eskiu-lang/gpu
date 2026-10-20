@@ -216,6 +216,20 @@ g.adam(0.001);       // and the optimizer step
 // each batch: g.set_input(x, images); g.set_labels(labels, digits); g.run()?;
 ```
 
+## Platforms
+
+| Modules | macOS arm64 | Linux x86-64 | Windows x86-64 | iOS, Android | WebAssembly |
+|---|---|---|---|---|---|
+| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/window>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | not yet | not yet |
+| `<gpu/math>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes |
+
+The WebGPU modules go through wgpu-native, so building them for iOS, Android or
+WebAssembly stops with an `#error` that says which modules work there. On phones, an app
+needs to give the package the surface it draws to (a `CAMetalLayer` on iOS, an
+`ANativeWindow` on Android) instead of an SDL window; in a browser, WebGPU is the browser's
+own (through emscripten's `emdawnwebgpu`), which cannot block on the GPU as `wgpuDevicePoll`
+does. Both are planned. The other modules are plain Eskiu and work on every target.
+
 ## Install
 
 The package needs wgpu-native 29, and SDL3 for `<gpu/window>`:
