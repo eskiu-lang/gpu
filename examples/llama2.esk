@@ -3,6 +3,12 @@
 // greedy output (-t 0) matches run.c token for token.
 //
 //     llama2 stories15M.bin -z tokenizer.bin -t 0 -n 256 -i "Once upon a time"
+//     llama2 llama-2-7b.Q4_0.gguf -t 0 -i "The capital of France is"
+//     llama2 TinyLlama-1.1B-Chat-v1.0/ -t 0 -i "The capital of France is"
+//
+// A checkpoint is a llama2.c .bin file, a llama GGUF file (Q4_0 and Q8_0 run
+// quantized, other types are converted to f16), or a Hugging Face model
+// directory (config.json, tokenizer.json and model*.safetensors).
 //
 // It runs on the GPU through <gpu/nn> (--cpu for the plain C-like loop, --f16
 // to keep the weight matrices in f16, half the memory traffic).
@@ -20,6 +26,8 @@ import <libc>;
 import <gpu>;
 import <gpu/nn>;
 import <gpu/gguf>;
+import <gpu/safetensors>;
+import <json>;
 
 struct Config {
     int dim;
@@ -433,6 +441,218 @@ Result<int, string> gpu_forward(GpuModelState* m, Transformer* t, int token, int
     return Ok<int, string>(-1);
 }
 
+// ── Hugging Face directories ─────────────────────────────────────────────────
+
+struct HfModel {
+    List<Safetensors> files;
+    *JsonValue config;
+}
+
+SafeTensor* hf_tensor(HfModel* h, string name) {
+    for (i in 0..h.files.size) {
+        SafeTensor* t = h.files.data[i].tensor(name);
+        if (t != null) return t;
+    }
+    return null;
+}
+
+double hf_num(HfModel* h, string key, double dflt) {
+    *JsonValue v = JsonValue_get(h.config, key);
+    if (v == null || v.kind != JNumber) return dflt;
+    return v.num;
+}
+
+*JsonValue json_file(string path) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return null;
+    *JsonValue v = json_parse((string)d);
+    free(d);
+    return v;
+}
+
+// Opens dir/model.safetensors, or every shard listed in
+// dir/model.safetensors.index.json.
+string hf_open(HfModel* h, string dir) {
+    String path;
+    defer String_free(&path);
+    String_appendf(&path, "%s/config.json", dir);
+    h.config = json_file(path.data);
+    if (h.config == null) return "cannot read config.json";
+    String_clear(&path);
+    String_appendf(&path, "%s/model.safetensors", dir);
+    Result<Safetensors, string> one = safetensors_load(path.data);
+    if (one.ok) {
+        List_push(&h.files, one.value);
+        return null;
+    }
+    String_clear(&path);
+    String_appendf(&path, "%s/model.safetensors.index.json", dir);
+    *JsonValue index = json_file(path.data);
+    if (index == null) return "no model.safetensors or model.safetensors.index.json";
+    defer JsonValue_free(index);
+    *JsonValue map = JsonValue_get(index, "weight_map");
+    if (map == null) return "the safetensors index has no weight_map";
+    List<String> seen;
+    defer List_free(&seen);
+    for (*JsonValue e = map.child; e != null; e = e.next) {
+        if (e.kind != JString) continue;
+        bool known = false;
+        for (k in 0..seen.size) known = known || strcmp(seen.data[k].data, e.str.data) == 0;
+        if (known) continue;
+        String name;
+        String_append(&name, e.str.data);
+        List_push(&seen, name);
+        String_clear(&path);
+        String_appendf(&path, "%s/%s", dir, e.str.data);
+        Result<Safetensors, string> shard = safetensors_load(path.data);
+        if (!shard.ok) return shard.error;
+        List_push(&h.files, shard.value);
+    }
+    return null;
+}
+
+Result<NnTensor, string> hf_upload(*Gpu g, HfModel* h, string name, bool as_f16) {
+    SafeTensor* t = hf_tensor(h, name);
+    if (t == null) return Err<NnTensor, string>("missing tensor");
+    *float tmp = alloc<float>((int64)t.count);
+    defer free(tmp);
+    if (!t.floats(tmp)) return Err<NnTensor, string>("a tensor is not floating point");
+    return upload(g, tmp, t.count, as_f16);
+}
+
+String hf_name_buf;
+
+string hf_layer(int l, string suffix) {
+    String_clear(&hf_name_buf);
+    String_appendf(&hf_name_buf, "model.layers.%d.%s", l, suffix);
+    return hf_name_buf.data;
+}
+
+Result<int, string> gpu_load_hf(GpuModelState* m, Transformer* t, HfModel* h, int max_seq) {
+    *Gpu g = &m.gpu;
+    Config* p = &t.c;
+    p.dim = (int)hf_num(h, "hidden_size", 0.0);
+    p.hidden_dim = (int)hf_num(h, "intermediate_size", 0.0);
+    p.n_layers = (int)hf_num(h, "num_hidden_layers", 0.0);
+    p.n_heads = (int)hf_num(h, "num_attention_heads", 0.0);
+    p.n_kv_heads = (int)hf_num(h, "num_key_value_heads", (double)p.n_heads);
+    p.vocab_size = (int)hf_num(h, "vocab_size", 0.0);
+    p.seq_len = (int)hf_num(h, "max_position_embeddings", 2048.0);
+    if (max_seq > 0 && max_seq < p.seq_len) p.seq_len = max_seq;
+    if (p.seq_len > 4096) p.seq_len = 4096;
+    if (p.dim <= 0 || p.n_heads <= 0 || p.n_layers <= 0 || p.vocab_size <= 0) return Err<int, string>("incomplete config.json");
+    m.prog = g.nn_program()?;
+    m.prog.eps = (float)hf_num(h, "rms_norm_eps", 0.00001);
+    m.prog.rope_base = (float)hf_num(h, "rope_theta", 10000.0);
+    m.prog.rope_neox = true;
+    m.emb = hf_upload(g, h, "model.embed_tokens.weight", false)?;
+    string head = hf_tensor(h, "lm_head.weight") != null ? "lm_head.weight" : "model.embed_tokens.weight";
+    m.wcls = hf_upload(g, h, head, true)?;
+    m.rms_final = hf_upload(g, h, "model.norm.weight", false)?;
+    for (l in 0..p.n_layers) {
+        List_push(&m.wq, hf_upload(g, h, hf_layer(l, "self_attn.q_proj.weight"), true)?);
+        List_push(&m.wk, hf_upload(g, h, hf_layer(l, "self_attn.k_proj.weight"), true)?);
+        List_push(&m.wv, hf_upload(g, h, hf_layer(l, "self_attn.v_proj.weight"), true)?);
+        List_push(&m.wo, hf_upload(g, h, hf_layer(l, "self_attn.o_proj.weight"), true)?);
+        List_push(&m.w1, hf_upload(g, h, hf_layer(l, "mlp.gate_proj.weight"), true)?);
+        List_push(&m.w2, hf_upload(g, h, hf_layer(l, "mlp.down_proj.weight"), true)?);
+        List_push(&m.w3, hf_upload(g, h, hf_layer(l, "mlp.up_proj.weight"), true)?);
+        List_push(&m.rms_att, hf_upload(g, h, hf_layer(l, "input_layernorm.weight"), false)?);
+        List_push(&m.rms_ffn, hf_upload(g, h, hf_layer(l, "post_attention_layernorm.weight"), false)?);
+    }
+    t.s.logits = alloc<float>(p.vocab_size);
+    return Ok<int, string>(0);
+}
+
+void hf_close(HfModel* h) {
+    for (i in 0..h.files.size) h.files.data[i].free();
+    List_free(&h.files);
+    if (h.config != null) JsonValue_free(h.config);
+}
+
+// A SentencePiece-style piece with U+2581 turned into a space.
+*char sp_piece(string src) {
+    String piece;
+    int64 n = strlen(src);
+    int64 k = 0;
+    while (k < n) {
+        if (k + 2 < n && (uint8)src[k] == 0xE2 && (uint8)src[k + 1] == 0x96 && (uint8)src[k + 2] == 0x81) {
+            String_push(&piece, ' ');
+            k += 3;
+        } else {
+            String_push(&piece, src[k]);
+            k++;
+        }
+    }
+    if (piece.data == null) String_append(&piece, "");
+    return piece.data;
+}
+
+// The tokenizer from a Hugging Face tokenizer.json (a BPE model): the merge
+// order becomes the merge score, so the llama2.c encoder merges in the same
+// order.
+string load_tokenizer_hf(Tokenizer* t, string dir, int vocab_size) {
+    String path;
+    defer String_free(&path);
+    String_appendf(&path, "%s/tokenizer.json", dir);
+    *JsonValue root = json_file(path.data);
+    if (root == null) return "cannot read tokenizer.json";
+    defer JsonValue_free(root);
+    *JsonValue model = JsonValue_get(root, "model");
+    *JsonValue vocab = model != null ? JsonValue_get(model, "vocab") : null;
+    if (vocab == null) return "tokenizer.json has no BPE vocabulary";
+    t.vocab_size = vocab_size;
+    t.vocab = alloc<*char>(vocab_size);
+    t.scores = alloc<float>(vocab_size);
+    for (i in 0..256) {
+        t.byte_pieces[i * 2] = (uint8)i;
+        t.byte_pieces[i * 2 + 1] = 0;
+    }
+    for (*JsonValue e = vocab.child; e != null; e = e.next) {
+        int id = (int)e.num;
+        if (id < 0 || id >= vocab_size) continue;
+        t.vocab[id] = sp_piece(e.key.data);
+        t.scores[id] = -1000000.0;
+        int len = (int)strlen((string)t.vocab[id]);
+        if (len > t.max_token_length) t.max_token_length = len;
+    }
+    for (i in 0..vocab_size) {
+        if (t.vocab[i] == null) t.vocab[i] = sp_piece("");
+    }
+    Map_init(&t.lookup, vocab_size * 2);
+    for (i in 0..vocab_size) {
+        int created = 0;
+        *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
+        if (created != 0) *slot = i;
+    }
+    *JsonValue merges = JsonValue_get(model, "merges");
+    int rank = 0;
+    String joined;
+    defer String_free(&joined);
+    if (merges != null) {
+        for (*JsonValue mm = merges.child; mm != null; mm = mm.next) {
+            String_clear(&joined);
+            if (mm.kind == JString) {
+                for (*char c = (*char)mm.str.data; *c != 0; c = c + 1) {
+                    if (*c != ' ') String_push(&joined, *c);
+                }
+            } else if (mm.kind == JArray && mm.child != null && mm.child.next != null) {
+                String_append(&joined, mm.child.str.data);
+                String_append(&joined, mm.child.next.str.data);
+            }
+            if (joined.data != null) {
+                *char piece = sp_piece(joined.data);
+                int id = Map_get_or(&t.lookup, (string)piece, -1);
+                if (id >= 0 && t.scores[id] < -(float)rank) t.scores[id] = -(float)rank;
+                free(piece);
+            }
+            rank++;
+        }
+    }
+    return null;
+}
+
 // ── Tokenizer ────────────────────────────────────────────────────────────────
 
 string load_tokenizer(Tokenizer* t, string path, int vocab_size) {
@@ -752,8 +972,33 @@ int main(int argc, string* argv) {
     GpuModelState gm;
     int n = (int)strlen(checkpoint);
     bool is_gguf = n > 5 && strcmp((string)((*char)checkpoint + n - 5), ".gguf") == 0;
+    String cfg;
+    String_appendf(&cfg, "%s/config.json", checkpoint);
+    FileStat st;
+    bool is_hf = fs_stat(cfg.data, &st) == 0;
+    String_free(&cfg);
     string err = null;
-    if (is_gguf) {
+    if (is_hf) {
+        if (cpu) {
+            printf("error: Hugging Face models run on the GPU only\n");
+            return 1;
+        }
+        HfModel hm;
+        err = hf_open(&hm, checkpoint);
+        if (err == null) {
+            Result<Gpu, string> go = gpu_open();
+            Result<int, string> ok = Ok<int, string>(0);
+            if (!go.ok) ok = Err<int, string>(go.error);
+            else {
+                gm.gpu = go.value;
+                ok = gpu_load_hf(&gm, &t, &hm, steps > 0 ? steps : 0);
+                if (ok.ok) ok = gpu_record(&gm, &t.c);
+            }
+            if (!ok.ok) err = ok.error;
+            else err = load_tokenizer_hf(&tok, checkpoint, t.c.vocab_size);
+        }
+        hf_close(&hm);
+    } else if (is_gguf) {
         if (cpu) {
             printf("error: GGUF models run on the GPU only\n");
             return 1;
