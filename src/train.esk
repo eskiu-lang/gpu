@@ -293,36 +293,43 @@ void _nn_elem(*NnProgram p, int mode, *NnTensor out, *NnTensor a, *NnTensor b, u
 }
 
 // Softmax cross-entropy: mode 0 writes the mean loss to out[0]; mode 1 adds
-// (softmax - onehot) / rows to the logits' gradient g. One thread per row
-// for the gradient, one workgroup reduction for the loss.
+// (softmax - onehot) / rows to the logits' gradient g. Two kernels, so that
+// the loss's workgroup barriers never follow a branch on the thread index
+// (Direct3D's shader compiler rejects that).
 void _nn_xent(*NnProgram p, int mode, *NnTensor out, *NnTensor logits, *NnTensor labels, uint32 rows, uint32 cols) {
-    string body =
+    string head =
         "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
         "@group(0) @binding(3) var<storage, read> x: array<f32>;\n"
         "@group(0) @binding(4) var<storage, read> y: array<f32>;\n"
-        "var<workgroup> part: array<f32, 256>;\n"
         "fn row_stats(r: u32, cols: u32) -> vec2<f32> {\n"
         "    var mx = -3.4e38;\n"
         "    for (var c = 0u; c < cols; c++) { mx = max(mx, x[r * cols + c]); }\n"
         "    var s = 0.0;\n"
         "    for (var c = 0u; c < cols; c++) { s += exp(x[r * cols + c] - mx); }\n"
         "    return vec2<f32>(mx, s);\n"
-        "}\n"
-        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "}\n";
+    String body;
+    defer String_free(&body);
+    String_append(&body, head);
+    if (mode == 1) String_append(&body,
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
         "    let rows = prm.p1;\n"
         "    let cols = prm.p2;\n"
-        "    if (prm.p0 == 1u) {\n"
-        "        let r = gid.x;\n"
-        "        if (r >= rows) { return; }\n"
-        "        let st = row_stats(r, cols);\n"
-        "        let label = u32(y[r]);\n"
-        "        for (var c = 0u; c < cols; c++) {\n"
-        "            var g = exp(x[r * cols + c] - st.x) / st.y;\n"
-        "            if (c == label) { g -= 1.0; }\n"
-        "            o[r * cols + c] += g / f32(rows);\n"
-        "        }\n"
-        "        return;\n"
+        "    let r = gid.x;\n"
+        "    if (r >= rows) { return; }\n"
+        "    let st = row_stats(r, cols);\n"
+        "    let label = u32(y[r]);\n"
+        "    for (var c = 0u; c < cols; c++) {\n"
+        "        var g = exp(x[r * cols + c] - st.x) / st.y;\n"
+        "        if (c == label) { g -= 1.0; }\n"
+        "        o[r * cols + c] += g / f32(rows);\n"
         "    }\n"
+        "}\n");
+    else String_append(&body,
+        "var<workgroup> part: array<f32, 256>;\n"
+        "@compute @workgroup_size(256) fn main(@builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "    let rows = prm.p1;\n"
+        "    let cols = prm.p2;\n"
         "    var loss = 0.0;\n"
         "    for (var r = lid.x; r < rows; r += 256u) {\n"
         "        let st = row_stats(r, cols);\n"
@@ -332,36 +339,42 @@ void _nn_xent(*NnProgram p, int mode, *NnTensor out, *NnTensor logits, *NnTensor
         "    workgroupBarrier();\n"
         "    for (var s = 128u; s > 0u; s >>= 1u) { if (lid.x < s) { part[lid.x] += part[lid.x + s]; } workgroupBarrier(); }\n"
         "    if (lid.x == 0u) { o[0] = part[0] / f32(rows); }\n"
-        "}\n";
+        "}\n");
     uint32[3] prm = {(uint32)mode, rows, cols};
     *NnTensor[3] ts = {out, logits, labels};
-    _nn_record(p, "train_xent", _nn_wgsl("", body), &prm[0], 3, &ts[0], 3, mode == 1 ? (rows + 255) / 256 : (uint32)1, 1, 1);
+    _nn_record(p, mode == 1 ? "train_xent_grad" : "train_xent_loss", _nn_wgsl("", body.data), &prm[0], 3, &ts[0], 3,
+        mode == 1 ? (rows + 255) / 256 : (uint32)1, 1, 1);
 }
 
 // Mean squared error: mode 0 the loss into out[0]; mode 1 adds
-// 2 (a - t) / n to a's gradient.
+// 2 (a - t) / n to a's gradient (two kernels, as for the cross-entropy).
 void _nn_mse(*NnProgram p, int mode, *NnTensor out, *NnTensor a, *NnTensor t, uint32 n) {
-    string body =
+    String body;
+    defer String_free(&body);
+    String_append(&body,
         "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
         "@group(0) @binding(3) var<storage, read> a: array<f32>;\n"
-        "@group(0) @binding(4) var<storage, read> t: array<f32>;\n"
-        "var<workgroup> part: array<f32, 256>;\n"
-        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "@group(0) @binding(4) var<storage, read> t: array<f32>;\n");
+    if (mode == 1) String_append(&body,
+        "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) gid: vec3<u32>) {\n"
         "    let n = prm.p1;\n"
-        "    if (prm.p0 == 1u) {\n"
-        "        if (gid.x < n) { o[gid.x] += 2.0 * (a[gid.x] - t[gid.x]) / f32(n); }\n"
-        "        return;\n"
-        "    }\n"
+        "    if (gid.x < n) { o[gid.x] += 2.0 * (a[gid.x] - t[gid.x]) / f32(n); }\n"
+        "}\n");
+    else String_append(&body,
+        "var<workgroup> part: array<f32, 256>;\n"
+        "@compute @workgroup_size(256) fn main(@builtin(local_invocation_id) lid: vec3<u32>) {\n"
+        "    let n = prm.p1;\n"
         "    var s = 0.0;\n"
         "    for (var i = lid.x; i < n; i += 256u) { let d = a[i] - t[i]; s += d * d; }\n"
         "    part[lid.x] = s;\n"
         "    workgroupBarrier();\n"
         "    for (var k = 128u; k > 0u; k >>= 1u) { if (lid.x < k) { part[lid.x] += part[lid.x + k]; } workgroupBarrier(); }\n"
         "    if (lid.x == 0u) { o[0] = part[0] / f32(n); }\n"
-        "}\n";
+        "}\n");
     uint32[2] prm = {(uint32)mode, n};
     *NnTensor[3] ts = {out, a, t};
-    _nn_record(p, "train_mse", _nn_wgsl("", body), &prm[0], 2, &ts[0], 3, mode == 1 ? (n + 255) / 256 : (uint32)1, 1, 1);
+    _nn_record(p, mode == 1 ? "train_mse_grad" : "train_mse_loss", _nn_wgsl("", body.data), &prm[0], 2, &ts[0], 3,
+        mode == 1 ? (n + 255) / 256 : (uint32)1, 1, 1);
 }
 
 // Adam (or SGD when beta1 and beta2 are 0): p -= lr * mhat / (sqrt(vhat) + eps),
