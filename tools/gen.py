@@ -42,6 +42,7 @@ class Gen:
         self.funcs = []
         self.known = set()
         self.anon = {}
+        self.defines = []
 
     def ctype(self, t):
         t = t.replace("WGPU_NULLABLE", "").replace("struct ", "").strip()
@@ -79,6 +80,11 @@ class Gen:
                 k, _, v = item.partition("=")
                 members.append((k.strip(), v.strip()))
             self.enums.append((m.group(1), members))
+        for m in re.finditer(r"#define (WGPU_[A-Z0-9_]+) \((\w+)(?:\((\d+)\))?\)", s):
+            v = {"UINT32_MAX": ("uint32", "0xFFFFFFFF"), "UINT64_MAX": ("uint64", "0xFFFFFFFFFFFFFFFF"),
+                 "SIZE_MAX": ("uint64", "0xFFFFFFFFFFFFFFFF"), "UINT32_C": ("uint32", m.group(3))}.get(m.group(2))
+            if v:
+                self.defines.append((v[0], m.group(1), v[1]))
         for m in re.finditer(r"static const (\w+) (\w+) = ([^;]+);", s):
             self.consts.append((m.group(1), m.group(2), " ".join(m.group(3).split())))
         for m in re.finditer(r"typedef [\w\s\*]+?\(\*(\w+)\)\s*\(", s):
@@ -131,6 +137,8 @@ class Gen:
             out.append(",\n".join("    %s%s" % (k, " = " + v if v else "") for k, v in members))
             out.append("}")
             out.append("")
+        for t, name, v in self.defines:
+            out.append("const %s %s = %s;" % (t, name, v))
         for t, name, v in self.consts:
             out.append("const %s %s = %s;" % (self.aliases.get(t, t), name, v))
         out.append("")
