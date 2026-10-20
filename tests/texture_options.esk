@@ -1,0 +1,107 @@
+// sRGB decoding, sRGB-correct mipmaps and sampler wrapping, read back from a
+// 1x1 target.
+import <io>;
+import <mem>;
+import <gpu>;
+
+string shader =
+    "@group(0) @binding(0) var tex: texture_2d<f32>;\n"
+    "@group(0) @binding(1) var samp: sampler;\n"
+    "@group(0) @binding(2) var<uniform> at: vec4<f32>;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    var p = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));\n"
+    "    return vec4(p[i], 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return textureSampleLevel(tex, samp, at.xy, at.z); }\n";
+
+int fails = 0;
+
+Result<int, string> sample(*Gpu gpu, *GpuTexture tex, *GpuSampler samp, float u, float v, float level, *uint8 out) {
+    GpuTexture target = gpu.target(1, 1)?;
+    defer target.release();
+    float[4] at = {u, v, level, 0.0};
+    GpuBuffer ub = gpu.uniform(&at, sizeof(at))?;
+    defer ub.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: target.format};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    pipe.bind_texture(0, tex);
+    pipe.bind_sampler(1, samp);
+    pipe.bind(2, &ub);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    target.read(out)?;
+    return Ok<int, string>(0);
+}
+
+void expect(string what, uint8 got, int want) {
+    int d = (int)got - want;
+    if (d < -2 || d > 2) {
+        printf("FAIL %s: %d, want %d\n", what, (int)got, want);
+        fails++;
+    }
+}
+
+Result<int, string> run() {
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    uint8[4] px;
+
+    uint8[16] gray = {188, 188, 188, 255, 188, 188, 188, 255, 188, 188, 188, 255, 188, 188, 188, 255};
+    GpuImageOptions srgb = GpuImageOptions{srgb: true};
+    GpuTexture g = gpu.image_with(2, 2, &gray, &srgb)?;
+    defer g.release();
+    GpuSamplerOptions so = GpuSamplerOptions{nearest: true};
+    GpuSampler nearest = gpu.sampler_with(&so)?;
+    defer nearest.release();
+    sample(&gpu, &g, &nearest, 0.5, 0.5, 0.0, &px[0])?;
+    expect("srgb 188 reads as linear 0.5", px[0], 128);
+
+    *uint8 checker = alloc<uint8>(64 * 64 * 4);
+    defer free(checker);
+    for (y in 0..64) {
+        for (x in 0..64) {
+            uint8 c = (x + y) % 2 == 0 ? (uint8)255 : (uint8)0;
+            int i = (y * 64 + x) * 4;
+            checker[i] = c;
+            checker[i + 1] = c;
+            checker[i + 2] = c;
+            checker[i + 3] = 255;
+        }
+    }
+    GpuImageOptions sm = GpuImageOptions{srgb: true, mipmaps: true};
+    GpuTexture ct = gpu.image_with(64, 64, checker, &sm)?;
+    defer ct.release();
+    if (ct.mips != 7) {
+        printf("FAIL mips: %d, want 7\n", (int)ct.mips);
+        fails++;
+    }
+    GpuSamplerOptions mo = GpuSamplerOptions{mipmaps: true};
+    GpuSampler mip = gpu.sampler_with(&mo)?;
+    defer mip.release();
+    sample(&gpu, &ct, &mip, 0.5, 0.5, 6.0, &px[0])?;
+    expect("1x1 mip of a black and white checker is linear 0.5", px[0], 128);
+
+    uint8[16] ramp = {255, 0, 0, 255, 0, 0, 255, 255, 255, 0, 0, 255, 0, 0, 255, 255};
+    GpuTexture rt = gpu.image(2, 2, &ramp)?;
+    defer rt.release();
+    sample(&gpu, &rt, &nearest, 1.25, 0.25, 0.0, &px[0])?;
+    expect("repeat wraps to the red column", px[0], 255);
+    GpuSamplerOptions co = GpuSamplerOptions{nearest: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    GpuSampler clamp = gpu.sampler_with(&co)?;
+    defer clamp.release();
+    sample(&gpu, &rt, &clamp, 1.25, 0.25, 0.0, &px[0])?;
+    expect("clamp stays on the blue column", px[2], 255);
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("texture options: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}

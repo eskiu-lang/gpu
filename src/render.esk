@@ -19,6 +19,7 @@ import <list>;
 import <result>;
 import <gpu/raw>;
 import <gpu/core>;
+import <libc>;
 
 type GpuColor = WGPUColor;
 
@@ -29,6 +30,26 @@ struct GpuTexture {
     WGPUTextureFormat format;
     uint32 width;
     uint32 height;
+    uint32 mips;
+}
+
+// How Gpu_image_with stores the pixels: srgb for color data (photos, base
+// color and emissive maps; the GPU converts to linear when sampling), mipmaps
+// to add the smaller levels that keep a texture smooth at a distance.
+struct GpuImageOptions {
+    bool srgb;
+    bool mipmaps;
+}
+
+// A sampler's settings. The zero value is linear filtering that repeats the
+// texture. wrap_u and wrap_v take WGPUAddressMode values (Repeat,
+// MirrorRepeat, ClampToEdge); anisotropy above 1 needs linear filtering.
+struct GpuSamplerOptions {
+    bool nearest;
+    bool mipmaps;
+    WGPUAddressMode wrap_u;
+    WGPUAddressMode wrap_v;
+    uint16 anisotropy;
 }
 
 struct GpuSampler {
@@ -49,6 +70,7 @@ struct GpuPipelineDesc {
     WGPUTextureFormat format;
     *GpuVertexLayout layout;
     bool depth;
+    bool depth_read_only;
     bool blend;
     WGPUPrimitiveTopology topology;
     WGPUCullMode cull;
@@ -103,14 +125,18 @@ Result<GpuBuffer, string> Gpu_uniform(*Gpu self, *void data, uint64 bytes) {
 }
 
 Result<GpuTexture, string> Gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage) {
+    return _gpu_texture(self, width, height, format, usage, 1);
+}
+
+Result<GpuTexture, string> _gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage, uint32 mips) {
     _gpu_push(self);
     WGPUTextureDescriptor d = WGPUTextureDescriptor{usage: usage, dimension: WGPUTextureDimension_2D,
-        size: WGPUExtent3D{width, height, 1}, format: format, mipLevelCount: 1, sampleCount: 1};
+        size: WGPUExtent3D{width, height, 1}, format: format, mipLevelCount: mips, sampleCount: 1};
     WGPUTexture t = wgpuDeviceCreateTexture(self.device, &d);
     WGPUTextureView v = null;
     if (t != null) v = wgpuTextureCreateView(t, null);
     string err = _gpu_pop(self, "texture");
-    GpuTexture tex = GpuTexture{*self, t, v, format, width, height};
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, mips};
     if (err != null || t == null) {
         GpuTexture_release(&tex);
         return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture", null));
@@ -127,10 +153,94 @@ Result<GpuTexture, string> Gpu_target(*Gpu self, uint32 width, uint32 height) {
 // An RGBA8 texture for shaders to sample, filled from width * height pixels
 // of 4 bytes each.
 Result<GpuTexture, string> Gpu_image(*Gpu self, uint32 width, uint32 height, *void rgba) {
-    GpuTexture t = Gpu_texture(self, width, height, WGPUTextureFormat_RGBA8Unorm,
-        WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    return Gpu_image_with(self, width, height, rgba, null);
+}
+
+// Gpu_image with options (null for the defaults: linear, no mipmaps).
+Result<GpuTexture, string> Gpu_image_with(*Gpu self, uint32 width, uint32 height, *void rgba, *GpuImageOptions opts) {
+    bool srgb = opts != null && opts.srgb;
+    bool mipmaps = opts != null && opts.mipmaps;
+    uint32 mips = 1;
+    if (mipmaps) {
+        uint32 m = width > height ? width : height;
+        while (m > 1) {
+            m = m / 2;
+            mips++;
+        }
+    }
+    WGPUTextureFormat format = srgb ? WGPUTextureFormat_RGBA8UnormSrgb : WGPUTextureFormat_RGBA8Unorm;
+    GpuTexture t = _gpu_texture(self, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst, mips)?;
     GpuTexture_write(&t, rgba);
+    if (mips > 1) _gpu_write_mips(&t, (*uint8)rgba, srgb);
     return Ok<GpuTexture, string>(t);
+}
+
+float[256] _gpu_srgb_lin;
+uint8[4096] _gpu_lin_srgb;
+bool _gpu_srgb_ready = false;
+
+void _gpu_srgb_tables() {
+    if (_gpu_srgb_ready) return;
+    for (i in 0..256) {
+        double c = (double)i / 255.0;
+        _gpu_srgb_lin[i] = (float)(c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4));
+    }
+    for (i in 0..4096) {
+        double l = (double)i / 4095.0;
+        double c = l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+        _gpu_lin_srgb[i] = (uint8)(c * 255.0 + 0.5);
+    }
+    _gpu_srgb_ready = true;
+}
+
+// Halves an RGBA8 image with a 2x2 box filter; with srgb, the color channels
+// are averaged in linear light.
+void _gpu_halve(*uint8 src, uint32 w, uint32 h, *uint8 dst, uint32 dw, uint32 dh, bool srgb) {
+    for (y in 0..dh) {
+        uint32 y0 = y * 2 < h ? y * 2 : h - 1;
+        uint32 y1 = y * 2 + 1 < h ? y * 2 + 1 : h - 1;
+        for (x in 0..dw) {
+            uint32 x0 = x * 2 < w ? x * 2 : w - 1;
+            uint32 x1 = x * 2 + 1 < w ? x * 2 + 1 : w - 1;
+            *uint8 a = src + ((uint64)y0 * w + x0) * 4;
+            *uint8 b = src + ((uint64)y0 * w + x1) * 4;
+            *uint8 c = src + ((uint64)y1 * w + x0) * 4;
+            *uint8 d = src + ((uint64)y1 * w + x1) * 4;
+            *uint8 o = dst + ((uint64)y * dw + x) * 4;
+            for (k in 0..4) {
+                if (srgb && k < 3) {
+                    float l = (_gpu_srgb_lin[(int)a[k]] + _gpu_srgb_lin[(int)b[k]] + _gpu_srgb_lin[(int)c[k]] + _gpu_srgb_lin[(int)d[k]]) * 0.25;
+                    o[k] = _gpu_lin_srgb[(int)(l * 4095.0 + 0.5)];
+                } else {
+                    o[k] = (uint8)(((uint32)a[k] + b[k] + c[k] + d[k] + 2) / 4);
+                }
+            }
+        }
+    }
+}
+
+void _gpu_write_mips(*GpuTexture t, *uint8 rgba, bool srgb) {
+    if (srgb) _gpu_srgb_tables();
+    uint32 w = t.width;
+    uint32 h = t.height;
+    *uint8 prev = rgba;
+    *uint8 owned = null;
+    for (level in 1..t.mips) {
+        uint32 dw = w > 1 ? w / 2 : 1;
+        uint32 dh = h > 1 ? h / 2 : 1;
+        *uint8 next = alloc<uint8>((int)(dw * dh * 4));
+        _gpu_halve(prev, w, h, next, dw, dh, srgb);
+        WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: t.handle, mipLevel: level, aspect: WGPUTextureAspect_All};
+        WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, dw * 4, dh};
+        WGPUExtent3D size = WGPUExtent3D{dw, dh, 1};
+        wgpuQueueWriteTexture(t.gpu.queue, &dst, next, (uint64)dw * dh * 4, &layout, &size);
+        if (owned != null) free(owned);
+        owned = next;
+        prev = next;
+        w = dw;
+        h = dh;
+    }
+    if (owned != null) free(owned);
 }
 
 Result<GpuTexture, string> Gpu_depth(*Gpu self, uint32 width, uint32 height) {
@@ -182,13 +292,22 @@ void GpuTexture_release(*GpuTexture self) {
 }
 
 // A sampler that repeats the texture; linear filtering when linear is true,
-// nearest otherwise.
+// nearest otherwise. Gpu_sampler_with takes the other settings.
 Result<GpuSampler, string> Gpu_sampler(*Gpu self, bool linear) {
-    WGPUFilterMode f = linear ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+    GpuSamplerOptions o = GpuSamplerOptions{nearest: !linear};
+    return Gpu_sampler_with(self, &o);
+}
+
+Result<GpuSampler, string> Gpu_sampler_with(*Gpu self, *GpuSamplerOptions o) {
+    WGPUFilterMode f = o.nearest ? WGPUFilterMode_Nearest : WGPUFilterMode_Linear;
+    WGPUAddressMode u = o.wrap_u != 0 ? o.wrap_u : WGPUAddressMode_Repeat;
+    WGPUAddressMode v = o.wrap_v != 0 ? o.wrap_v : WGPUAddressMode_Repeat;
+    uint16 aniso = o.anisotropy > 1 && !o.nearest && o.mipmaps ? o.anisotropy : (uint16)1;
     _gpu_push(self);
-    WGPUSamplerDescriptor d = WGPUSamplerDescriptor{addressModeU: WGPUAddressMode_Repeat, addressModeV: WGPUAddressMode_Repeat,
-        addressModeW: WGPUAddressMode_Repeat, magFilter: f, minFilter: f, mipmapFilter: WGPUMipmapFilterMode_Nearest,
-        lodMinClamp: 0.0, lodMaxClamp: 32.0, maxAnisotropy: 1};
+    WGPUSamplerDescriptor d = WGPUSamplerDescriptor{addressModeU: u, addressModeV: v,
+        addressModeW: WGPUAddressMode_Repeat, magFilter: f, minFilter: f,
+        mipmapFilter: o.mipmaps && !o.nearest ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest,
+        lodMinClamp: 0.0, lodMaxClamp: 32.0, maxAnisotropy: aniso};
     WGPUSampler s = wgpuDeviceCreateSampler(self.device, &d);
     string err = _gpu_pop(self, "sampler");
     if (err != null) return Err<GpuSampler, string>(err);
@@ -231,7 +350,8 @@ Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
     WGPUColorTargetState target = WGPUColorTargetState{format: d.format, writeMask: WGPUColorWriteMask_All};
     if (d.blend) target.blend = &blend;
     WGPUFragmentState frag = WGPUFragmentState{module: p.module, entryPoint: gpu_str(d.fragment), targetCount: 1, targets: &target};
-    WGPUDepthStencilState ds = WGPUDepthStencilState{format: WGPUTextureFormat_Depth24Plus, depthWriteEnabled: WGPUOptionalBool_True,
+    WGPUDepthStencilState ds = WGPUDepthStencilState{format: WGPUTextureFormat_Depth24Plus,
+        depthWriteEnabled: d.depth_read_only ? WGPUOptionalBool_False : WGPUOptionalBool_True,
         depthCompare: WGPUCompareFunction_Less,
         stencilFront: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
         stencilBack: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
