@@ -25,11 +25,20 @@ import <result>;
 import <gpu/raw>;
 import <gpu/core>;
 
+// kind is NN_F32, NN_F16, NN_Q8_0 or NN_Q4_0. A quantized tensor keeps one
+// f32 scale per block of 32 values in scales and the packed values in buf.
 struct NnTensor {
     GpuBuffer buf;
     uint64 count;
     bool f16;
+    int kind;
+    GpuBuffer scales;
 }
+
+const int NN_F32 = 0;
+const int NN_F16 = 1;
+const int NN_Q8_0 = 2;
+const int NN_Q4_0 = 3;
 
 struct _NnOp {
     WGPUComputePipeline pipeline;
@@ -53,11 +62,13 @@ struct NnProgram {
     List<GpuBuffer> params;
     GpuBuffer step;
     uint32[4] step_values;
+    float eps;
+    float rope_base;
 }
 
 Result<NnTensor, string> Gpu_nn_tensor(*Gpu self, uint64 count) {
     GpuBuffer b = Gpu_buffer(self, count * 4 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst)?;
-    return Ok<NnTensor, string>(NnTensor{b, count, false});
+    return Ok<NnTensor, string>(NnTensor{buf: b, count: count, kind: NN_F32});
 }
 
 // A tensor filled from count floats at data.
@@ -129,7 +140,63 @@ Result<NnTensor, string> Gpu_nn_upload_f16(*Gpu self, *float data, uint64 count)
         GpuBuffer_write(&b, at * 2, tmp, bytes);
         at = at + n;
     }
-    return Ok<NnTensor, string>(NnTensor{b, count, true});
+    return Ok<NnTensor, string>(NnTensor{buf: b, count: count, f16: true, kind: NN_F16});
+}
+
+float _nn_half(*uint8 p) {
+    return _nn_half_to_float((uint16)((uint32)p[0] | (uint32)p[1] << 8));
+}
+
+// A tensor of count values from GGML Q8_0 blocks at raw (34 bytes per 32
+// values: an f16 scale and 32 int8), repacked into word-aligned arrays.
+Result<NnTensor, string> Gpu_nn_upload_q8_0(*Gpu self, *uint8 raw, uint64 count) {
+    uint64 nb = count / 32;
+    GpuBuffer qs = Gpu_buffer(self, nb * 32 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    GpuBuffer sc = Gpu_buffer(self, nb * 4 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    uint64 chunk = 65536;
+    *uint8 q = alloc<uint8>((int64)(chunk * 32));
+    *float d = alloc<float>((int64)chunk);
+    defer free(q);
+    defer free(d);
+    uint64 at = 0;
+    while (at < nb) {
+        uint64 n = nb - at < chunk ? nb - at : chunk;
+        for (b in 0..n) {
+            *uint8 blk = raw + (at + b) * 34;
+            d[b] = _nn_half(blk);
+            memcpy(q + b * 32, blk + 2, 32);
+        }
+        GpuBuffer_write(&qs, at * 32, q, n * 32);
+        GpuBuffer_write(&sc, at * 4, d, n * 4);
+        at = at + n;
+    }
+    return Ok<NnTensor, string>(NnTensor{buf: qs, count: count, kind: NN_Q8_0, scales: sc});
+}
+
+// A tensor of count values from GGML Q4_0 blocks at raw (18 bytes per 32
+// values: an f16 scale and 16 bytes of 4-bit values offset by 8).
+Result<NnTensor, string> Gpu_nn_upload_q4_0(*Gpu self, *uint8 raw, uint64 count) {
+    uint64 nb = count / 32;
+    GpuBuffer qs = Gpu_buffer(self, nb * 16 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    GpuBuffer sc = Gpu_buffer(self, nb * 4 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    uint64 chunk = 65536;
+    *uint8 q = alloc<uint8>((int64)(chunk * 16));
+    *float d = alloc<float>((int64)chunk);
+    defer free(q);
+    defer free(d);
+    uint64 at = 0;
+    while (at < nb) {
+        uint64 n = nb - at < chunk ? nb - at : chunk;
+        for (b in 0..n) {
+            *uint8 blk = raw + (at + b) * 18;
+            d[b] = _nn_half(blk);
+            memcpy(q + b * 16, blk + 2, 16);
+        }
+        GpuBuffer_write(&qs, at * 16, q, n * 16);
+        GpuBuffer_write(&sc, at * 4, d, n * 4);
+        at = at + n;
+    }
+    return Ok<NnTensor, string>(NnTensor{buf: qs, count: count, kind: NN_Q4_0, scales: sc});
 }
 
 // Copies the tensor's first count values to out.
@@ -139,12 +206,15 @@ Result<int, string> NnTensor_read(*NnTensor self, *float out, uint64 count) {
 
 void NnTensor_release(*NnTensor self) {
     GpuBuffer_release(&self.buf);
+    if (self.kind == NN_Q8_0 || self.kind == NN_Q4_0) GpuBuffer_release(&self.scales);
 }
 
 Result<NnProgram, string> Gpu_nn_program(*Gpu self) {
     NnProgram p;
     p.gpu = *self;
     p.step = Gpu_buffer(self, 16, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)?;
+    p.eps = 0.00001;
+    p.rope_base = 10000.0;
     return Ok<NnProgram, string>(p);
 }
 
@@ -275,7 +345,14 @@ void NnProgram_embed(*NnProgram self, *NnTensor out, *NnTensor table, uint32 n) 
     _nn_record(self, "embed", _nn_wgsl("", body), &p[0], 1, &ts[0], 2, (n + 255) / 256, 1, 1);
 }
 
-// out = weight * x / sqrt(mean(x^2) + 1e-5), over n values (out may be x).
+uint32 _nn_bits(float f) {
+    uint32 u = 0;
+    memcpy(&u, &f, 4);
+    return u;
+}
+
+// out = weight * x / sqrt(mean(x^2) + eps), over n values (out may be x);
+// eps is the program's (1e-5 unless changed).
 void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor weight, uint32 n) {
     string body =
         "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
@@ -289,10 +366,10 @@ void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor we
         "    part[lid.x] = ss;\n"
         "    workgroupBarrier();\n"
         "    for (var s = 128u; s > 0u; s >>= 1u) { if (lid.x < s) { part[lid.x] += part[lid.x + s]; } workgroupBarrier(); }\n"
-        "    let scale = 1.0 / sqrt(part[0] / f32(n) + 1e-5);\n"
+        "    let scale = 1.0 / sqrt(part[0] / f32(n) + bitcast<f32>(prm.p1));\n"
         "    for (var i = lid.x; i < n; i += 256u) { o[i] = w[i] * (scale * x[i]); }\n"
         "}\n";
-    uint32[1] p = {n};
+    uint32[2] p = {n, _nn_bits(self.eps)};
     *NnTensor[3] ts = {out, x, weight};
     if (out == x) {
         string body2 =
@@ -306,14 +383,14 @@ void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor we
             "    part[lid.x] = ss;\n"
             "    workgroupBarrier();\n"
             "    for (var s = 128u; s > 0u; s >>= 1u) { if (lid.x < s) { part[lid.x] += part[lid.x + s]; } workgroupBarrier(); }\n"
-            "    let scale = 1.0 / sqrt(part[0] / f32(n) + 1e-5);\n"
+            "    let scale = 1.0 / sqrt(part[0] / f32(n) + bitcast<f32>(prm.p1));\n"
             "    for (var i = lid.x; i < n; i += 256u) { x[i] = w[i] * (scale * x[i]); }\n"
             "}\n";
         *NnTensor[2] ts2 = {x, weight};
-        _nn_record(self, "rmsnorm_inplace", _nn_wgsl("", body2), &p[0], 1, &ts2[0], 2, 1, 1, 1);
+        _nn_record(self, "rmsnorm_inplace", _nn_wgsl("", body2), &p[0], 2, &ts2[0], 2, 1, 1, 1);
         return;
     }
-    _nn_record(self, "rmsnorm", _nn_wgsl("", body), &p[0], 1, &ts[0], 3, 1, 1, 1);
+    _nn_record(self, "rmsnorm", _nn_wgsl("", body), &p[0], 2, &ts[0], 3, 1, 1, 1);
 }
 
 // out[out_offset + step.b * out_pos_stride + r] = sum_c w[w_offset + r * cols + c] * x[c]
@@ -322,6 +399,10 @@ void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor we
 void NnProgram_matvec_at(*NnProgram self, *NnTensor out, uint32 out_offset, uint32 out_pos_stride, *NnTensor w, uint64 w_offset,
     *NnTensor x, uint32 rows, uint32 cols) {
     bool sg = self.gpu.subgroups;
+    if (w.kind == NN_Q8_0 || w.kind == NN_Q4_0) {
+        _nn_matvec_quant(self, out, out_offset, out_pos_stride, w, w_offset, x, rows, cols);
+        return;
+    }
     String body;
     defer String_free(&body);
     String_append(&body, "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n");
@@ -360,6 +441,76 @@ void NnProgram_matvec_at(*NnProgram self, *NnTensor out, uint32 out_offset, uint
     _nn_record(self, key, _nn_wgsl(w.f16 ? "enable f16;\n" : "", body.data), &p[0], 5, &ts[0], 3, gx, gy, 1);
 }
 
+// The quantized matvec: one 32-lane slice per row, each lane taking whole
+// blocks of 32 values (w_offset counts values and must be a multiple of 32).
+void _nn_matvec_quant(*NnProgram self, *NnTensor out, uint32 out_offset, uint32 out_pos_stride, *NnTensor w, uint64 w_offset,
+    *NnTensor x, uint32 rows, uint32 cols) {
+    bool sg = self.gpu.subgroups;
+    bool q8 = w.kind == NN_Q8_0;
+    String body;
+    defer String_free(&body);
+    String_append(&body,
+        "@group(0) @binding(2) var<storage, read_write> o: array<f32>;\n"
+        "@group(0) @binding(3) var<storage, read> sc: array<f32>;\n"
+        "@group(0) @binding(4) var<storage, read> qs: array<u32>;\n"
+        "@group(0) @binding(5) var<storage, read> x: array<vec4<f32>>;\n");
+    if (!sg) String_append(&body, "var<workgroup> part: array<f32, 256>;\n");
+    String_append(&body,
+        "fn i8x4(w: u32) -> vec4<f32> {\n"
+        "    return vec4<f32>(f32(i32(w << 24u) >> 24u), f32(i32(w << 16u) >> 24u), f32(i32(w << 8u) >> 24u), f32(i32(w) >> 24u));\n"
+        "}\n"
+        "fn lo4(w: u32) -> vec4<f32> {\n"
+        "    return vec4<f32>(f32(w & 15u), f32((w >> 8u) & 15u), f32((w >> 16u) & 15u), f32((w >> 24u) & 15u)) - 8.0;\n"
+        "}\n"
+        "fn hi4(w: u32) -> vec4<f32> {\n"
+        "    return vec4<f32>(f32((w >> 4u) & 15u), f32((w >> 12u) & 15u), f32((w >> 20u) & 15u), f32((w >> 28u) & 15u)) - 8.0;\n"
+        "}\n"
+        "@compute @workgroup_size(256) fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>,\n"
+        "    @builtin(num_workgroups) nw: vec3<u32>) {\n"
+        "    let row = (wid.y * nw.x + wid.x) * 8u + lid.x / 32u;\n"
+        "    let lane = lid.x % 32u;\n"
+        "    let rows = prm.p0;\n"
+        "    let nb = prm.p1 / 32u;\n"
+        "    var acc = 0.0;\n"
+        "    if (row < rows) {\n"
+        "        let first = prm.p4 / 32u + row * nb;\n"
+        "        for (var b = lane; b < nb; b += 32u) {\n"
+        "            let blk = first + b;\n"
+        "            let xb = b * 8u;\n"
+        "            var s = 0.0;\n");
+    if (q8) String_append(&body,
+        "            let qb = blk * 8u;\n"
+        "            for (var k = 0u; k < 8u; k++) { s += dot(i8x4(qs[qb + k]), x[xb + k]); }\n");
+    else String_append(&body,
+        "            let qb = blk * 4u;\n"
+        "            for (var k = 0u; k < 4u; k++) {\n"
+        "                let wv = qs[qb + k];\n"
+        "                s += dot(lo4(wv), x[xb + k]) + dot(hi4(wv), x[xb + 4u + k]);\n"
+        "            }\n");
+    String_append(&body,
+        "            acc += s * sc[blk];\n"
+        "        }\n"
+        "    }\n");
+    if (sg) String_append(&body,
+        "    let total = subgroupAdd(acc);\n"
+        "    if (lane == 0u && row < rows) { o[prm.p2 + step.b * prm.p3 + row] = total; }\n"
+        "}\n");
+    else String_append(&body,
+        "    part[lid.x] = acc;\n"
+        "    workgroupBarrier();\n"
+        "    for (var s = 16u; s > 0u; s >>= 1u) { if (lane < s) { part[lid.x] += part[lid.x + s]; } workgroupBarrier(); }\n"
+        "    if (lane == 0u && row < rows) { o[prm.p2 + step.b * prm.p3 + row] = part[lid.x]; }\n"
+        "}\n");
+    uint32[5] p = {rows, cols, out_offset, out_pos_stride, (uint32)w_offset};
+    NnTensor sct = NnTensor{buf: w.scales, count: w.count / 32, kind: NN_F32};
+    *NnTensor[4] ts = {out, &sct, w, x};
+    uint32 groups = (rows + 7) / 8;
+    uint32 gx = groups < 65535 ? groups : 65535;
+    uint32 gy = (groups + gx - 1) / gx;
+    string key = q8 ? (sg ? "matvec_q8_sg" : "matvec_q8") : (sg ? "matvec_q4_sg" : "matvec_q4");
+    _nn_record(self, key, _nn_wgsl("", body.data), &p[0], 5, &ts[0], 4, gx, gy, 1);
+}
+
 // out = w (rows x cols, row-major) * x.
 void NnProgram_matvec(*NnProgram self, *NnTensor out, *NnTensor w, *NnTensor x, uint32 rows, uint32 cols) {
     NnProgram_matvec_at(self, out, 0, 0, w, 0, x, rows, cols);
@@ -376,7 +527,7 @@ void NnProgram_rope(*NnProgram self, *NnTensor q, *NnTensor k, uint32 k_offset, 
         "    let i = id.x * 2u;\n"
         "    if (i >= prm.p0) { return; }\n"
         "    let head_dim = i % prm.p2;\n"
-        "    let freq = 1.0 / pow(10000.0, f32(head_dim) / f32(prm.p2));\n"
+        "    let freq = 1.0 / pow(bitcast<f32>(prm.p5), f32(head_dim) / f32(prm.p2));\n"
         "    let val = f32(step.b) * freq;\n"
         "    let fcr = cos(val);\n"
         "    let fci = sin(val);\n"
@@ -392,9 +543,9 @@ void NnProgram_rope(*NnProgram self, *NnTensor q, *NnTensor k, uint32 k_offset, 
         "        k[at + 1u] = k0 * fci + k1 * fcr;\n"
         "    }\n"
         "}\n";
-    uint32[5] p = {dim, kv_dim, head_size, k_offset, k_pos_stride};
+    uint32[6] p = {dim, kv_dim, head_size, k_offset, k_pos_stride, _nn_bits(self.rope_base)};
     *NnTensor[2] ts = {q, k};
-    _nn_record(self, "rope", _nn_wgsl("", body), &p[0], 5, &ts[0], 2, (dim / 2 + 255) / 256, 1, 1);
+    _nn_record(self, "rope", _nn_wgsl("", body), &p[0], 6, &ts[0], 2, (dim / 2 + 255) / 256, 1, 1);
 }
 
 // Causal multi-head attention for the query at position step.b over the
