@@ -42,3 +42,30 @@ jobs:
         run: |
           mkdir -p build
           for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done
+
+  windows:
+    # DirectX 12 through WARP, Windows' software adapter: the tests run with no GPU.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip
+      - name: Install Eskiu and wgpu-native
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          unzip -q eskiu.zip -d $HOME/eskiu
+          curl -fsSL -o wgpu.zip https://github.com/gfx-rs/wgpu-native/releases/download/$WGPU_VERSION/wgpu-windows-x86_64-gnu-release.zip
+          unzip -q wgpu.zip -d $HOME/wgpu
+      - name: Layout check
+        run: |
+          export PATH="$HOME/eskiu/bin:$HOME/wgpu/lib:$PATH"
+          CC=gcc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$HOME/wgpu/lib:$PATH"
+          CC=gcc eskiuc test -L$HOME/wgpu/lib
