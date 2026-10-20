@@ -1,0 +1,244 @@
+// Trains a two-layer network on MNIST on the GPU and saves its weights as
+// safetensors; --load evaluates saved weights instead of training.
+//
+//     mnist DIR [--epochs N] [--save mnist.safetensors] [--load mnist.safetensors]
+//
+// DIR holds the four MNIST files, gzipped as distributed
+// (https://storage.googleapis.com/cvdf-datasets/mnist/train-images-idx3-ubyte.gz
+// and the other three) or already uncompressed.
+
+import <io>;
+import <mem>;
+import <string>;
+import <fs>;
+import <time>;
+import <libc>;
+import <gpu>;
+import <gpu/nn>;
+import <gpu/train>;
+import <gpu/inflate>;
+import <gpu/safetensors>;
+
+struct Data {
+    *float images;
+    *int labels;
+    int count;
+}
+
+uint32 be32(*uint8 p) {
+    return (uint32)p[0] << 24 | (uint32)p[1] << 16 | (uint32)p[2] << 8 | (uint32)p[3];
+}
+
+// Reads DIR/name or DIR/name.gz (a gzip member with deflate data) of size
+// bytes once uncompressed.
+*uint8 read_file(string dir, string name, uint64 size) {
+    String path;
+    defer String_free(&path);
+    String_appendf(&path, "%s/%s", dir, name);
+    int64 n = 0;
+    *uint8 raw = fs_read_all(path.data, &n);
+    if (raw != null) return raw;
+    String_append(&path, ".gz");
+    *uint8 gz = fs_read_all(path.data, &n);
+    if (gz == null || n < 18 || gz[0] != 0x1F || gz[1] != 0x8B) return null;
+    defer free(gz);
+    int64 at = 10;
+    if ((gz[3] & 4) != 0) at += 2 + ((int64)gz[at] | (int64)gz[at + 1] << 8);
+    if ((gz[3] & 8) != 0) {
+        while (at < n && gz[at] != 0) at++;
+        at++;
+    }
+    *uint8 out = alloc<uint8>((int64)size);
+    Result<uint64, string> r = inflate_raw(gz + at, (uint64)(n - at - 8), out, size);
+    if (!r.ok || r.value != size) {
+        free(out);
+        return null;
+    }
+    return out;
+}
+
+bool load(string dir, string images, string labels, int count, Data* d) {
+    *uint8 im = read_file(dir, images, (uint64)(16 + count * 784));
+    *uint8 lb = read_file(dir, labels, (uint64)(8 + count));
+    if (im == null || lb == null || be32(im) != 2051 || be32(lb) != 2049) return false;
+    d.count = count;
+    d.images = alloc<float>((int64)count * 784);
+    d.labels = alloc<int>((int64)count);
+    for (i in 0..count * 784) d.images[i] = (float)im[16 + i] / 255.0;
+    for (i in 0..count) d.labels[i] = (int)lb[8 + i];
+    free(im);
+    free(lb);
+    return true;
+}
+
+struct Model {
+    NnGraph g;
+    NnVar x;
+    NnVar y;
+    NnVar w1;
+    NnVar b1;
+    NnVar w2;
+    NnVar b2;
+    NnVar logits;
+    NnVar loss;
+}
+
+uint32 BATCH = 100;
+
+Result<Model, string> build(*Gpu gpu) {
+    Model m;
+    m.g = gpu.nn_graph(BATCH)?;
+    m.x = m.g.input(784);
+    m.y = m.g.labels();
+    m.w1 = m.g.param(784, 128, 0.05);
+    m.b1 = m.g.param(1, 128, 0.0);
+    m.w2 = m.g.param(128, 10, 0.125);
+    m.b2 = m.g.param(1, 10, 0.0);
+    NnVar h = m.g.relu(m.g.bias(m.g.matmul(m.x, m.w1), m.b1));
+    m.logits = m.g.bias(m.g.matmul(h, m.w2), m.b2);
+    m.loss = m.g.cross_entropy(m.logits, m.y);
+    m.g.backward(m.loss)?;
+    m.g.adam(0.001);
+    return Ok<Model, string>(m);
+}
+
+Result<float, string> accuracy(Model* m, Data* d) {
+    float[1000] out;
+    int right = 0;
+    for (b in 0..d.count / (int)BATCH) {
+        m.g.set_input(m.x, d.images + (int64)b * BATCH * 784);
+        m.g.forward()?;
+        m.g.read(m.logits, &out[0])?;
+        for (i in 0..BATCH) {
+            int best = 0;
+            for (c in 1..10) {
+                if (out[i * 10 + c] > out[i * 10 + best]) best = c;
+            }
+            if (best == d.labels[b * (int)BATCH + (int)i]) right++;
+        }
+    }
+    return Ok<float, string>((float)right / (float)d.count);
+}
+
+Result<int, string> save(Model* m, string path) {
+    *float w1 = alloc<float>(784 * 128);
+    *float b1 = alloc<float>(128);
+    *float w2 = alloc<float>(128 * 10);
+    *float b2 = alloc<float>(10);
+    defer free(w1);
+    defer free(b1);
+    defer free(w2);
+    defer free(b2);
+    m.g.read(m.w1, w1)?;
+    m.g.read(m.b1, b1)?;
+    m.g.read(m.w2, w2)?;
+    m.g.read(m.b2, b2)?;
+    SafetensorsWriter out;
+    defer out.free();
+    out.add("w1", w1, 784, 128);
+    out.add("b1", b1, 128, 0);
+    out.add("w2", w2, 128, 10);
+    out.add("b2", b2, 10, 0);
+    return out.save(path);
+}
+
+Result<int, string> restore(Model* m, string path) {
+    Safetensors st = safetensors_load(path)?;
+    defer st.free();
+    string[4] names = {"w1", "b1", "w2", "b2"};
+    NnVar[4] vars = {m.w1, m.b1, m.w2, m.b2};
+    uint64[4] sizes = {784 * 128, 128, 128 * 10, 10};
+    for (k in 0..4) {
+        SafeTensor* t = st.tensor(names[k]);
+        if (t == null || t.count != sizes[k]) return Err<int, string>("the weights file does not match the model");
+        *float v = alloc<float>((int64)t.count);
+        t.floats(v);
+        m.g.set_param(vars[k], v);
+        free(v);
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run(string dir, int epochs, string save_path, string load_path) {
+    Data train;
+    Data test;
+    if (!load(dir, "t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte", 10000, &test)) {
+        return Err<int, string>("cannot read the MNIST test files in that directory");
+    }
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    Model m = build(&gpu)?;
+    defer m.g.release();
+    if (load_path != null) {
+        restore(&m, load_path)?;
+        float acc = accuracy(&m, &test)?;
+        printf("test accuracy %.2f%%\n", (double)(acc * 100.0));
+        return Ok<int, string>(0);
+    }
+    if (!load(dir, "train-images-idx3-ubyte", "train-labels-idx1-ubyte", 60000, &train)) {
+        return Err<int, string>("cannot read the MNIST training files in that directory");
+    }
+    *int order = alloc<int>(60000);
+    defer free(order);
+    *float batch_x = alloc<float>((int64)BATCH * 784);
+    *int batch_y = alloc<int>((int64)BATCH);
+    defer free(batch_x);
+    defer free(batch_y);
+    for (i in 0..60000) order[i] = i;
+    uint64 seed = 42;
+    for (epoch in 0..epochs) {
+        int64 t0 = time_monotonic_ms();
+        for (i in 0..60000) {
+            seed = seed * 6364136223846793005 + 1442695040888963407;
+            int j = (int)((seed >> 33) % (uint64)(60000 - i)) + i;
+            int tmp = order[i];
+            order[i] = order[j];
+            order[j] = tmp;
+        }
+        float loss_sum = 0.0;
+        int steps = 60000 / (int)BATCH;
+        for (s in 0..steps) {
+            for (i in 0..BATCH) {
+                int at = order[s * (int)BATCH + (int)i];
+                memcpy(batch_x + (int64)i * 784, train.images + (int64)at * 784, 784 * 4);
+                batch_y[i] = train.labels[at];
+            }
+            m.g.set_input(m.x, batch_x);
+            m.g.set_labels(m.y, batch_y);
+            m.g.run()?;
+            if (s % 100 == 99) loss_sum += m.g.read_scalar(m.loss)?;
+        }
+        float acc = accuracy(&m, &test)?;
+        int64 ms = time_monotonic_ms() - t0;
+        printf("epoch %d: loss %.4f, test accuracy %.2f%%, %lld ms\n", epoch + 1, (double)(loss_sum / (float)(steps / 100)),
+            (double)(acc * 100.0), ms);
+    }
+    if (save_path != null) {
+        save(&m, save_path)?;
+        printf("saved %s\n", save_path);
+    }
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    if (argc < 2) {
+        printf("usage: mnist DIR [--epochs N] [--save FILE] [--load FILE]\n");
+        return 2;
+    }
+    int epochs = 3;
+    string save_path = null;
+    string load_path = null;
+    int i = 2;
+    while (i + 1 < argc) {
+        if (strcmp(argv[i], "--epochs") == 0) epochs = atoi(argv[i + 1]);
+        else if (strcmp(argv[i], "--save") == 0) save_path = argv[i + 1];
+        else if (strcmp(argv[i], "--load") == 0) load_path = argv[i + 1];
+        i += 2;
+    }
+    Result<int, string> r = run(argv[1], epochs, save_path, load_path);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
