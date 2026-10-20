@@ -1,0 +1,95 @@
+// safetensors: a file written by the Python library (F32, F16, BF16, I64), a
+// round trip through SafetensorsWriter, and damaged files.
+import <io>;
+import <mem>;
+import <fs>;
+import <libc>;
+import <gpu/safetensors>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+Result<int, string> run() {
+    Safetensors st = safetensors_load("tests/data/sample.safetensors")?;
+    defer st.free();
+    check("four tensors", st.tensors.size == 4);
+    string[3] names = {"f32", "f16", "bf16"};
+    for (k in 0..3) {
+        SafeTensor* t = st.tensor(names[k]);
+        float[6] v;
+        bool ok = t != null && t.ndims == 2 && t.shape[0] == 2 && t.shape[1] == 3 && t.floats(&v[0]);
+        for (i in 0..6) ok = ok && v[i] == (float)i / 4.0;
+        check(names[k], ok);
+    }
+    SafeTensor* ids = st.tensor("ids");
+    int64[3] iv;
+    if (ids != null) memcpy(&iv[0], ids.data, 24);
+    check("int64 data", ids != null && strcmp(ids.dtype.data, "I64") == 0 && iv[0] == 7 && iv[1] == -1);
+
+    float[6] w = {1.5, -2.0, 0.25, 8.0, 3.0, -0.5};
+    float[2] b = {0.1, 0.2};
+    SafetensorsWriter out;
+    out.add("w", &w[0], 2, 3);
+    out.add("b", &b[0], 2, 0);
+    out.save("build/roundtrip.safetensors")?;
+    out.free();
+    Safetensors back = safetensors_load("build/roundtrip.safetensors")?;
+    defer back.free();
+    SafeTensor* tw = back.tensor("w");
+    SafeTensor* tb = back.tensor("b");
+    float[6] got;
+    check("round trip", tw != null && tb != null && tw.floats(&got[0]) && got[3] == 8.0 && tb.ndims == 1 && tb.count == 2);
+
+    int64 len = 0;
+    *uint8 file = fs_read_all("tests/data/sample.safetensors", &len);
+    defer free(file);
+    int accepted = 0;
+    for (cut in 0..len) {
+        *uint8 copy = alloc<uint8>(len);
+        memcpy(copy, file, len);
+        Result<Safetensors, string> r = safetensors_parse(copy, (uint64)cut);
+        if (r.ok) {
+            accepted++;
+            Safetensors s = r.value;
+            s.free();
+        } else free(copy);
+    }
+    check("truncated files are rejected", accepted == 0);
+    uint32 seed = 5;
+    for (round in 0..500) {
+        *uint8 copy = alloc<uint8>(len);
+        memcpy(copy, file, len);
+        for (k in 0..3) {
+            seed = seed * 1103515245 + 12345;
+            copy[(int64)(seed >> 8) % len] = (uint8)(seed >> 3);
+        }
+        Result<Safetensors, string> r = safetensors_parse(copy, (uint64)len);
+        if (r.ok) {
+            Safetensors s = r.value;
+            for (i in 0..s.tensors.size) {
+                SafeTensor* t = &s.tensors.data[i];
+                *float tmp = alloc<float>((int64)t.count + 1);
+                t.floats(tmp);
+                free(tmp);
+            }
+            s.free();
+        } else free(copy);
+    }
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("safetensors: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}
