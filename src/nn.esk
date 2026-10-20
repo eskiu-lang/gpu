@@ -64,6 +64,7 @@ struct NnProgram {
     uint32[4] step_values;
     float eps;
     float rope_base;
+    bool rope_neox;
 }
 
 Result<NnTensor, string> Gpu_nn_tensor(*Gpu self, uint64 count) {
@@ -517,35 +518,45 @@ void NnProgram_matvec(*NnProgram self, *NnTensor out, *NnTensor w, *NnTensor x, 
 }
 
 // Rotary position embedding at position step.b on q (dim values) and on the
-// key k written at k_offset + step.b * k_pos_stride (kv_dim values).
+// key k written at k_offset + step.b * k_pos_stride (kv_dim values). The
+// pairs are adjacent values (Meta's and llama.cpp's layout), or the two halves
+// of each head when the program's rope_neox is set (Hugging Face's layout).
 void NnProgram_rope(*NnProgram self, *NnTensor q, *NnTensor k, uint32 k_offset, uint32 k_pos_stride, uint32 dim, uint32 kv_dim,
     uint32 head_size) {
     string body =
         "@group(0) @binding(2) var<storage, read_write> q: array<f32>;\n"
         "@group(0) @binding(3) var<storage, read_write> k: array<f32>;\n"
         "@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
-        "    let i = id.x * 2u;\n"
-        "    if (i >= prm.p0) { return; }\n"
-        "    let head_dim = i % prm.p2;\n"
+        "    if (id.x * 2u >= prm.p0) { return; }\n"
+        "    var i = id.x * 2u;\n"
+        "    var other = i + 1u;\n"
+        "    var head_dim = i % prm.p2;\n"
+        "    if (prm.p6 != 0u) {\n"
+        "        let half = prm.p2 / 2u;\n"
+        "        let j = id.x % half;\n"
+        "        i = (id.x / half) * prm.p2 + j;\n"
+        "        other = i + half;\n"
+        "        head_dim = j * 2u;\n"
+        "    }\n"
         "    let freq = 1.0 / pow(bitcast<f32>(prm.p5), f32(head_dim) / f32(prm.p2));\n"
         "    let val = f32(step.b) * freq;\n"
         "    let fcr = cos(val);\n"
         "    let fci = sin(val);\n"
         "    let q0 = q[i];\n"
-        "    let q1 = q[i + 1u];\n"
+        "    let q1 = q[other];\n"
         "    q[i] = q0 * fcr - q1 * fci;\n"
-        "    q[i + 1u] = q0 * fci + q1 * fcr;\n"
-        "    if (i < prm.p1) {\n"
-        "        let at = prm.p3 + step.b * prm.p4 + i;\n"
-        "        let k0 = k[at];\n"
-        "        let k1 = k[at + 1u];\n"
-        "        k[at] = k0 * fcr - k1 * fci;\n"
-        "        k[at + 1u] = k0 * fci + k1 * fcr;\n"
+        "    q[other] = q0 * fci + q1 * fcr;\n"
+        "    if (other < prm.p1) {\n"
+        "        let at = prm.p3 + step.b * prm.p4;\n"
+        "        let k0 = k[at + i];\n"
+        "        let k1 = k[at + other];\n"
+        "        k[at + i] = k0 * fcr - k1 * fci;\n"
+        "        k[at + other] = k0 * fci + k1 * fcr;\n"
         "    }\n"
         "}\n";
-    uint32[6] p = {dim, kv_dim, head_size, k_offset, k_pos_stride, _nn_bits(self.rope_base)};
+    uint32[7] p = {dim, kv_dim, head_size, k_offset, k_pos_stride, _nn_bits(self.rope_base), self.rope_neox ? (uint32)1 : (uint32)0};
     *NnTensor[2] ts = {q, k};
-    _nn_record(self, "rope", _nn_wgsl("", body), &p[0], 6, &ts[0], 2, (dim / 2 + 255) / 256, 1, 1);
+    _nn_record(self, "rope", _nn_wgsl("", body), &p[0], 7, &ts[0], 2, (dim / 2 + 255) / 256, 1, 1);
 }
 
 // Causal multi-head attention for the query at position step.b over the
