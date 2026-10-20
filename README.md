@@ -81,7 +81,7 @@ if (!r.ok) printf("error: %s\n", r.error);
 ```
 
 ```
-$ eskiuc run -L/opt/homebrew/lib twice.esk
+$ eskiuc run twice.esk
 510.0
 ```
 
@@ -183,7 +183,7 @@ llama2.c. It reads llama2.c checkpoints, llama GGUF files (Q4_0 and Q8_0 run qua
 the GPU, other types are converted to f16) and Hugging Face model directories:
 
 ```
-$ eskiuc build -L/opt/homebrew/lib && ./build/llama2 llama-2-7b.Q4_0.gguf -t 0 -i "The capital of France is"
+$ eskiuc build && ./build/llama2 llama-2-7b.Q4_0.gguf -t 0 -i "The capital of France is"
 ```
 
 | Model | Eskiu | Reference |
@@ -232,24 +232,24 @@ does. Both are planned. The other modules are plain Eskiu and work on every targ
 
 ## Install
 
-The package needs wgpu-native 29, and SDL3 for `<gpu/window>`:
-
-```bash
-brew install wgpu-native sdl3          # macOS
-```
-
-On Linux and Windows, wgpu-native comes from its
-[release archives](https://github.com/gfx-rs/wgpu-native/releases) and SDL3 from your system's
-packages or [libsdl.org](https://libsdl.org). Then, in an Eskiu package (Eskiu 0.12 or newer):
+In an Eskiu package (Eskiu 0.12 or newer):
 
 ```bash
 eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.1.0
-eskiuc build -L/opt/homebrew/lib       # the directory that holds libwgpu_native
+eskiuc build
 ```
 
-On Linux the library also has to be on the loader path when the program runs
-(`LD_LIBRARY_PATH`, or a system library directory). On Windows, `wgpu_native.dll` goes next
-to the executable.
+The package's `eskiu.toml` names wgpu-native 29's own release archives for macOS (arm64 and
+x86-64), Linux (x86-64 and arm64) and Windows x86-64: the first build that links it
+(`eskiuc build`, `run`, `test`) downloads the one for your machine, checks its SHA-256 and
+keeps it in `~/.eskiu/native`, and every build links against it with no `-L` (on Windows the
+DLL is copied next to the program). A program that only uses the pure Eskiu modules
+downloads nothing.
+
+`<gpu/window>` also needs SDL3, which publishes no prebuilt library for macOS or Linux: install
+it from your system (`brew install sdl3` on macOS, the SDL3 development package or
+[libsdl.org](https://libsdl.org) elsewhere) and give its directory to a build that opens a
+window, as in `eskiuc build -L/opt/homebrew/lib`.
 
 ## Modules
 
@@ -281,7 +281,7 @@ Bug reports are welcome; please include the program, the `eskiuc --version` outp
 adapter it ran on. The tests and the layout check run with:
 
 ```bash
-eskiuc test -L/opt/homebrew/lib
+eskiuc test
 tools/gen.py $(brew --prefix wgpu-native)/include            # regenerates src/raw.esk
 python3 -I tools/gen_test_models.py                          # regenerates the glTF test models
 tools/layout_check.sh $(brew --prefix wgpu-native)/include /opt/homebrew/lib

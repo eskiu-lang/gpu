@@ -21,11 +21,10 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers libvulkan1 unzip
           curl -fsSL -o wgpu.zip https://github.com/gfx-rs/wgpu-native/releases/download/$WGPU_VERSION/wgpu-linux-x86_64-release.zip
           unzip -q wgpu.zip -d $HOME/wgpu
-          echo "LD_LIBRARY_PATH=$HOME/wgpu/lib" >> $GITHUB_ENV
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
       - name: Tests
-        run: eskiuc test -L$HOME/wgpu/lib
+        run: eskiuc test
 
   macos:
     runs-on: macos-15
@@ -37,7 +36,7 @@ jobs:
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $(brew --prefix wgpu-native)/include $(brew --prefix)/lib
       - name: Tests
-        run: eskiuc test -L$(brew --prefix)/lib
+        run: eskiuc test
       - name: Examples build
         run: |
           mkdir -p build
@@ -69,5 +68,5 @@ jobs:
           CC=gcc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
       - name: Tests
         run: |
-          export PATH="$HOME/eskiu/bin:$HOME/wgpu/lib:$PATH"
-          CC=gcc eskiuc test -L$HOME/wgpu/lib
+          export PATH="$HOME/eskiu/bin:$PATH"
+          CC=gcc eskiuc test
