@@ -1,10 +1,48 @@
-# gpu
+<p align="center">
+  <img src="https://raw.githubusercontent.com/eskiu-lang/eskiu/main/assets/logo.png" alt="Eskiu, a kitten with a ball of yarn" width="140">
+</p>
 
-GPU compute and rendering for [Eskiu](https://eskiu-lang.org), over WebGPU through
-[wgpu-native](https://github.com/gfx-rs/wgpu-native). One API runs on Metal (macOS),
-Vulkan (Linux) and DirectX 12 (Windows), with shaders written in WGSL.
+<h2 align="center">gpu</h2>
+<p align="center">GPU compute and rendering for Eskiu, over WebGPU.</p>
+<p align="center"><sub>Part of the <a href="https://github.com/eskiu-lang">Eskiu</a> project</sub></p>
+<p align="center">
+  <a href="https://eskiu-lang.org">eskiu-lang.org</a> &nbsp;&middot;&nbsp;
+  <a href="#modules">Modules</a> &nbsp;&middot;&nbsp;
+  <a href="examples/">Examples</a> &nbsp;&middot;&nbsp;
+  <a href="https://github.com/eskiu-lang/eskiu">The language</a>
+</p>
 
-```c
+<p align="center">
+  <a href="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/version-0.1.0-6448d4" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/wgpu--native-29-orange" alt="wgpu-native 29">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
+</p>
+
+---
+
+`gpu` is an Eskiu package for running compute kernels and drawing on the GPU. It is built
+on [wgpu-native](https://github.com/gfx-rs/wgpu-native), so one API runs on Metal (macOS),
+Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
+
+- **Compute.** Storage buffers, kernels and dispatches, with results read back into
+  Eskiu memory.
+- **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
+  render pipelines and passes, to an offscreen texture or a window.
+- **Windows and input.** `<gpu/window>` opens a window over SDL3 and gives its surface
+  and its keyboard and mouse events.
+- **Errors as `Result`.** Every call that can fail returns one, with the message from the
+  WebGPU validation layer; a WGSL error comes with its line and column.
+- **The whole API underneath.** `<gpu/raw>` is all of `webgpu.h` and `wgpu.h`, generated,
+  with every struct's layout checked against the C compiler.
+
+<p align="center">
+  <img src="assets/cube.png" alt="A textured cube rendered offscreen by tests/render_cube.esk" width="256">
+</p>
+
+## Compute
+
+```eskiu
 import <io>;
 import <gpu>;
 
@@ -32,63 +70,97 @@ Result<int, string> r = run();
 if (!r.ok) printf("error: %s\n", r.error);
 ```
 
-## Requirements
+```
+$ eskiuc run -L/opt/homebrew/lib twice.esk
+510.0
+```
 
-- wgpu-native 29 (`brew install wgpu-native` on macOS; on Linux and Windows, the
-  [release archives](https://github.com/gfx-rs/wgpu-native/releases)).
-- SDL3 for windows (`<gpu/window>` only): `brew install sdl3`, or your system's package.
-- Eskiu 0.12 or newer.
+## Rendering
 
-## Using it
+A window, a pipeline and one draw per frame (from [`examples/triangle.esk`](examples/triangle.esk)):
+
+```eskiu
+Gpu gpu = gpu_open()?;
+defer gpu.release();
+Window win = window_open("Eskiu triangle", 800, 600)?;
+defer win.release();
+GpuSurface surface = win.surface(&gpu)?;
+defer surface.release();
+GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format};
+GpuPipeline pipe = gpu.pipeline(&d)?;
+defer pipe.release();
+
+bool running = true;
+WindowEvent ev;
+while (running) {
+    while (win.poll(&ev)) {
+        if (ev.kind == WINDOW_QUIT) running = false;
+        if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
+    }
+    GpuFrame frame = surface.frame()?;
+    GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    surface.present(&frame);
+}
+```
+
+[`examples/cube.esk`](examples/cube.esk) adds a vertex and an index buffer, a texture, a
+depth buffer and a matrix uniform from `<gpu/math>`. Both quit with Escape, or after N frames
+with `--frames N`.
+
+## Install
+
+The package needs wgpu-native 29, and SDL3 for `<gpu/window>`:
+
+```bash
+brew install wgpu-native sdl3          # macOS
+```
+
+On Linux and Windows, wgpu-native comes from its
+[release archives](https://github.com/gfx-rs/wgpu-native/releases) and SDL3 from your system's
+packages or [libsdl.org](https://libsdl.org). Then, in an Eskiu package (Eskiu 0.12 or newer):
 
 ```bash
 eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.1.0
-eskiuc build -L/opt/homebrew/lib          # the directory that holds libwgpu_native
+eskiuc build -L/opt/homebrew/lib       # the directory that holds libwgpu_native
 ```
 
-On Linux the library must also be on the loader path at run time
-(`LD_LIBRARY_PATH`, or install it next to the system libraries). On Windows,
-`wgpu_native.dll` goes next to the executable.
+On Linux the library also has to be on the loader path when the program runs
+(`LD_LIBRARY_PATH`, or a system library directory). On Windows, `wgpu_native.dll` goes next
+to the executable.
 
 ## Modules
 
 | Module | What it has |
 |---|---|
 | `<gpu>` | `<gpu/core>` and `<gpu/render>` together |
-| `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write), `GpuKernel` (compute) |
+| `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
 | `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window surfaces |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 (links SDL3) |
-| `<gpu/math>` | `Mat4` (perspective, look at, rotate, translate, multiply) |
-| `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async`, for code on the event loop |
-| `<gpu/raw>` | the whole WebGPU C API (`webgpu.h` and `wgpu.h`), generated |
+| `<gpu/math>` | `Mat4`: perspective, look at, rotate, translate, multiply |
+| `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
+| `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
 
-Every call that can fail returns a `Result`, with the message from WebGPU's validation
-layer as its error (a WGSL syntax error comes with its line and column). Each object
-has a `release()` for `defer`. `<gpu/raw>` covers what the idiomatic layer does not;
-its handles are the same ones the `Gpu*` structs hold.
+Each object has a `release()` to pair with `defer`. The handles inside the `Gpu*` structs are
+the `<gpu/raw>` ones, so a program can drop down to the C API for anything the idiomatic
+layer does not cover.
 
-## Examples
+## Contributing
 
-`examples/compute.esk` adds two arrays of a million floats. `examples/triangle.esk` and
-`examples/cube.esk` open a window (the cube is textured, with a depth buffer); pass
-`--frames N` to quit after N frames.
+Bug reports are welcome; please include the program, the `eskiuc --version` output and the
+adapter it ran on. The tests and the layout check run with:
 
 ```bash
-eskiuc run -L/opt/homebrew/lib examples/cube.esk
-```
-
-## Development
-
-```bash
-eskiuc test -L/opt/homebrew/lib                                     # tests/*.esk
-tools/gen.py $(brew --prefix wgpu-native)/include                   # regenerate src/raw.esk
+eskiuc test -L/opt/homebrew/lib
+tools/gen.py $(brew --prefix wgpu-native)/include            # regenerates src/raw.esk
 tools/layout_check.sh $(brew --prefix wgpu-native)/include /opt/homebrew/lib
 ```
 
-`tools/layout_check.sh` compiles a C program and an Eskiu program that print the size
-and field offsets of every WebGPU struct, and compares them. CI runs it and the tests
-on Linux (software Vulkan, no GPU) and macOS.
+`tools/layout_check.sh` compiles a C program and an Eskiu program that print the size and
+field offsets of every WebGPU struct and compares their output. CI runs it and the tests on
+Linux (software Vulkan, no GPU needed) and macOS.
 
 ## License
 
-MIT.
+MIT. See [LICENSE](LICENSE).
