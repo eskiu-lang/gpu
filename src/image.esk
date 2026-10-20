@@ -1,0 +1,45 @@
+// image.esk: decoded images and the PNG/JPEG front door (<gpu/image>).
+//
+// An Image is 8-bit RGBA, four bytes per pixel, rows packed with the top row
+// first, which is what a glTF texture upload wants. image_decode looks at the
+// signature and hands the bytes to png_decode or jpeg_decode; image_load reads
+// a file first. The decoders are pure Eskiu and need no GPU.
+//
+//     Image img = image_load("albedo.png")?;
+//     defer img.free();
+
+import <mem>;
+import <fs>;
+import <result>;
+import <gpu/png>;
+import <gpu/jpeg>;
+
+struct Image {
+    uint32 width;
+    uint32 height;
+    *uint8 rgba;
+}
+
+void Image_free(*Image self) {
+    if (self.rgba != null) free((*void)self.rgba);
+    self.rgba = null;
+    self.width = 0;
+    self.height = 0;
+}
+
+// Decodes a PNG or JPEG held in memory, chosen by its first bytes.
+Result<Image, string> image_decode(*uint8 data, uint64 len) {
+    if (data == null) return Err<Image, string>("image: no data");
+    if (len >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71) return png_decode(data, len);
+    if (len >= 3 && data[0] == 255 && data[1] == 216 && data[2] == 255) return jpeg_decode(data, len);
+    return Err<Image, string>("image: unknown format");
+}
+
+// Reads a file and decodes it.
+Result<Image, string> image_load(string path) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<Image, string>("image: cannot read file");
+    defer free((*void)data);
+    return image_decode(data, (uint64)n);
+}

@@ -1,0 +1,318 @@
+// inflate.esk: zlib and raw DEFLATE decompression (RFC 1950, RFC 1951).
+//
+// The output size must be known up front (PNG computes it from the header):
+// the caller passes a buffer and its capacity, and a stream that would write
+// past it is an error. Every read of the input is bounds checked; reading past
+// the end feeds zero bits and is reported as a truncated stream. Huffman codes
+// are decoded through a 9-bit lookup table with a canonical-code fallback for
+// the longer ones, the scheme used by stb_image and zlib.
+//
+//     Result<uint64, string> r = inflate_zlib(src, src_len, dst, dst_cap);
+//     uint64 written = r?;
+
+import <mem>;
+import <result>;
+
+const uint16[29] _INF_LEN_BASE = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+const uint8[29] _INF_LEN_EXTRA = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+const uint16[30] _INF_DIST_BASE = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+const uint8[30] _INF_DIST_EXTRA = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+const uint8[19] _INF_CL_ORDER = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+// A Huffman table. fast[] maps the next 9 input bits (LSB first) to
+// (length << 9) | symbol, or 0 when the code is longer; the other arrays are
+// the canonical code ranges per length for the slow path.
+struct _InfHuff {
+    uint16[512] fast;
+    uint16[17] firstcode;
+    int[18] maxcode;
+    uint16[17] firstsym;
+    uint8[288] size;
+    uint16[288] value;
+}
+
+struct _Inflate {
+    *uint8 src;
+    uint64 len;
+    uint64 pos;
+    uint64 bits;
+    int nbits;
+    int over;
+    *uint8 dst;
+    uint64 cap;
+    uint64 out;
+    _InfHuff lit;
+    _InfHuff dist;
+    _InfHuff cl;
+}
+
+int _inf_rev16(int v) {
+    int n = v;
+    n = ((n & 0xAAAA) >> 1) | ((n & 0x5555) << 1);
+    n = ((n & 0xCCCC) >> 2) | ((n & 0x3333) << 2);
+    n = ((n & 0xF0F0) >> 4) | ((n & 0x0F0F) << 4);
+    n = ((n & 0xFF00) >> 8) | ((n & 0x00FF) << 8);
+    return n;
+}
+
+// Tops the bit buffer up to more than 56 bits; past the end of the input it
+// shifts in zero bytes and counts them in `over`.
+void _inf_fill(*_Inflate z) {
+    while (z.nbits <= 56) {
+        uint64 b = 0;
+        if (z.pos < z.len) {
+            b = (uint64)z.src[z.pos];
+            z.pos++;
+        } else {
+            z.over++;
+        }
+        z.bits = z.bits | (b << z.nbits);
+        z.nbits += 8;
+    }
+}
+
+int _inf_bits(*_Inflate z, int n) {
+    if (n == 0) return 0;
+    if (z.nbits < n) _inf_fill(z);
+    int v = (int)(z.bits & (uint64)((1 << n) - 1));
+    z.bits = z.bits >> n;
+    z.nbits -= n;
+    return v;
+}
+
+// True once the decoder consumed bits that were not in the input.
+bool _inf_overrun(*_Inflate z) {
+    return z.over * 8 > z.nbits;
+}
+
+// Builds a table from code lengths (0 = unused). Returns 0 for an
+// over-subscribed set of lengths.
+int _inf_build(*_InfHuff h, *uint8 lens, int num) {
+    let sizes: int[17];
+    let next: int[16];
+    memset((*void)&h.fast[0], 0, 1024);
+    for (i in 0..num) {
+        int l = (int)lens[i];
+        if (l > 15) return 0;
+        sizes[l]++;
+    }
+    sizes[0] = 0;
+    for (i in 1..16) {
+        if (sizes[i] > (1 << i)) return 0;
+    }
+    int code = 0;
+    int k = 0;
+    for (i in 1..16) {
+        next[i] = code;
+        h.firstcode[i] = (uint16)code;
+        h.firstsym[i] = (uint16)k;
+        code = code + sizes[i];
+        if (sizes[i] != 0 && code - 1 >= (1 << i)) return 0;
+        h.maxcode[i] = code << (16 - i);
+        code = code << 1;
+        k += sizes[i];
+    }
+    h.maxcode[16] = 0x10000;
+    for (i in 0..num) {
+        int s = (int)lens[i];
+        if (s != 0) {
+            int c = next[s] - (int)h.firstcode[s] + (int)h.firstsym[s];
+            if (c < 0 || c >= 288) return 0;
+            h.size[c] = (uint8)s;
+            h.value[c] = (uint16)i;
+            if (s <= 9) {
+                int j = _inf_rev16(next[s]) >> (16 - s);
+                while (j < 512) {
+                    h.fast[j] = (uint16)((s << 9) | i);
+                    j += 1 << s;
+                }
+            }
+            next[s]++;
+        }
+    }
+    return 1;
+}
+
+// Decodes one symbol, -1 for an invalid code.
+int _inf_decode(*_Inflate z, *_InfHuff h) {
+    if (z.nbits < 16) _inf_fill(z);
+    int b = (int)h.fast[(int)(z.bits & 511)];
+    if (b != 0) {
+        int s = b >> 9;
+        z.bits = z.bits >> s;
+        z.nbits -= s;
+        return b & 511;
+    }
+    int k = _inf_rev16((int)(z.bits & 0xFFFF));
+    int s = 10;
+    while (s < 16 && k >= h.maxcode[s]) s++;
+    if (s >= 16) return -1;
+    int idx = (k >> (16 - s)) - (int)h.firstcode[s] + (int)h.firstsym[s];
+    if (idx < 0 || idx >= 288 || (int)h.size[idx] != s) return -1;
+    z.bits = z.bits >> s;
+    z.nbits -= s;
+    return (int)h.value[idx];
+}
+
+string _inf_codes(*_Inflate z) {
+    while (true) {
+        int sym = _inf_decode(z, &z.lit);
+        if (sym < 256) {
+            if (sym < 0) return "inflate: bad code";
+            if (z.out >= z.cap) return "inflate: too much data";
+            if (z.over > 8) return "inflate: truncated";
+            z.dst[z.out] = (uint8)sym;
+            z.out++;
+            continue;
+        }
+        if (sym == 256) return null;
+        sym -= 257;
+        if (sym >= 29) return "inflate: bad length";
+        int length = (int)_INF_LEN_BASE[sym] + _inf_bits(z, (int)_INF_LEN_EXTRA[sym]);
+        int d = _inf_decode(z, &z.dist);
+        if (d < 0 || d >= 30) return "inflate: bad distance";
+        uint64 dist = (uint64)((int)_INF_DIST_BASE[d] + _inf_bits(z, (int)_INF_DIST_EXTRA[d]));
+        if (dist > z.out) return "inflate: bad distance";
+        if (z.out + (uint64)length > z.cap) return "inflate: too much data";
+        if (z.over > 8) return "inflate: truncated";
+        *uint8 p = z.dst + z.out;
+        *uint8 q = p - dist;
+        if (dist >= (uint64)length) {
+            memcpy((*void)p, (*void)q, (int64)length);
+        } else {
+            for (i in 0..length) p[i] = q[i];
+        }
+        z.out += (uint64)length;
+    }
+    return null;
+}
+
+string _inf_stored(*_Inflate z) {
+    _inf_bits(z, z.nbits & 7);
+    int buffered = z.nbits / 8 - z.over;
+    if (buffered < 0) return "inflate: truncated";
+    z.pos -= (uint64)buffered;
+    z.bits = 0;
+    z.nbits = 0;
+    z.over = 0;
+    if (z.len - z.pos < 4) return "inflate: truncated";
+    *uint8 s = z.src + z.pos;
+    int n = (int)s[0] | ((int)s[1] << 8);
+    int nn = (int)s[2] | ((int)s[3] << 8);
+    if (n != (nn ^ 0xFFFF)) return "inflate: bad stored block";
+    z.pos += 4;
+    if (z.len - z.pos < (uint64)n) return "inflate: truncated";
+    if (z.cap - z.out < (uint64)n) return "inflate: too much data";
+    memcpy((*void)(z.dst + z.out), (*void)(z.src + z.pos), (int64)n);
+    z.pos += (uint64)n;
+    z.out += (uint64)n;
+    return null;
+}
+
+string _inf_fixed(*_Inflate z) {
+    let lens: uint8[320];
+    for (i in 0..144) lens[i] = 8;
+    for (i in 144..256) lens[i] = 9;
+    for (i in 256..280) lens[i] = 7;
+    for (i in 280..288) lens[i] = 8;
+    for (i in 288..320) lens[i] = 5;
+    _inf_build(&z.lit, &lens[0], 288);
+    _inf_build(&z.dist, &lens[288], 32);
+    return null;
+}
+
+string _inf_dynamic(*_Inflate z) {
+    int hlit = _inf_bits(z, 5) + 257;
+    int hdist = _inf_bits(z, 5) + 1;
+    int hclen = _inf_bits(z, 4) + 4;
+    let cl: uint8[19];
+    for (i in 0..hclen) cl[(int)_INF_CL_ORDER[i]] = (uint8)_inf_bits(z, 3);
+    if (_inf_build(&z.cl, &cl[0], 19) == 0) return "inflate: bad code lengths";
+    let lens: uint8[320];
+    int total = hlit + hdist;
+    int n = 0;
+    while (n < total) {
+        int c = _inf_decode(z, &z.cl);
+        if (c < 0 || c >= 19) return "inflate: bad code lengths";
+        if (z.over > 8) return "inflate: truncated";
+        if (c < 16) {
+            lens[n] = (uint8)c;
+            n++;
+            continue;
+        }
+        int rep = 0;
+        uint8 fill = 0;
+        if (c == 16) {
+            if (n == 0) return "inflate: bad code lengths";
+            fill = lens[n - 1];
+            rep = 3 + _inf_bits(z, 2);
+        } else if (c == 17) {
+            rep = 3 + _inf_bits(z, 3);
+        } else {
+            rep = 11 + _inf_bits(z, 7);
+        }
+        if (n + rep > total) return "inflate: bad code lengths";
+        for (i in 0..rep) lens[n + i] = fill;
+        n += rep;
+    }
+    if (lens[256] == 0) return "inflate: no end code";
+    if (_inf_build(&z.lit, &lens[0], hlit) == 0) return "inflate: bad code lengths";
+    if (_inf_build(&z.dist, &lens[hlit], hdist) == 0) return "inflate: bad code lengths";
+    return null;
+}
+
+string _inf_run(*_Inflate z) {
+    while (true) {
+        int last = _inf_bits(z, 1);
+        int kind = _inf_bits(z, 2);
+        if (_inf_overrun(z)) return "inflate: truncated";
+        string e = null;
+        if (kind == 0) {
+            e = _inf_stored(z);
+        } else if (kind == 1) {
+            e = _inf_fixed(z);
+            if (e == null) e = _inf_codes(z);
+        } else if (kind == 2) {
+            e = _inf_dynamic(z);
+            if (e == null) e = _inf_codes(z);
+        } else {
+            e = "inflate: bad block type";
+        }
+        if (e != null) return e;
+        if (_inf_overrun(z)) return "inflate: truncated";
+        if (last != 0) return null;
+    }
+    return null;
+}
+
+Result<uint64, string> _inf_start(*uint8 src, uint64 len, *uint8 dst, uint64 cap, bool zlib) {
+    *_Inflate z = alloc<_Inflate>(1);
+    if (z == null) return Err<uint64, string>("inflate: out of memory");
+    defer free((*void)z);
+    z.src = src;
+    z.len = len;
+    z.dst = dst;
+    z.cap = cap;
+    if (zlib) {
+        if (len < 2) return Err<uint64, string>("inflate: truncated");
+        int cmf = (int)src[0];
+        int flg = (int)src[1];
+        if ((cmf & 15) != 8 || (cmf >> 4) > 7 || (cmf * 256 + flg) % 31 != 0) return Err<uint64, string>("inflate: bad zlib header");
+        if ((flg & 32) != 0) return Err<uint64, string>("inflate: preset dictionary");
+        z.pos = 2;
+    }
+    string e = _inf_run(z);
+    if (e != null) return Err<uint64, string>(e);
+    return Ok<uint64, string>(z.out);
+}
+
+// Inflates a zlib stream (2-byte header, DEFLATE data, Adler-32 not checked)
+// into dst, which holds cap bytes. Returns the number of bytes written.
+Result<uint64, string> inflate_zlib(*uint8 src, uint64 len, *uint8 dst, uint64 cap) {
+    return _inf_start(src, len, dst, cap, true);
+}
+
+// Inflates raw DEFLATE data with no header.
+Result<uint64, string> inflate_raw(*uint8 src, uint64 len, *uint8 dst, uint64 cap) {
+    return _inf_start(src, len, dst, cap, false);
+}

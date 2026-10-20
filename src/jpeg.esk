@@ -1,0 +1,923 @@
+// jpeg.esk: JPEG decoding to RGBA8 (imported by <gpu/image>).
+//
+// Supports baseline and extended sequential Huffman JPEGs and progressive
+// ones, 8-bit precision, grayscale, YCbCr and RGB (Adobe transform 0 or
+// component ids 'R' 'G' 'B'), any sampling factors from 1 to 4 that divide the
+// largest one, restart markers and any number of DHT/DQT segments. Arithmetic
+// coding, lossless and hierarchical frames, 12-bit samples and CMYK are
+// rejected. EXIF orientation is ignored.
+//
+// The pipeline follows libjpeg: the accurate integer IDCT (jidctint), "fancy"
+// triangle-filter chroma upsampling for 2x1, 1x2 and 2x2 subsampling (pixel
+// replication otherwise), and the same fixed-point YCbCr to RGB conversion, so
+// the output stays within a unit or two of djpeg's. The entropy decoder follows
+// stb_image: a 9-bit Huffman lookup table and a bit buffer that feeds zeros
+// once a marker or the end of the data is reached. A file that ends before EOI
+// is reported as truncated.
+//
+//     Result<Image, string> r = jpeg_decode(bytes, len);
+
+import <mem>;
+import <result>;
+import <gpu/image>;
+
+// Zigzag position to natural order, padded so a corrupt run cannot index
+// past the end.
+const uint8[80] _J_DEZIG = {
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
+    12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28,
+    35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+    58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63
+};
+
+// A Huffman table: fast[] maps the next 9 bits to a symbol index (255 when
+// the code is longer), maxcode[] and delta[] decode the rest canonically.
+struct _JHuff {
+    uint8[512] fast;
+    uint16[256] code;
+    uint8[256] values;
+    uint8[257] size;
+    uint32[18] maxcode;
+    int[17] delta;
+}
+
+struct _JComp {
+    int id;
+    int h;
+    int v;
+    int tq;
+    int hd;
+    int ha;
+    int dc_pred;
+    int64 bw;
+    int64 bh;
+    int64 x;
+    int64 y;
+    *uint8 plane;
+    *int16 coef;
+}
+
+struct _Jpeg {
+    *uint8 d;
+    uint64 len;
+    uint64 pos;
+    uint32 buf;
+    int bits;
+    int marker;
+    bool nomore;
+    int over;
+    _JHuff[4] hdc;
+    _JHuff[4] hac;
+    bool[8] hdef;
+    uint16[256] q;
+    bool[4] qdef;
+    int64 w;
+    int64 h;
+    int nc;
+    _JComp[4] comp;
+    int hmax;
+    int vmax;
+    int64 mcux;
+    int64 mcuy;
+    bool sof;
+    bool progressive;
+    bool scanned;
+    int scan_n;
+    int[4] order;
+    int ss;
+    int se;
+    int ah;
+    int al;
+    int eob_run;
+    int restart;
+    int todo;
+    int adobe;
+    bool jfif;
+    string err;
+}
+
+int _j_be16(*uint8 p) {
+    return ((int)p[0] << 8) | (int)p[1];
+}
+
+int _j_clamp16(int64 v) {
+    if (v < -32768) return -32768;
+    if (v > 32767) return 32767;
+    return (int)v;
+}
+
+uint8 _j_clamp8(int64 v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8)v;
+}
+
+string _j_build(*_JHuff h, *int count) {
+    int k = 0;
+    for (i in 0..16) {
+        for (n in 0..count[i]) {
+            if (k >= 256) return "jpeg: bad huffman table";
+            h.size[k] = (uint8)(i + 1);
+            k++;
+        }
+    }
+    h.size[k] = 0;
+    uint32 code = 0;
+    k = 0;
+    for (j in 1..17) {
+        h.delta[j] = k - (int)code;
+        if ((int)h.size[k] == j) {
+            while ((int)h.size[k] == j) {
+                h.code[k] = (uint16)code;
+                code++;
+                k++;
+            }
+            if (code - 1 >= ((uint32)1 << j)) return "jpeg: bad huffman table";
+        }
+        h.maxcode[j] = code << (16 - j);
+        code = code << 1;
+    }
+    h.maxcode[17] = 0xFFFFFFFF;
+    memset((*void)&h.fast[0], 255, 512);
+    for (i in 0..k) {
+        int s = (int)h.size[i];
+        if (s <= 9) {
+            int c = (int)h.code[i] << (9 - s);
+            int m = 1 << (9 - s);
+            for (j in 0..m) h.fast[c + j] = (uint8)i;
+        }
+    }
+    return null;
+}
+
+// Refills the bit buffer to more than 24 bits. Byte stuffing (FF 00) is
+// undone; any other marker stops the data and zeros are shifted in from then
+// on. Zeros shifted in past the end of the input are counted in `over`.
+void _j_grow(*_Jpeg j) {
+    while (j.bits <= 24) {
+        int b = 0;
+        if (!j.nomore) {
+            if (j.pos < j.len) {
+                b = (int)j.d[j.pos];
+                j.pos++;
+                if (b == 255) {
+                    int c = 0;
+                    if (j.pos < j.len) {
+                        c = (int)j.d[j.pos];
+                        j.pos++;
+                    }
+                    while (c == 255 && j.pos < j.len) {
+                        c = (int)j.d[j.pos];
+                        j.pos++;
+                    }
+                    if (c != 0) {
+                        j.marker = c;
+                        j.nomore = true;
+                        b = 0;
+                    }
+                }
+            } else {
+                j.over++;
+            }
+        }
+        j.buf = j.buf | ((uint32)b << (24 - j.bits));
+        j.bits += 8;
+    }
+}
+
+int _j_decode(*_Jpeg j, *_JHuff h) {
+    if (j.bits < 16) _j_grow(j);
+    int k = (int)h.fast[(int)(j.buf >> 23)];
+    if (k < 255) {
+        int s = (int)h.size[k];
+        if (s > j.bits) return -1;
+        j.buf = j.buf << s;
+        j.bits -= s;
+        return (int)h.values[k];
+    }
+    uint32 temp = j.buf >> 16;
+    k = 10;
+    while (k < 17 && temp >= h.maxcode[k]) k++;
+    if (k >= 17 || k > j.bits) return -1;
+    int c = (int)(j.buf >> (32 - k)) + h.delta[k];
+    if (c < 0 || c >= 256) return -1;
+    j.buf = j.buf << k;
+    j.bits -= k;
+    return (int)h.values[c];
+}
+
+// Reads an n-bit magnitude (1..16) and extends its sign.
+int _j_receive(*_Jpeg j, int n) {
+    if (j.bits < n) _j_grow(j);
+    int v = (int)(j.buf >> (32 - n));
+    j.buf = j.buf << n;
+    j.bits -= n;
+    if (v < (1 << (n - 1))) v = v - (1 << n) + 1;
+    return v;
+}
+
+int _j_getbits(*_Jpeg j, int n) {
+    if (n == 0) return 0;
+    if (j.bits < n) _j_grow(j);
+    int v = (int)(j.buf >> (32 - n));
+    j.buf = j.buf << n;
+    j.bits -= n;
+    return v;
+}
+
+int _j_getbit(*_Jpeg j) {
+    if (j.bits < 1) _j_grow(j);
+    int v = (int)(j.buf >> 31);
+    j.buf = j.buf << 1;
+    j.bits -= 1;
+    return v;
+}
+
+void _j_reset(*_Jpeg j) {
+    j.buf = 0;
+    j.bits = 0;
+    j.nomore = false;
+    j.marker = -1;
+    j.eob_run = 0;
+    for (i in 0..4) j.comp[i].dc_pred = 0;
+    j.todo = j.restart > 0 ? j.restart : 0x7FFFFFFF;
+}
+
+// The accurate integer IDCT of libjpeg (jidctint.c) on dequantized
+// coefficients in natural order, writing 8x8 samples.
+void _j_idct(*int src, *uint8 out, int64 stride) {
+    let ws: int64[64];
+    for (c in 0..8) {
+        *int p = src + c;
+        if (p[8] == 0 && p[16] == 0 && p[24] == 0 && p[32] == 0 && p[40] == 0 && p[48] == 0 && p[56] == 0) {
+            int64 dc = (int64)p[0] << 2;
+            for (r in 0..8) ws[r * 8 + c] = dc;
+            continue;
+        }
+        int64 z2 = (int64)p[16];
+        int64 z3 = (int64)p[48];
+        int64 z1 = (z2 + z3) * 4433;
+        int64 t2 = z1 - z3 * 15137;
+        int64 t3 = z1 + z2 * 6270;
+        z2 = (int64)p[0];
+        z3 = (int64)p[32];
+        int64 t0 = (z2 + z3) << 13;
+        int64 t1 = (z2 - z3) << 13;
+        int64 t10 = t0 + t3;
+        int64 t13 = t0 - t3;
+        int64 t11 = t1 + t2;
+        int64 t12 = t1 - t2;
+        t0 = (int64)p[56];
+        t1 = (int64)p[40];
+        t2 = (int64)p[24];
+        t3 = (int64)p[8];
+        z1 = t0 + t3;
+        z2 = t1 + t2;
+        z3 = t0 + t2;
+        int64 z4 = t1 + t3;
+        int64 z5 = (z3 + z4) * 9633;
+        t0 = t0 * 2446;
+        t1 = t1 * 16819;
+        t2 = t2 * 25172;
+        t3 = t3 * 12299;
+        z1 = z1 * -7373;
+        z2 = z2 * -20995;
+        z3 = z3 * -16069 + z5;
+        z4 = z4 * -3196 + z5;
+        t0 += z1 + z3;
+        t1 += z2 + z4;
+        t2 += z2 + z3;
+        t3 += z1 + z4;
+        ws[c] = (t10 + t3 + 1024) >> 11;
+        ws[56 + c] = (t10 - t3 + 1024) >> 11;
+        ws[8 + c] = (t11 + t2 + 1024) >> 11;
+        ws[48 + c] = (t11 - t2 + 1024) >> 11;
+        ws[16 + c] = (t12 + t1 + 1024) >> 11;
+        ws[40 + c] = (t12 - t1 + 1024) >> 11;
+        ws[24 + c] = (t13 + t0 + 1024) >> 11;
+        ws[32 + c] = (t13 - t0 + 1024) >> 11;
+    }
+    for (r in 0..8) {
+        *int64 w = &ws[r * 8];
+        *uint8 o = out + (int64)r * stride;
+        int64 z2 = w[2];
+        int64 z3 = w[6];
+        int64 z1 = (z2 + z3) * 4433;
+        int64 t2 = z1 - z3 * 15137;
+        int64 t3 = z1 + z2 * 6270;
+        int64 t0 = (w[0] + w[4]) << 13;
+        int64 t1 = (w[0] - w[4]) << 13;
+        int64 t10 = t0 + t3;
+        int64 t13 = t0 - t3;
+        int64 t11 = t1 + t2;
+        int64 t12 = t1 - t2;
+        t0 = w[7];
+        t1 = w[5];
+        t2 = w[3];
+        t3 = w[1];
+        z1 = t0 + t3;
+        z2 = t1 + t2;
+        z3 = t0 + t2;
+        int64 z4 = t1 + t3;
+        int64 z5 = (z3 + z4) * 9633;
+        t0 = t0 * 2446;
+        t1 = t1 * 16819;
+        t2 = t2 * 25172;
+        t3 = t3 * 12299;
+        z1 = z1 * -7373;
+        z2 = z2 * -20995;
+        z3 = z3 * -16069 + z5;
+        z4 = z4 * -3196 + z5;
+        t0 += z1 + z3;
+        t1 += z2 + z4;
+        t2 += z2 + z3;
+        t3 += z1 + z4;
+        int64 half = 1 << 17;
+        o[0] = _j_clamp8(((t10 + t3 + half) >> 18) + 128);
+        o[7] = _j_clamp8(((t10 - t3 + half) >> 18) + 128);
+        o[1] = _j_clamp8(((t11 + t2 + half) >> 18) + 128);
+        o[6] = _j_clamp8(((t11 - t2 + half) >> 18) + 128);
+        o[2] = _j_clamp8(((t12 + t1 + half) >> 18) + 128);
+        o[5] = _j_clamp8(((t12 - t1 + half) >> 18) + 128);
+        o[3] = _j_clamp8(((t13 + t0 + half) >> 18) + 128);
+        o[4] = _j_clamp8(((t13 - t0 + half) >> 18) + 128);
+    }
+}
+
+bool _j_fail(*_Jpeg j, string msg) {
+    if (j.err == null) j.err = msg;
+    return false;
+}
+
+// One baseline block: Huffman decode, dequantize, IDCT into the plane.
+bool _j_block_base(*_Jpeg j, *_JComp c, int64 bx, int64 by) {
+    let blk: int[64];
+    *_JHuff hd = &j.hdc[c.hd];
+    *_JHuff ha = &j.hac[c.ha];
+    *uint16 q = &j.q[c.tq * 64];
+    int t = _j_decode(j, hd);
+    if (t < 0 || t > 15) return _j_fail(j, "jpeg: bad huffman code");
+    int diff = t != 0 ? _j_receive(j, t) : 0;
+    int dc = c.dc_pred + diff;
+    if (dc < -65535 || dc > 65535) return _j_fail(j, "jpeg: bad dc value");
+    c.dc_pred = dc;
+    blk[0] = _j_clamp16((int64)dc * (int64)q[0]);
+    int k = 1;
+    while (k < 64) {
+        int rs = _j_decode(j, ha);
+        if (rs < 0) return _j_fail(j, "jpeg: bad huffman code");
+        int s = rs & 15;
+        int r = rs >> 4;
+        if (s == 0) {
+            if (rs != 0xF0) break;
+            k += 16;
+        } else {
+            k += r;
+            int z = (int)_J_DEZIG[k];
+            k++;
+            blk[z] = _j_clamp16((int64)_j_receive(j, s) * (int64)q[z]);
+        }
+    }
+    int64 stride = c.bw * 8;
+    _j_idct(&blk[0], c.plane + by * 8 * stride + bx * 8, stride);
+    return true;
+}
+
+bool _j_block_dc(*_Jpeg j, *_JComp c, *int16 data) {
+    if (j.ah == 0) {
+        int t = _j_decode(j, &j.hdc[c.hd]);
+        if (t < 0 || t > 15) return _j_fail(j, "jpeg: bad huffman code");
+        int diff = t != 0 ? _j_receive(j, t) : 0;
+        int dc = c.dc_pred + diff;
+        if (dc < -65535 || dc > 65535) return _j_fail(j, "jpeg: bad dc value");
+        c.dc_pred = dc;
+        data[0] = (int16)_j_clamp16((int64)dc << j.al);
+    } else if (_j_getbit(j) != 0) {
+        data[0] = (int16)_j_clamp16((int64)data[0] + ((int64)1 << j.al));
+    }
+    return true;
+}
+
+// Moves a nonzero coefficient one bit away from zero (progressive refinement).
+void _j_refine(*int16 p, int bit) {
+    int v = (int)*p;
+    if ((v & bit) == 0) {
+        if (v > 0) *p = (int16)_j_clamp16((int64)(v + bit));
+        else *p = (int16)_j_clamp16((int64)(v - bit));
+    }
+}
+
+bool _j_block_ac(*_Jpeg j, *_JComp c, *int16 data) {
+    *_JHuff ha = &j.hac[c.ha];
+    if (j.ah == 0) {
+        if (j.eob_run > 0) {
+            j.eob_run--;
+            return true;
+        }
+        int k = j.ss;
+        while (k <= j.se) {
+            int rs = _j_decode(j, ha);
+            if (rs < 0) return _j_fail(j, "jpeg: bad huffman code");
+            int s = rs & 15;
+            int r = rs >> 4;
+            if (s == 0) {
+                if (r < 15) {
+                    j.eob_run = (1 << r) + _j_getbits(j, r) - 1;
+                    break;
+                }
+                k += 16;
+            } else {
+                k += r;
+                int z = (int)_J_DEZIG[k];
+                k++;
+                data[z] = (int16)_j_clamp16((int64)_j_receive(j, s) << j.al);
+            }
+        }
+        return true;
+    }
+    int bit = 1 << j.al;
+    if (j.eob_run > 0) {
+        j.eob_run--;
+        for (k in j.ss..j.se + 1) {
+            *int16 p = data + (int)_J_DEZIG[k];
+            if (*p != 0 && _j_getbit(j) != 0) _j_refine(p, bit);
+        }
+        return true;
+    }
+    int k = j.ss;
+    while (k <= j.se) {
+        int rs = _j_decode(j, ha);
+        if (rs < 0) return _j_fail(j, "jpeg: bad huffman code");
+        int s = rs & 15;
+        int r = rs >> 4;
+        int val = 0;
+        if (s == 0) {
+            if (r < 15) {
+                j.eob_run = (1 << r) - 1 + _j_getbits(j, r);
+                r = 64;
+            }
+        } else {
+            if (s != 1) return _j_fail(j, "jpeg: bad huffman code");
+            val = _j_getbit(j) != 0 ? bit : -bit;
+        }
+        while (k <= j.se) {
+            *int16 p = data + (int)_J_DEZIG[k];
+            k++;
+            if (*p != 0) {
+                if (_j_getbit(j) != 0) _j_refine(p, bit);
+            } else {
+                if (r == 0) {
+                    *p = (int16)val;
+                    break;
+                }
+                r--;
+            }
+        }
+    }
+    return true;
+}
+
+bool _j_block(*_Jpeg j, *_JComp c, int64 bx, int64 by) {
+    if (!j.progressive) return _j_block_base(j, c, bx, by);
+    *int16 data = c.coef + (by * c.bw + bx) * 64;
+    if (j.ss == 0) return _j_block_dc(j, c, data);
+    return _j_block_ac(j, c, data);
+}
+
+// After each MCU: count down the restart interval and resynchronize at the
+// restart marker. Returns false when the scan should stop.
+bool _j_after_mcu(*_Jpeg j) {
+    j.todo--;
+    if (j.todo > 0) return true;
+    if (j.bits < 24) _j_grow(j);
+    if (j.marker < 0xD0 || j.marker > 0xD7) return false;
+    _j_reset(j);
+    return true;
+}
+
+string _j_scan(*_Jpeg j) {
+    _j_reset(j);
+    if (j.scan_n == 1) {
+        *_JComp c = &j.comp[j.order[0]];
+        int64 bw = (c.x + 7) / 8;
+        int64 bh = (c.y + 7) / 8;
+        for (by in 0..bh) {
+            for (bx in 0..bw) {
+                if (!_j_block(j, c, bx, by)) return j.err;
+                if (!_j_after_mcu(j)) return null;
+            }
+            if (j.over > 0) return "jpeg: truncated";
+        }
+        return null;
+    }
+    for (my in 0..j.mcuy) {
+        for (mx in 0..j.mcux) {
+            for (n in 0..j.scan_n) {
+                *_JComp c = &j.comp[j.order[n]];
+                for (v in 0..c.v) {
+                    for (u in 0..c.h) {
+                        if (!_j_block(j, c, mx * (int64)c.h + (int64)u, my * (int64)c.v + (int64)v)) return j.err;
+                    }
+                }
+            }
+            if (!_j_after_mcu(j)) return null;
+        }
+        if (j.over > 0) return "jpeg: truncated";
+    }
+    return null;
+}
+
+// Progressive images: dequantize and transform every block once all scans
+// are in.
+string _j_finish(*_Jpeg j) {
+    let blk: int[64];
+    for (n in 0..j.nc) {
+        *_JComp c = &j.comp[n];
+        if (!j.qdef[c.tq]) return "jpeg: missing quantization table";
+        *uint16 q = &j.q[c.tq * 64];
+        int64 stride = c.bw * 8;
+        for (by in 0..c.bh) {
+            for (bx in 0..c.bw) {
+                *int16 data = c.coef + (by * c.bw + bx) * 64;
+                for (i in 0..64) blk[i] = _j_clamp16((int64)data[i] * (int64)q[i]);
+                _j_idct(&blk[0], c.plane + by * 8 * stride + bx * 8, stride);
+            }
+        }
+    }
+    return null;
+}
+
+string _j_sof(*_Jpeg j, *uint8 s, int n, int kind) {
+    if (j.sof) return "jpeg: multiple frames";
+    if (kind == 0xC3 || kind == 0xC7 || kind == 0xCB || kind == 0xCF) return "jpeg: lossless not supported";
+    if (kind >= 0xC9) return "jpeg: arithmetic coding not supported";
+    if (kind != 0xC0 && kind != 0xC1 && kind != 0xC2) return "jpeg: hierarchical not supported";
+    if (n < 6) return "jpeg: bad SOF";
+    if (s[0] != 8) return "jpeg: only 8-bit precision supported";
+    j.h = (int64)_j_be16(s + 1);
+    j.w = (int64)_j_be16(s + 3);
+    j.nc = (int)s[5];
+    if (j.h == 0) return "jpeg: DNL height not supported";
+    if (j.w == 0) return "jpeg: bad size";
+    if (j.w * j.h > 0x10000000) return "jpeg: image too large";
+    if (j.nc == 4) return "jpeg: cmyk not supported";
+    if (j.nc != 1 && j.nc != 3) return "jpeg: bad component count";
+    if (n != 6 + 3 * j.nc) return "jpeg: bad SOF";
+    j.progressive = kind == 0xC2;
+    j.hmax = 1;
+    j.vmax = 1;
+    for (i in 0..j.nc) {
+        *_JComp c = &j.comp[i];
+        *uint8 p = s + 6 + i * 3;
+        c.id = (int)p[0];
+        c.h = (int)p[1] >> 4;
+        c.v = (int)p[1] & 15;
+        c.tq = (int)p[2];
+        if (c.h < 1 || c.h > 4 || c.v < 1 || c.v > 4) return "jpeg: bad sampling factors";
+        if (c.tq > 3) return "jpeg: bad quantization table id";
+        for (k in 0..i) {
+            if (j.comp[k].id == c.id) return "jpeg: duplicate component id";
+        }
+        if (c.h > j.hmax) j.hmax = c.h;
+        if (c.v > j.vmax) j.vmax = c.v;
+    }
+    j.mcux = (j.w + (int64)(8 * j.hmax) - 1) / (int64)(8 * j.hmax);
+    j.mcuy = (j.h + (int64)(8 * j.vmax) - 1) / (int64)(8 * j.vmax);
+    for (i in 0..j.nc) {
+        *_JComp c = &j.comp[i];
+        if (j.hmax % c.h != 0 || j.vmax % c.v != 0) return "jpeg: unsupported sampling factors";
+        c.bw = j.mcux * (int64)c.h;
+        c.bh = j.mcuy * (int64)c.v;
+        c.x = (j.w * (int64)c.h + (int64)j.hmax - 1) / (int64)j.hmax;
+        c.y = (j.h * (int64)c.v + (int64)j.vmax - 1) / (int64)j.vmax;
+        c.plane = alloc<uint8>(c.bw * c.bh * 64);
+        if (c.plane == null) return "jpeg: out of memory";
+        if (j.progressive) {
+            c.coef = alloc<int16>(c.bw * c.bh * 64);
+            if (c.coef == null) return "jpeg: out of memory";
+        }
+    }
+    j.sof = true;
+    return null;
+}
+
+string _j_sos(*_Jpeg j, *uint8 s, int n) {
+    if (!j.sof) return "jpeg: scan before frame header";
+    if (n < 1) return "jpeg: bad SOS";
+    int ns = (int)s[0];
+    if (ns < 1 || ns > 4 || ns > j.nc || n != 4 + 2 * ns) return "jpeg: bad SOS";
+    j.scan_n = ns;
+    for (i in 0..ns) {
+        int id = (int)s[1 + i * 2];
+        int tb = (int)s[2 + i * 2];
+        int found = -1;
+        for (k in 0..j.nc) {
+            if (j.comp[k].id == id) found = k;
+        }
+        if (found < 0) return "jpeg: bad SOS component";
+        for (k in 0..i) {
+            if (j.order[k] == found) return "jpeg: bad SOS component";
+        }
+        j.order[i] = found;
+        j.comp[found].hd = tb >> 4;
+        j.comp[found].ha = tb & 15;
+        if (tb >> 4 > 3 || (tb & 15) > 3) return "jpeg: bad huffman table id";
+    }
+    *uint8 p = s + 1 + ns * 2;
+    j.ss = (int)p[0];
+    j.se = (int)p[1];
+    j.ah = (int)p[2] >> 4;
+    j.al = (int)p[2] & 15;
+    if (j.progressive) {
+        if (j.ss > 63 || j.se > 63 || j.ss > j.se || j.ah > 13 || j.al > 13) return "jpeg: bad SOS";
+        if (j.ss == 0 && j.se != 0) return "jpeg: bad SOS";
+        if (j.ss > 0 && ns != 1) return "jpeg: bad SOS";
+    } else {
+        if (j.ss != 0 || j.ah != 0 || j.al != 0) return "jpeg: bad SOS";
+        j.se = 63;
+    }
+    for (i in 0..ns) {
+        *_JComp c = &j.comp[j.order[i]];
+        bool need_dc = !j.progressive || (j.ss == 0 && j.ah == 0);
+        bool need_ac = !j.progressive || j.ss > 0;
+        if (need_dc && !j.hdef[c.hd]) return "jpeg: missing huffman table";
+        if (need_ac && !j.hdef[4 + c.ha]) return "jpeg: missing huffman table";
+        if (!j.progressive && !j.qdef[c.tq]) return "jpeg: missing quantization table";
+    }
+    return null;
+}
+
+string _j_dht(*_Jpeg j, *uint8 s, int n) {
+    let count: int[16];
+    int p = 0;
+    while (p < n) {
+        if (n - p < 17) return "jpeg: bad DHT";
+        int tc = (int)s[p] >> 4;
+        int th = (int)s[p] & 15;
+        if (tc > 1 || th > 3) return "jpeg: bad DHT";
+        int total = 0;
+        for (i in 0..16) {
+            count[i] = (int)s[p + 1 + i];
+            total += count[i];
+        }
+        p += 17;
+        if (total > 256 || n - p < total) return "jpeg: bad DHT";
+        *_JHuff h = tc == 0 ? &j.hdc[th] : &j.hac[th];
+        string e = _j_build(h, &count[0]);
+        if (e != null) return e;
+        memset((*void)&h.values[0], 0, 256);
+        memcpy((*void)&h.values[0], (*void)(s + p), (int64)total);
+        j.hdef[tc * 4 + th] = true;
+        p += total;
+    }
+    return null;
+}
+
+string _j_dqt(*_Jpeg j, *uint8 s, int n) {
+    int p = 0;
+    while (p < n) {
+        int pq = (int)s[p] >> 4;
+        int tq = (int)s[p] & 15;
+        if (pq > 1 || tq > 3) return "jpeg: bad DQT";
+        int need = pq == 0 ? 64 : 128;
+        if (n - p - 1 < need) return "jpeg: bad DQT";
+        p++;
+        for (i in 0..64) {
+            int v = pq == 0 ? (int)s[p + i] : _j_be16(s + p + i * 2);
+            j.q[tq * 64 + (int)_J_DEZIG[i]] = (uint16)v;
+        }
+        j.qdef[tq] = true;
+        p += need;
+    }
+    return null;
+}
+
+// Reads the next marker code: one already met by the entropy decoder, or FF
+// (plus fill bytes) and a code at the read position. -1 at the end of data,
+// -2 when something else is there.
+int _j_next_marker(*_Jpeg j) {
+    if (j.marker >= 0) {
+        int m = j.marker;
+        j.marker = -1;
+        return m;
+    }
+    if (j.pos >= j.len) return -1;
+    if ((int)j.d[j.pos] != 255) return -2;
+    while (j.pos < j.len && (int)j.d[j.pos] == 255) j.pos++;
+    if (j.pos >= j.len) return -1;
+    int m = (int)j.d[j.pos];
+    j.pos++;
+    return m;
+}
+
+// After a scan whose end marker was not reached: skips to the next marker
+// that is not a restart.
+void _j_skip_junk(*_Jpeg j) {
+    while (j.pos + 1 < j.len) {
+        if ((int)j.d[j.pos] == 255) {
+            int c = (int)j.d[j.pos + 1];
+            if (c != 0 && c != 255 && (c < 0xD0 || c > 0xD7)) {
+                j.marker = c;
+                j.pos += 2;
+                return;
+            }
+            if (c == 255) {
+                j.pos++;
+                continue;
+            }
+            j.pos += 2;
+            continue;
+        }
+        j.pos++;
+    }
+    j.pos = j.len;
+}
+
+string _j_parse(*_Jpeg j) {
+    if (j.len < 4 || (int)j.d[0] != 255 || (int)j.d[1] != 0xD8) return "jpeg: bad signature";
+    j.pos = 2;
+    j.marker = -1;
+    j.adobe = -1;
+    while (true) {
+        int m = _j_next_marker(j);
+        if (m == -1) return "jpeg: truncated";
+        if (m == -2) return "jpeg: expected marker";
+        if (m == 0xD9) break;
+        if ((m >= 0xD0 && m <= 0xD7) || m == 1 || m == 0xD8) continue;
+        if (j.len - j.pos < 2) return "jpeg: truncated";
+        int seg = _j_be16(j.d + j.pos);
+        if (seg < 2) return "jpeg: bad segment length";
+        if (j.len - j.pos < (uint64)seg) return "jpeg: truncated";
+        *uint8 s = j.d + j.pos + 2;
+        int n = seg - 2;
+        j.pos += (uint64)seg;
+        string e = null;
+        if (m == 0xC4) {
+            e = _j_dht(j, s, n);
+        } else if (m == 0xDB) {
+            e = _j_dqt(j, s, n);
+        } else if (m == 0xDD) {
+            if (n != 2) return "jpeg: bad DRI";
+            j.restart = _j_be16(s);
+        } else if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            e = _j_sof(j, s, n, m);
+        } else if (m == 0xDA) {
+            e = _j_sos(j, s, n);
+            if (e == null) e = _j_scan(j);
+            if (e == null && j.over > 0) e = "jpeg: truncated";
+            if (e != null) return e;
+            j.scanned = true;
+            if (j.marker < 0) _j_skip_junk(j);
+        } else if (m == 0xEE) {
+            if (n >= 12 && memcmp((*void)s, (*void)"Adobe", 5) == 0) j.adobe = (int)s[11];
+        } else if (m == 0xE0) {
+            if (n >= 5 && memcmp((*void)s, (*void)"JFIF", 5) == 0) j.jfif = true;
+        }
+        if (e != null) return e;
+    }
+    if (!j.sof || !j.scanned) return "jpeg: no image data";
+    if (j.progressive) return _j_finish(j);
+    return null;
+}
+
+// Expands a component to the full image size into out (w*h bytes), the way
+// libjpeg's default upsampler does.
+void _j_upsample(*_Jpeg j, *_JComp c, *uint8 out, *int tmp) {
+    int64 hs = (int64)(j.hmax / c.h);
+    int64 vs = (int64)(j.vmax / c.v);
+    int64 stride = c.bw * 8;
+    int64 dw = c.x;
+    int64 dh = c.y;
+    int64 w = j.w;
+    *uint8 pl = c.plane;
+    for (y in 0..j.h) {
+        *uint8 o = out + y * w;
+        if (hs == 1 && vs == 2) {
+            int64 r = y / 2;
+            bool top = (y & 1) == 0;
+            int64 r1 = top ? (r > 0 ? r - 1 : 0) : (r + 1 < dh ? r + 1 : dh - 1);
+            int bias = top ? 1 : 2;
+            *uint8 s0 = pl + r * stride;
+            *uint8 s1 = pl + r1 * stride;
+            for (x in 0..w) o[x] = (uint8)(((int)s0[x] * 3 + (int)s1[x] + bias) >> 2);
+        } else if (hs == 2 && vs == 1 && dw > 2) {
+            *uint8 s = pl + y * stride;
+            for (i in 0..dw) tmp[i] = (int)s[i];
+            _j_fancy_row(tmp, dw, o, w, false);
+        } else if (hs == 2 && vs == 2 && dw > 2) {
+            int64 r = y / 2;
+            bool top = (y & 1) == 0;
+            int64 r1 = top ? (r > 0 ? r - 1 : 0) : (r + 1 < dh ? r + 1 : dh - 1);
+            *uint8 s0 = pl + r * stride;
+            *uint8 s1 = pl + r1 * stride;
+            for (i in 0..dw) tmp[i] = (int)s0[i] * 3 + (int)s1[i];
+            _j_fancy_row(tmp, dw, o, w, true);
+        } else {
+            *uint8 s = pl + (y / vs) * stride;
+            if (hs == 1) memcpy((*void)o, (*void)s, w);
+            else for (x in 0..w) o[x] = s[x / hs];
+        }
+    }
+}
+
+// One row of libjpeg's horizontal triangle filter over n >= 3 inputs, keeping
+// the first w outputs. With v2 the inputs are column sums 3*near+far of two
+// rows (h2v2), otherwise plain samples (h2v1).
+void _j_fancy_row(*int s, int64 n, *uint8 o, int64 w, bool v2) {
+    for (i in 0..n) {
+        int64 x = i * 2;
+        int cur = s[i] * 3;
+        int a = 0;
+        int b = 0;
+        if (v2) {
+            a = i == 0 ? (s[0] * 4 + 8) >> 4 : (cur + s[i - 1] + 8) >> 4;
+            b = i + 1 == n ? (s[i] * 4 + 7) >> 4 : (cur + s[i + 1] + 7) >> 4;
+        } else {
+            a = i == 0 ? s[0] : (cur + s[i - 1] + 1) >> 2;
+            b = i + 1 == n ? s[i] : (cur + s[i + 1] + 2) >> 2;
+        }
+        if (x < w) o[x] = (uint8)a;
+        if (x + 1 < w) o[x + 1] = (uint8)b;
+    }
+}
+
+void _j_free3(**uint8 p) {
+    for (i in 0..3) {
+        if (p[i] != null) free((*void)p[i]);
+    }
+}
+
+void _j_release(*_Jpeg j) {
+    for (i in 0..4) {
+        if (j.comp[i].plane != null) free((*void)j.comp[i].plane);
+        if (j.comp[i].coef != null) free((*void)j.comp[i].coef);
+    }
+    free((*void)j);
+}
+
+// Decodes a JPEG held in memory. The pixels are RGBA8 with alpha 255.
+Result<Image, string> jpeg_decode(*uint8 data, uint64 len) {
+    if (data == null) return Err<Image, string>("jpeg: bad signature");
+    *_Jpeg j = alloc<_Jpeg>(1);
+    if (j == null) return Err<Image, string>("jpeg: out of memory");
+    defer _j_release(j);
+    j.d = data;
+    j.len = len;
+    string e = _j_parse(j);
+    if (e != null) return Err<Image, string>(e);
+
+    int64 w = j.w;
+    int64 h = j.h;
+    let full: *uint8[3];
+    defer _j_free3(&full[0]);
+    *int tmp = alloc<int>(w + 64);
+    if (tmp == null) return Err<Image, string>("jpeg: out of memory");
+    defer free((*void)tmp);
+    for (i in 0..j.nc) {
+        full[i] = alloc<uint8>(w * h);
+        if (full[i] == null) return Err<Image, string>("jpeg: out of memory");
+        _j_upsample(j, &j.comp[i], full[i], tmp);
+    }
+    *uint8 rgba = alloc<uint8>(w * h * 4);
+    if (rgba == null) return Err<Image, string>("jpeg: out of memory");
+    bool rgb = false;
+    if (j.nc == 3 && !j.jfif) {
+        if (j.adobe == 0) rgb = true;
+        if (j.adobe < 0 && j.comp[0].id == 82 && j.comp[1].id == 71 && j.comp[2].id == 66) rgb = true;
+    }
+    int64 total = w * h;
+    if (j.nc == 1) {
+        *uint8 g = full[0];
+        for (i in 0..total) {
+            *uint8 o = rgba + i * 4;
+            o[0] = g[i];
+            o[1] = g[i];
+            o[2] = g[i];
+            o[3] = 255;
+        }
+    } else if (rgb) {
+        for (i in 0..total) {
+            *uint8 o = rgba + i * 4;
+            o[0] = full[0][i];
+            o[1] = full[1][i];
+            o[2] = full[2][i];
+            o[3] = 255;
+        }
+    } else {
+        *uint8 py = full[0];
+        *uint8 pb = full[1];
+        *uint8 pr = full[2];
+        for (i in 0..total) {
+            int yy = (int)py[i];
+            int cb = (int)pb[i] - 128;
+            int cr = (int)pr[i] - 128;
+            *uint8 o = rgba + i * 4;
+            o[0] = _j_clamp8((int64)(yy + ((91881 * cr + 32768) >> 16)));
+            o[1] = _j_clamp8((int64)(yy + ((32768 - 22554 * cb - 46802 * cr) >> 16)));
+            o[2] = _j_clamp8((int64)(yy + ((116130 * cb + 32768) >> 16)));
+            o[3] = 255;
+        }
+    }
+    return Ok<Image, string>(Image{(uint32)w, (uint32)h, rgba});
+}

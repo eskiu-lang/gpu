@@ -1,0 +1,145 @@
+// PNG decoding against the expected pixels in tests/data/*.rgba (written by
+// tools/gen_test_images.py), plus truncated and corrupted inputs that must be
+// rejected or decoded without a crash.
+import <io>;
+import <libc>;
+import <mem>;
+import <fs>;
+import <result>;
+import <gpu/image>;
+import <gpu/inflate>;
+
+int fails = 0;
+
+const int NCASES = 53;
+const string[53] CASES = {
+    "g1", "g2", "g4", "g8", "g16", "g2_trns", "g16_trns",
+    "rgb8", "rgb8_trns", "ga8", "rgba8", "rgb16", "rgb16_trns", "ga16", "rgba16",
+    "p1", "p2", "p4", "p8", "p8_trns",
+    "i_g1", "i_g2", "i_g4", "i_g8", "i_g16", "i_g2_trns", "i_g16_trns",
+    "i_rgb8", "i_rgb8_trns", "i_ga8", "i_rgba8", "i_rgb16", "i_rgb16_trns", "i_ga16", "i_rgba16",
+    "i_p1", "i_p2", "i_p4", "i_p8", "i_p8_trns",
+    "rgba8_stored", "rgb8_fixed", "rgb8_split", "i_1x1", "i_3x2", "g1_wide",
+    "g8", "rgba8", "p8_trns", "i_rgba16", "rgb8_split", "rgba8_stored", "i_p1"
+};
+
+*uint8 load(string path, *int64 n) {
+    *uint8 d = fs_read_all(path, n);
+    if (d == null) {
+        printf("FAIL cannot read %s\n", path);
+        fails++;
+    }
+    return d;
+}
+
+void check(string name) {
+    let png: char[128];
+    let raw: char[128];
+    snprintf(&png[0], 128, "tests/data/%s.png", name);
+    snprintf(&raw[0], 128, "tests/data/%s.rgba", name);
+    int64 n = 0;
+    int64 rn = 0;
+    *uint8 d = load((string)&png[0], &n);
+    *uint8 want = load((string)&raw[0], &rn);
+    if (d == null || want == null) return;
+    defer free((*void)d);
+    defer free((*void)want);
+    Result<Image, string> r = image_decode(d, (uint64)n);
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+        return;
+    }
+    Image img = r.value;
+    defer img.free();
+    if ((int64)img.width * (int64)img.height * 4 != rn) {
+        printf("FAIL %s: size %ux%u\n", name, img.width, img.height);
+        fails++;
+        return;
+    }
+    if (memcmp((*void)img.rgba, (*void)want, rn) != 0) {
+        for (i in 0..rn) {
+            if (img.rgba[i] != want[i]) {
+                printf("FAIL %s: byte %lld is %d, want %d\n", name, i, (int)img.rgba[i], (int)want[i]);
+                break;
+            }
+        }
+        fails++;
+    }
+}
+
+// Every prefix of a few lengths must fail cleanly, and flipped bytes must
+// either fail or give an image of the right size.
+void abuse(string name) {
+    let png: char[128];
+    snprintf(&png[0], 128, "tests/data/%s.png", name);
+    int64 n = 0;
+    *uint8 d = load((string)&png[0], &n);
+    if (d == null) return;
+    defer free((*void)d);
+    *uint8 buf = alloc<uint8>(n);
+    defer free((*void)buf);
+    for (cut in 0..n) {
+        memcpy((*void)buf, (*void)d, cut);
+        Result<Image, string> r = png_decode(buf, (uint64)cut);
+        if (r.ok) {
+            printf("FAIL %s: truncated at %lld decoded\n", name, cut);
+            fails++;
+            Image img = r.value;
+            img.free();
+        }
+    }
+    uint32 seed = 12345;
+    for (k in 0..400) {
+        memcpy((*void)buf, (*void)d, n);
+        for (f in 0..1 + k % 3) {
+            seed = seed * 1103515245 + 12345;
+            int64 at = (int64)((seed >> 8) % (uint32)n);
+            seed = seed * 1103515245 + 12345;
+            buf[at] = (uint8)((int)buf[at] ^ (int)(1 + (seed >> 16) % 255));
+        }
+        Result<Image, string> r = png_decode(buf, (uint64)n);
+        if (r.ok) {
+            Image img = r.value;
+            img.free();
+        }
+    }
+}
+
+// Raw inflate of corrupted data with the CRC out of the way.
+void abuse_inflate() {
+    int64 n = 0;
+    *uint8 d = load("tests/data/rgb8_split.png", &n);
+    if (d == null) return;
+    defer free((*void)d);
+    *uint8 out = alloc<uint8>(70000);
+    defer free((*void)out);
+    uint32 seed = 99;
+    for (k in 0..3000) {
+        *uint8 buf = alloc<uint8>(n);
+        memcpy((*void)buf, (*void)d, n);
+        seed = seed * 1103515245 + 12345;
+        int64 at = 33 + (int64)((seed >> 8) % (uint32)(n - 33));
+        buf[at] = (uint8)((int)buf[at] ^ (int)(1 + (seed >> 16) % 255));
+        (void)inflate_raw(buf + 33, (uint64)(n - 33), out, (uint64)(k * 23 % 70000));
+        free((*void)buf);
+    }
+}
+
+int main() {
+    for (i in 0..NCASES) check(CASES[i]);
+    abuse("rgb8");
+    abuse("i_p4");
+    abuse("rgba8_stored");
+    abuse("rgb8_fixed");
+    abuse_inflate();
+    Result<Image, string> r = image_decode((*uint8)"GIF89a....", 10);
+    if (r.ok) {
+        printf("FAIL unknown format accepted\n");
+        fails++;
+    }
+    Result<Image, string> missing = image_load("tests/data/does_not_exist.png");
+    if (missing.ok) fails++;
+    if (fails == 0) printf("image_png: ok\n");
+    return fails == 0 ? 0 : 1;
+}

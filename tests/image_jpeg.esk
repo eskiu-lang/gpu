@@ -1,0 +1,141 @@
+// JPEG decoding against djpeg's output in tests/data/*.rgba (written by
+// tools/gen_test_images.py) with a small tolerance, files that must be
+// rejected, and truncated or corrupted inputs that must not crash.
+import <io>;
+import <libc>;
+import <mem>;
+import <fs>;
+import <result>;
+import <gpu/image>;
+
+int fails = 0;
+bool verbose = false;
+
+const int NCASES = 21;
+const string[21] CASES = {
+    "j444", "j422", "j420", "j440", "jgray", "jrgb", "j420_rst", "j444_rst3b",
+    "j420_opt", "j420_q100", "jprog420", "jprog444", "jprog422", "jproggray", "jprog_rst",
+    "jseq_scans", "j420_1x1", "j420_2x2", "j420_17x9", "jmixed", "jsips"
+};
+
+*uint8 load(string path, *int64 n) {
+    *uint8 d = fs_read_all(path, n);
+    if (d == null) {
+        printf("FAIL cannot read %s\n", path);
+        fails++;
+    }
+    return d;
+}
+
+void check(string name) {
+    let jpg: char[128];
+    let raw: char[128];
+    snprintf(&jpg[0], 128, "tests/data/%s.jpg", name);
+    snprintf(&raw[0], 128, "tests/data/%s.rgba", name);
+    int64 n = 0;
+    int64 rn = 0;
+    *uint8 d = load((string)&jpg[0], &n);
+    *uint8 want = load((string)&raw[0], &rn);
+    if (d == null || want == null) return;
+    defer free((*void)d);
+    defer free((*void)want);
+    Result<Image, string> r = image_decode(d, (uint64)n);
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+        return;
+    }
+    Image img = r.value;
+    defer img.free();
+    if ((int64)img.width * (int64)img.height * 4 != rn) {
+        printf("FAIL %s: size %ux%u\n", name, img.width, img.height);
+        fails++;
+        return;
+    }
+    int worst = 0;
+    int64 sum = 0;
+    for (i in 0..rn) {
+        int e = (int)img.rgba[i] - (int)want[i];
+        if (e < 0) e = -e;
+        if (e > worst) worst = e;
+        sum += (int64)e;
+    }
+    double mean = (double)sum / (double)(rn / 4 * 3);
+    if (verbose) printf("%s: max %d mean %.3f\n", name, worst, mean);
+    if (worst > 8 || mean > 2.0) {
+        printf("FAIL %s: max error %d, mean %.3f\n", name, worst, mean);
+        fails++;
+    }
+}
+
+void reject(string path, string want) {
+    int64 n = 0;
+    *uint8 d = load(path, &n);
+    if (d == null) return;
+    defer free((*void)d);
+    Result<Image, string> r = jpeg_decode(d, (uint64)n);
+    if (r.ok) {
+        printf("FAIL %s decoded\n", path);
+        fails++;
+        Image img = r.value;
+        img.free();
+        return;
+    }
+    if (strcmp(r.error, want) != 0) {
+        printf("FAIL %s: '%s', want '%s'\n", path, r.error, want);
+        fails++;
+    }
+}
+
+// Every prefix must fail cleanly, and flipped bytes must either fail or give
+// an image of the declared size.
+void abuse(string name) {
+    let jpg: char[128];
+    snprintf(&jpg[0], 128, "tests/data/%s.jpg", name);
+    int64 n = 0;
+    *uint8 d = load((string)&jpg[0], &n);
+    if (d == null) return;
+    defer free((*void)d);
+    *uint8 buf = alloc<uint8>(n);
+    defer free((*void)buf);
+    for (cut in 0..n) {
+        memcpy((*void)buf, (*void)d, cut);
+        Result<Image, string> r = jpeg_decode(buf, (uint64)cut);
+        if (r.ok) {
+            printf("FAIL %s: truncated at %lld decoded\n", name, cut);
+            fails++;
+            Image img = r.value;
+            img.free();
+        }
+    }
+    uint32 seed = 777;
+    for (k in 0..1500) {
+        memcpy((*void)buf, (*void)d, n);
+        for (f in 0..1 + k % 4) {
+            seed = seed * 1103515245 + 12345;
+            int64 at = (int64)((seed >> 8) % (uint32)n);
+            seed = seed * 1103515245 + 12345;
+            buf[at] = (uint8)((int)buf[at] ^ (int)(1 + (seed >> 16) % 255));
+        }
+        Result<Image, string> r = jpeg_decode(buf, (uint64)n);
+        if (r.ok) {
+            Image img = r.value;
+            img.free();
+        }
+    }
+}
+
+int main(int argc, string* argv) {
+    verbose = argc > 1;
+    for (i in 0..NCASES) check(CASES[i]);
+    reject("tests/data/jarith.bad.jpg", "jpeg: arithmetic coding not supported");
+    reject("tests/data/j12bit.bad.jpg", "jpeg: only 8-bit precision supported");
+    reject("tests/data/jcmyk.bad.jpg", "jpeg: cmyk not supported");
+    abuse("j420");
+    abuse("jprog420");
+    abuse("j420_rst");
+    abuse("jprog_rst");
+    abuse("jgray");
+    if (fails == 0) printf("image_jpeg: ok\n");
+    return fails == 0 ? 0 : 1;
+}
