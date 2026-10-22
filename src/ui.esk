@@ -1,0 +1,112 @@
+// ui.esk: GpuView for eskiu-lang/ui apps on iOS (CAMetalLayer) and Android
+// (SurfaceView / ANativeWindow). Import <gpu/ui> alongside <ui> and <gpu>:
+//
+//     use_gpu_surface(void(uint32 w, uint32 h) {
+//         ...
+//     });
+//     GpuView(Style{flex_grow: 1});
+//
+// Once GpuView has laid out (use_gpu_surface fires with its pixel size), call
+// gpu_ui_surface(&gpu) to create and configure a GpuSurface for it.
+
+import <mem>;
+import <result>;
+import <string>;
+import <ui>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+extern *void gpu_ui_native_handle(*int width, *int height);
+#else
+*void gpu_ui_native_handle(*int width, *int height) {
+    *width = 0;
+    *height = 0;
+    return null;
+}
+#endif
+
+// Parses "resize WIDTH HEIGHT" from the "gpu" native channel.
+bool _gpu_ui_parse_resize(string payload, *uint32 width, *uint32 height) {
+    if (payload == null || strncmp(payload, "resize ", 7) != 0) return false;
+    int at = 7;
+    uint32 w = 0;
+    while (payload[at] >= '0' && payload[at] <= '9') {
+        w = w * 10 + (uint32)(payload[at] - '0');
+        at++;
+    }
+    if (at == 7 || payload[at] != ' ') return false;
+    at++;
+    uint32 h = 0;
+    int hstart = at;
+    while (payload[at] >= '0' && payload[at] <= '9') {
+        h = h * 10 + (uint32)(payload[at] - '0');
+        at++;
+    }
+    if (at == hstart || w == 0 || h == 0) return false;
+    *width = w;
+    *height = h;
+    return true;
+}
+
+struct _GpuSurfaceHandler {
+    fn(uint32, uint32)->void handler;
+}
+
+void _gpu_ui_release_handler(escaping fn(uint32, uint32)->void handler) {
+    free_closure(handler);
+}
+
+// Calls on_resize(width, height) in physical pixels whenever the mounted
+// GpuView's native surface becomes ready or changes size.
+void use_gpu_surface(escaping fn(uint32, uint32)->void on_resize) {
+    static int tag;
+    *Slot slot = ui_slot(10, &tag);
+    *_GpuSurfaceHandler held = (*_GpuSurfaceHandler)slot.data;
+    if (held == null) {
+        held = alloc<_GpuSurfaceHandler>(1);
+        slot.data = held;
+        slot.dispose = void() {
+            _gpu_ui_release_handler(held.handler);
+            free(held);
+        };
+    } else {
+        _gpu_ui_release_handler(held.handler);
+    }
+    held.handler = on_resize;
+    use_native_event("gpu", void(string payload) {
+        uint32 w = 0;
+        uint32 h = 0;
+        if (_gpu_ui_parse_resize(payload, &w, &h)) {
+            held.handler(w, h);
+        }
+    });
+}
+
+// Mounts a native GPU surface view (CAMetalLayer on iOS, SurfaceView on
+// Android) filling the box layout gives it.
+void GpuView(Style style) {
+    NativeView(style, "gpu", void(string name, string payload) {});
+}
+
+// Creates and configures a GpuSurface for the currently mounted GpuView.
+Result<GpuSurface, string> gpu_ui_surface(*Gpu gpu) {
+    int w = 0;
+    int h = 0;
+    *void handle = gpu_ui_native_handle(&w, &h);
+    if (handle == null || w <= 0 || h <= 0) {
+        return Err<GpuSurface, string>("gpu/ui: GpuView surface is not ready");
+    }
+#ifdef TARGET_OS_IPHONE
+    GpuSurface s = gpu.surface_metal(handle)?;
+    s.configure((uint32)w, (uint32)h);
+    return Ok<GpuSurface, string>(s);
+#elif defined(__ANDROID__)
+    GpuSurface s = gpu.surface_android(handle)?;
+    s.configure((uint32)w, (uint32)h);
+    return Ok<GpuSurface, string>(s);
+#else
+    return Err<GpuSurface, string>("gpu/ui: GpuView runs on iOS and Android");
+#endif
+}

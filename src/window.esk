@@ -20,6 +20,10 @@ import <gpu/raw>;
 import <gpu/core>;
 import <gpu/render>;
 
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+#error "gpu/window: SDL3 desktop windows run on macOS, Linux and Windows; on iOS and Android use <gpu/ui> or Gpu_surface_metal / Gpu_surface_android"
+#endif
+
 #pragma link("SDL3")
 
 extern bool SDL_Init(uint32 flags);

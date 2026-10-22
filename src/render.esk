@@ -507,6 +507,12 @@ Result<GpuSurface, string> Gpu_surface_win32(*Gpu self, *void hinstance, *void h
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
 }
 
+// A surface over an Android ANativeWindow*.
+Result<GpuSurface, string> Gpu_surface_android(*Gpu self, *void window) {
+    WGPUSurfaceSourceAndroidNativeWindow src = WGPUSurfaceSourceAndroidNativeWindow{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceAndroidNativeWindow}, window: window};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+}
+
 // Sets the size of the surface's frames, in pixels; call it again when the
 // window is resized.
 void GpuSurface_configure(*GpuSurface self, uint32 width, uint32 height) {

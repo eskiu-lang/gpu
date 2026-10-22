@@ -22,8 +22,9 @@
 ---
 
 `gpu` is an Eskiu package for running compute kernels and drawing on the GPU. It is built
-on [wgpu-native](https://github.com/gfx-rs/wgpu-native), so one API runs on Metal (macOS),
-Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
+on [wgpu-native](https://github.com/gfx-rs/wgpu-native), so one API runs on Metal (macOS
+and iOS), Vulkan (Linux and Android) and DirectX 12 (Windows), and shaders are written in
+WGSL.
 
 - **Compute.** Storage buffers, kernels and dispatches, with results read back into
   Eskiu memory.
@@ -37,8 +38,9 @@ Vulkan (Linux) and DirectX 12 (Windows), and shaders are written in WGSL.
   networks with automatic differentiation and Adam.
 - **Images.** `<gpu/image>` decodes PNG and JPEG (baseline and progressive) in pure Eskiu;
   textures can be sRGB and mipmapped.
-- **Windows and input.** `<gpu/window>` opens a window over SDL3 and gives its surface
-  and its keyboard and mouse events.
+- **Windows, mobile views and input.** `<gpu/window>` opens a desktop window over SDL3 and
+  gives its surface and keyboard/mouse events; `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer`
+  on iOS, `SurfaceView` on Android) inside an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app.
 - **Errors as `Result`.** Every call that can fail returns one, with the message from the
   WebGPU validation layer; a WGSL error comes with its line and column.
 - **The whole API underneath.** `<gpu/raw>` is all of `webgpu.h` and `wgpu.h`, generated,
@@ -218,17 +220,40 @@ g.adam(0.001);       // and the optimizer step
 
 ## Platforms
 
-| Modules | macOS arm64 | Linux x86-64 | Windows x86-64 | iOS, Android | WebAssembly |
-|---|---|---|---|---|---|
-| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/window>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | not yet | not yet |
-| `<gpu/math>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes |
+| Modules | macOS arm64 | Linux x86-64 | Windows x86-64 | iOS (arm64, simulator) | Android (arm64, x86-64) | WebAssembly |
+|---|---|---|---|---|---|---|
+| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | not yet |
+| `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | no |
+| `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
+| `<gpu/math>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
 
-The WebGPU modules go through wgpu-native, so building them for iOS, Android or
-WebAssembly stops with an `#error` that says which modules work there. On phones, an app
-needs to give the package the surface it draws to (a `CAMetalLayer` on iOS, an
-`ANativeWindow` on Android) instead of an SDL window; in a browser, WebGPU is the browser's
-own (through emscripten's `emdawnwebgpu`), which cannot block on the GPU as `wgpuDevicePoll`
-does. Both are planned. The other modules are plain Eskiu and work on every target.
+On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
+`gpu_ui_surface(&gpu)`) or directly into a `CAMetalLayer` (`gpu.surface_metal(layer)`) or
+`ANativeWindow*` (`gpu.surface_android(window)`). In a browser, WebGPU is the browser's own
+(through emscripten's `emdawnwebgpu`), which cannot block on the GPU as `wgpuDevicePoll`
+does.
+
+```eskiu
+import <ui>;
+import <gpu>;
+import <gpu/ui>;
+
+void App() {
+    use_gpu_surface(void(uint32 w, uint32 h) {
+        Gpu gpu = gpu_open().value;
+        defer gpu.release();
+        GpuSurface surface = gpu_ui_surface(&gpu).value;
+        defer surface.release();
+        GpuFrame frame = surface.frame().value;
+        GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
+        pass.end();
+        surface.present(&frame);
+    });
+    Column(Style{grow: 1}) {
+        GpuView(Style{grow: 1});
+    }
+}
+```
 
 ## Install
 
@@ -240,11 +265,13 @@ eskiuc build
 ```
 
 The package's `eskiu.toml` names wgpu-native 29's own release archives for macOS (arm64 and
-x86-64), Linux (x86-64 and arm64) and Windows x86-64: the first build that links it
-(`eskiuc build`, `run`, `test`) downloads the one for your machine, checks its SHA-256 and
-keeps it in `~/.eskiu/native`, and every build links against it with no `-L` (on Windows the
-DLL is copied next to the program). A program that only uses the pure Eskiu modules
-downloads nothing.
+x86-64), Linux (x86-64 and arm64), Windows x86-64, iOS (arm64 device, arm64 simulator and
+x86-64 simulator) and Android (arm64 and x86-64): the first build that links it
+(`eskiuc build`, `run`, `test`, or a `--target` cross-build) downloads the one for the
+target platform, checks its SHA-256 and keeps it in `~/.eskiu/native`, and every build links
+against it with no `-L` (on Windows the DLL is copied next to the program; `ui build ios`
+and `ui build android` link `libwgpu_native.a` into the app bundle). A program that only
+uses the pure Eskiu modules downloads nothing.
 
 `<gpu/window>` also needs SDL3, which publishes no prebuilt library for macOS or Linux: install
 it from your system (`brew install sdl3` on macOS, the SDL3 development package or
@@ -257,8 +284,9 @@ window, as in `eskiuc build -L/opt/homebrew/lib`.
 |---|---|
 | `<gpu>` | `<gpu/core>` and `<gpu/render>` together |
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
-| `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window surfaces |
-| `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 (links SDL3) |
+| `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
+| `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
+| `<gpu/ui>` | `GpuView`, `use_gpu_surface` and `gpu_ui_surface` for `eskiu-lang/ui` apps on iOS and Android |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
