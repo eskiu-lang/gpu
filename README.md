@@ -266,10 +266,10 @@ Android, hence the `#if`.
 
 ## Install
 
-In an Eskiu package (Eskiu 0.12 or newer):
+In an Eskiu package (Eskiu 0.14 or newer, for the iOS and Android archives):
 
 ```bash
-eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.1.0
+eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.2.0
 eskiuc build
 ```
 
