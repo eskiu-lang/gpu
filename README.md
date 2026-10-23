@@ -235,11 +235,15 @@ does.
 
 ```eskiu
 import <ui>;
-import <gpu>;
 import <gpu/ui>;
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+import <gpu>;
+#endif
 
 void App() {
     use_gpu_surface(void(uint32 w, uint32 h) {
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+        if (w == 0) { return; }   // the surface went away (the app went to the background)
         Gpu gpu = gpu_open().value;
         defer gpu.release();
         GpuSurface surface = gpu_ui_surface(&gpu).value;
@@ -248,12 +252,17 @@ void App() {
         GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
         pass.end();
         surface.present(&frame);
+#endif
     });
     Column(Style{grow: 1}) {
         GpuView(Style{grow: 1});
     }
 }
 ```
+
+On the web and in the desktop hosts `GpuView` is an empty box and `use_gpu_surface` never
+fires, so the same app builds there; the WebGPU modules and `gpu_ui_surface` exist on iOS and
+Android, hence the `#if`.
 
 ## Install
 

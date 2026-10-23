@@ -7,24 +7,25 @@
 //     GpuView(Style{flex_grow: 1});
 //
 // Once GpuView has laid out (use_gpu_surface fires with its pixel size), call
-// gpu_ui_surface(&gpu) to create and configure a GpuSurface for it.
+// gpu_ui_surface(&gpu) to create and configure a GpuSurface for it. When the surface goes
+// away (Android sends the app to the background), use_gpu_surface fires with (0, 0): release
+// what was made for it, and make it again at the next size.
+//
+// On the web and the desktop hosts GpuView is an empty box and use_gpu_surface never fires;
+// gpu_ui_surface and the WebGPU modules exist on iOS and Android only, so code that renders
+// sits under `#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)`.
 
 import <mem>;
 import <result>;
 import <string>;
 import <ui>;
+
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 import <gpu/raw>;
 import <gpu/core>;
 import <gpu/render>;
 
-#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 extern *void gpu_ui_native_handle(*int width, *int height);
-#else
-*void gpu_ui_native_handle(*int width, *int height) {
-    *width = 0;
-    *height = 0;
-    return null;
-}
 #endif
 
 // Parses "resize WIDTH HEIGHT" from the "gpu" native channel.
@@ -80,6 +81,8 @@ void use_gpu_surface(escaping fn(uint32, uint32)->void on_resize) {
         uint32 h = 0;
         if (_gpu_ui_parse_resize(payload, &w, &h)) {
             held.handler(w, h);
+        } else if (payload != null && strcmp(payload, "destroy") == 0) {
+            held.handler(0, 0);
         }
     });
 }
@@ -87,9 +90,14 @@ void use_gpu_surface(escaping fn(uint32, uint32)->void on_resize) {
 // Mounts a native GPU surface view (CAMetalLayer on iOS, SurfaceView on
 // Android) filling the box layout gives it.
 void GpuView(Style style) {
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
     NativeView(style, "gpu", void(string name, string payload) {});
+#else
+    Column(style) {}
+#endif
 }
 
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 // Creates and configures a GpuSurface for the currently mounted GpuView.
 Result<GpuSurface, string> gpu_ui_surface(*Gpu gpu) {
     int w = 0;
@@ -106,7 +114,6 @@ Result<GpuSurface, string> gpu_ui_surface(*Gpu gpu) {
     GpuSurface s = gpu.surface_android(handle)?;
     s.configure((uint32)w, (uint32)h);
     return Ok<GpuSurface, string>(s);
-#else
-    return Err<GpuSurface, string>("gpu/ui: GpuView runs on iOS and Android");
 #endif
 }
+#endif
