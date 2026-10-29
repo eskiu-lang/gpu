@@ -6,7 +6,7 @@
 // Adam7 interlacing. Chunk lengths and CRCs are checked; ancillary chunks
 // other than PLTE and tRNS are skipped, an unknown critical chunk is an error.
 //
-//     Result<Image, string> r = png_decode(bytes, len);
+//     Result<Bitmap, string> r = png_decode(bytes, len);
 
 import <mem>;
 import <result>;
@@ -290,20 +290,20 @@ string _png_chunks(*_Png p, *uint8 data, uint64 len, *uint8 idat, *uint64 idat_l
 }
 
 // Decodes a PNG held in memory. The pixels are always RGBA8.
-Result<Image, string> png_decode(*uint8 data, uint64 len) {
-    if (data == null || len < 8) return Err<Image, string>("png: bad signature");
+Result<Bitmap, string> png_decode(*uint8 data, uint64 len) {
+    if (data == null || len < 8) return Err<Bitmap, string>("png: bad signature");
     if (data[0] != 137 || data[1] != 80 || data[2] != 78 || data[3] != 71 || data[4] != 13 || data[5] != 10 || data[6] != 26 || data[7] != 10) {
-        return Err<Image, string>("png: bad signature");
+        return Err<Bitmap, string>("png: bad signature");
     }
     *_Png p = alloc<_Png>(1);
-    if (p == null) return Err<Image, string>("png: out of memory");
+    if (p == null) return Err<Bitmap, string>("png: out of memory");
     defer free((*void)p);
     for (i in 0..256) p.plte[i * 4 + 3] = 255;
     uint64 zlen = 0;
     string e = _png_chunks(p, data, len, null, &zlen);
-    if (e != null) return Err<Image, string>(e);
+    if (e != null) return Err<Bitmap, string>(e);
     *uint8 z = alloc<uint8>((int64)zlen + 1);
-    if (z == null) return Err<Image, string>("png: out of memory");
+    if (z == null) return Err<Bitmap, string>("png: out of memory");
     defer free((*void)z);
     _png_chunks(p, data, len, z, &zlen);
 
@@ -316,19 +316,19 @@ Result<Image, string> png_decode(*uint8 data, uint64 len) {
     }
     // DEFLATE expands at most about 1032 to 1, so a header that promises far
     // more pixels than the data can hold is rejected before allocating.
-    if (raw_len / 1032 > (int64)zlen + 64) return Err<Image, string>("png: not enough image data");
+    if (raw_len / 1032 > (int64)zlen + 64) return Err<Bitmap, string>("png: not enough image data");
     *uint8 raw = alloc<uint8>(raw_len + 1);
-    if (raw == null) return Err<Image, string>("png: out of memory");
+    if (raw == null) return Err<Bitmap, string>("png: out of memory");
     defer free((*void)raw);
     uint64 got = inflate_zlib(z, zlen, raw, (uint64)raw_len)?;
-    if (got != (uint64)raw_len) return Err<Image, string>("png: not enough image data");
+    if (got != (uint64)raw_len) return Err<Bitmap, string>("png: not enough image data");
 
     int64 full_row = _png_rowbytes(p, p.w);
     *uint8 zero = alloc<uint8>(full_row + 1);
-    if (zero == null) return Err<Image, string>("png: out of memory");
+    if (zero == null) return Err<Bitmap, string>("png: out of memory");
     defer free((*void)zero);
     *uint8 rgba = alloc<uint8>(p.w * p.h * 4);
-    if (rgba == null) return Err<Image, string>("png: out of memory");
+    if (rgba == null) return Err<Bitmap, string>("png: out of memory");
     int64 bpp = ((int64)p.nch * (int64)p.depth + 7) / 8;
     int64 off = 0;
     for (k in 0..passes) {
@@ -345,12 +345,12 @@ Result<Image, string> png_decode(*uint8 data, uint64 len) {
             *uint8 cur = raw + off + 1;
             if (!_png_unfilter(cur, prev, rb, bpp, (int)raw[off])) {
                 free((*void)rgba);
-                return Err<Image, string>("png: bad filter");
+                return Err<Bitmap, string>("png: bad filter");
             }
             _png_emit(p, cur, pw, rgba + ((y0 + y * dy) * p.w + x0) * 4, dx * 4);
             prev = cur;
             off += rb + 1;
         }
     }
-    return Ok<Image, string>(Image{(uint32)p.w, (uint32)p.h, rgba});
+    return Ok<Bitmap, string>(Bitmap{(uint32)p.w, (uint32)p.h, rgba});
 }

@@ -259,12 +259,12 @@ int _gpu_model_texture(*GpuModel self, int image, bool srgb, int fallback) {
     }
     GltfImage* img = &self.data.images.data[image];
     if (img.data == null || img.len == 0) return fallback;
-    Result<Image, string> dec = image_decode(img.data, img.len);
+    Result<Bitmap, string> dec = image_decode(img.data, img.len);
     if (!dec.ok) return fallback;
-    Image pic = dec.value;
+    Bitmap pic = dec.value;
     GpuImageOptions o = GpuImageOptions{srgb: srgb, mipmaps: true};
     Result<GpuTexture, string> t = Gpu_image_with(&self.gpu, pic.width, pic.height, pic.rgba, &o);
-    Image_free(&pic);
+    Bitmap_free(&pic);
     if (!t.ok) return fallback;
     List_push(&self.textures, t.value);
     int slot = self.textures.size - 1;

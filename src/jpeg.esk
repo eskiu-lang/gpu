@@ -15,7 +15,7 @@
 // once a marker or the end of the data is reached. A file that ends before EOI
 // is reported as truncated.
 //
-//     Result<Image, string> r = jpeg_decode(bytes, len);
+//     Result<Bitmap, string> r = jpeg_decode(bytes, len);
 
 import <mem>;
 import <result>;
@@ -857,30 +857,30 @@ void _j_release(*_Jpeg j) {
 }
 
 // Decodes a JPEG held in memory. The pixels are RGBA8 with alpha 255.
-Result<Image, string> jpeg_decode(*uint8 data, uint64 len) {
-    if (data == null) return Err<Image, string>("jpeg: bad signature");
+Result<Bitmap, string> jpeg_decode(*uint8 data, uint64 len) {
+    if (data == null) return Err<Bitmap, string>("jpeg: bad signature");
     *_Jpeg j = alloc<_Jpeg>(1);
-    if (j == null) return Err<Image, string>("jpeg: out of memory");
+    if (j == null) return Err<Bitmap, string>("jpeg: out of memory");
     defer _j_release(j);
     j.d = data;
     j.len = len;
     string e = _j_parse(j);
-    if (e != null) return Err<Image, string>(e);
+    if (e != null) return Err<Bitmap, string>(e);
 
     int64 w = j.w;
     int64 h = j.h;
     let full: *uint8[3];
     defer _j_free3(&full[0]);
     *int tmp = alloc<int>(w + 64);
-    if (tmp == null) return Err<Image, string>("jpeg: out of memory");
+    if (tmp == null) return Err<Bitmap, string>("jpeg: out of memory");
     defer free((*void)tmp);
     for (i in 0..j.nc) {
         full[i] = alloc<uint8>(w * h);
-        if (full[i] == null) return Err<Image, string>("jpeg: out of memory");
+        if (full[i] == null) return Err<Bitmap, string>("jpeg: out of memory");
         _j_upsample(j, &j.comp[i], full[i], tmp);
     }
     *uint8 rgba = alloc<uint8>(w * h * 4);
-    if (rgba == null) return Err<Image, string>("jpeg: out of memory");
+    if (rgba == null) return Err<Bitmap, string>("jpeg: out of memory");
     bool rgb = false;
     if (j.nc == 3 && !j.jfif) {
         if (j.adobe == 0) rgb = true;
@@ -919,5 +919,5 @@ Result<Image, string> jpeg_decode(*uint8 data, uint64 len) {
             o[3] = 255;
         }
     }
-    return Ok<Image, string>(Image{(uint32)w, (uint32)h, rgba});
+    return Ok<Bitmap, string>(Bitmap{(uint32)w, (uint32)h, rgba});
 }

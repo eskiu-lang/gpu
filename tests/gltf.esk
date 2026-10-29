@@ -45,7 +45,7 @@ void quad() {
     check("unlit material with a texture", m.unlit && m.base_color_texture.texture == 0 && near(m.base_color.w, 1.0));
     check("nearest clamped sampler", g.samplers.size == 1 && g.samplers.data[0].mag_filter == 9728 && g.samplers.data[0].wrap_s == 33071);
     GltfImage* im = &g.images.data[0];
-    Result<Image, string> dec = image_decode(im.data, im.len);
+    Result<Bitmap, string> dec = image_decode(im.data, im.len);
     check("embedded png decodes", dec.ok && dec.value.width == 4 && dec.value.rgba[0] == 255 && dec.value.rgba[1] == 0);
     if (dec.ok) dec.value.free();
 }

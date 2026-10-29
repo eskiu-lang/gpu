@@ -131,7 +131,7 @@ Textures come from pixels or files. `<gpu/image>` decodes PNG and JPEG, and
 filtering, wrapping and anisotropy:
 
 ```eskiu
-Image img = image_load("albedo.jpg")?;
+Bitmap img = image_load("albedo.jpg")?;
 defer img.free();
 GpuImageOptions o = GpuImageOptions{srgb: true, mipmaps: true};
 GpuTexture tex = gpu.image_with(img.width, img.height, img.rgba, &o)?;

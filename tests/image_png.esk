@@ -44,13 +44,13 @@ void check(string name) {
     if (d == null || want == null) return;
     defer free((*void)d);
     defer free((*void)want);
-    Result<Image, string> r = image_decode(d, (uint64)n);
+    Result<Bitmap, string> r = image_decode(d, (uint64)n);
     if (!r.ok) {
         printf("FAIL %s: %s\n", name, r.error);
         fails++;
         return;
     }
-    Image img = r.value;
+    Bitmap img = r.value;
     defer img.free();
     if ((int64)img.width * (int64)img.height * 4 != rn) {
         printf("FAIL %s: size %ux%u\n", name, img.width, img.height);
@@ -81,11 +81,11 @@ void abuse(string name) {
     defer free((*void)buf);
     for (cut in 0..n) {
         memcpy((*void)buf, (*void)d, cut);
-        Result<Image, string> r = png_decode(buf, (uint64)cut);
+        Result<Bitmap, string> r = png_decode(buf, (uint64)cut);
         if (r.ok) {
             printf("FAIL %s: truncated at %lld decoded\n", name, cut);
             fails++;
-            Image img = r.value;
+            Bitmap img = r.value;
             img.free();
         }
     }
@@ -98,9 +98,9 @@ void abuse(string name) {
             seed = seed * 1103515245 + 12345;
             buf[at] = (uint8)((int)buf[at] ^ (int)(1 + (seed >> 16) % 255));
         }
-        Result<Image, string> r = png_decode(buf, (uint64)n);
+        Result<Bitmap, string> r = png_decode(buf, (uint64)n);
         if (r.ok) {
-            Image img = r.value;
+            Bitmap img = r.value;
             img.free();
         }
     }
@@ -133,12 +133,12 @@ int main() {
     abuse("rgba8_stored");
     abuse("rgb8_fixed");
     abuse_inflate();
-    Result<Image, string> r = image_decode((*uint8)"GIF89a....", 10);
+    Result<Bitmap, string> r = image_decode((*uint8)"GIF89a....", 10);
     if (r.ok) {
         printf("FAIL unknown format accepted\n");
         fails++;
     }
-    Result<Image, string> missing = image_load("tests/data/does_not_exist.png");
+    Result<Bitmap, string> missing = image_load("tests/data/does_not_exist.png");
     if (missing.ok) fails++;
     if (fails == 0) printf("image_png: ok\n");
     return fails == 0 ? 0 : 1;
