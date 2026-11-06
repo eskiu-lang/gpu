@@ -1,0 +1,763 @@
+// The <gpu/render> pipeline, pass and binding options, one offscreen image per
+// feature: blend presets and the blend constant, depth formats and compares,
+// load ops, several passes in one encoder, instancing, scissor and viewport,
+// texture sub-rectangle writes, render to texture, async readback, bind groups
+// shared across pipelines, and a joint matrix buffer for GPU skinning.
+//
+// Each image is compared with tests/data/render_NAME.rgba within one unit per
+// channel, and a few pixels are checked against their computed values. Shapes
+// have edges on pixel boundaries so that every GPU rasterizes them alike.
+// GPU_UPDATE=1 rewrites the images.
+import <io>;
+import <mem>;
+import <fs>;
+import <env>;
+import <list>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/model>;
+
+int fails = 0;
+
+// Rectangles in pixels of a 32x32 target (y down), each vertex x, y, z and
+// an RGBA color.
+string flat =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+    "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> V {\n"
+    "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, p.z, 1.0), c);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+
+// A full-screen triangle that samples a texture with nearest texels.
+string copy_shader =
+    "@group(0) @binding(0) var tex: texture_2d<f32>;\n"
+    "@group(0) @binding(1) var samp: sampler;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let x = f32(i & 1u) * 4.0 - 1.0;\n"
+    "    let y = f32(i >> 1u) * 4.0 - 1.0;\n"
+    "    return vec4<f32>(x, y, 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+    "    return textureSample(tex, samp, p.xy / 32.0);\n"
+    "}\n";
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+void rect(List<float>* out, float x0, float y0, float x1, float y1, float z, float r, float g, float b, float a) {
+    float[12] c = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    for (i in 0..6) {
+        List_push(out, c[i * 2]);
+        List_push(out, c[i * 2 + 1]);
+        List_push(out, z);
+        List_push(out, r);
+        List_push(out, g);
+        List_push(out, b);
+        List_push(out, a);
+    }
+}
+
+GpuVertexLayout rect_layout() {
+    GpuVertexLayout l = GpuVertexLayout{stride: 28};
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x4, 12);
+    return l;
+}
+
+GpuPipelineDesc flat_desc(*GpuVertexLayout l) {
+    return GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8Unorm, layout: l};
+}
+
+Result<GpuBuffer, string> upload(*Gpu gpu, List<float>* v) {
+    return gpu.vertices(v.data, (uint64)v.size * 4);
+}
+
+uint8 ch(*uint8 px, int x, int y, int c) {
+    return px[(y * 32 + x) * 4 + c];
+}
+
+bool near(int a, int b) {
+    return a - b <= 1 && b - a <= 1;
+}
+
+// The pixel at (x, y) is (r, g, b) within one unit.
+void expect(string name, *uint8 px, int x, int y, int r, int g, int b) {
+    if (!near(ch(px, x, y, 0), r) || !near(ch(px, x, y, 1), g) || !near(ch(px, x, y, 2), b)) {
+        printf("FAIL %s: pixel (%d, %d) is %d %d %d, want %d %d %d\n", name, x, y,
+            (int)ch(px, x, y, 0), (int)ch(px, x, y, 1), (int)ch(px, x, y, 2), r, g, b);
+        fails++;
+    }
+}
+
+// Compares a 32x32 image with tests/data/render_NAME.rgba.
+void golden(string name, *uint8 px) {
+    let path: char[128];
+    snprintf(&path[0], 128, "tests/data/render_%s.rgba", name);
+    int64 n = 32 * 32 * 4;
+    if (env_get("GPU_UPDATE") != null) {
+        fs_write_all((string)&path[0], px, n);
+        return;
+    }
+    int64 got = 0;
+    *uint8 want = fs_read_all((string)&path[0], &got);
+    if (want == null || got != n) {
+        printf("FAIL %s: cannot read %s\n", name, (string)&path[0]);
+        fails++;
+        if (want != null) free((*void)want);
+        return;
+    }
+    defer free((*void)want);
+    for (i in 0..n) {
+        int d = (int)px[i] - (int)want[i];
+        if (d > 1 || d < -1) {
+            printf("FAIL %s: byte %d of pixel (%d, %d) is %d, golden %d\n", name, (int)(i % 4),
+                (int)(i / 4 % 32), (int)(i / 4 / 32), (int)px[i], (int)want[i]);
+            fails++;
+            return;
+        }
+    }
+}
+
+Result<int, string> read_golden(string name, *GpuTexture t, *uint8 px) {
+    t.read(px)?;
+    golden(name, px);
+    return Ok<int, string>(0);
+}
+
+// GPU_BLEND_CONSTANT at 0.25, a custom WGPUBlendState (source by its alpha
+// plus the target by the constant), ALPHA, ADDITIVE and a draw with color
+// writes off, all over red.
+Result<int, string> blend(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    GpuPipeline opaque = gpu.pipeline(&d)?;
+    defer opaque.release();
+    d.blend_mode = GPU_BLEND_CONSTANT;
+    GpuPipeline constant = gpu.pipeline(&d)?;
+    defer constant.release();
+    WGPUBlendState custom = WGPUBlendState{
+        WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_Constant},
+        WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha}};
+    d.blend_mode = GPU_BLEND_NONE;
+    d.blend_state = &custom;
+    GpuPipeline fade = gpu.pipeline(&d)?;
+    defer fade.release();
+    d.blend_state = null;
+    d.blend = true;
+    GpuPipeline alpha = gpu.pipeline(&d)?;
+    defer alpha.release();
+    d.blend = false;
+    d.blend_mode = GPU_BLEND_ADDITIVE;
+    GpuPipeline add = gpu.pipeline(&d)?;
+    defer add.release();
+    d.blend_mode = GPU_BLEND_NONE;
+    d.no_color_write = true;
+    GpuPipeline hidden = gpu.pipeline(&d)?;
+    defer hidden.release();
+
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 0.0, 0.0, 1.0, 1.0);
+    rect(&v, 16.0, 0.0, 32.0, 16.0, 0.0, 0.0, 1.0, 0.0, 0.5);
+    rect(&v, 0.0, 16.0, 16.0, 32.0, 0.0, 1.0, 1.0, 1.0, 0.5);
+    rect(&v, 16.0, 16.0, 32.0, 32.0, 0.0, 0.0, 0.0, 1.0, 1.0);
+    rect(&v, 24.0, 24.0, 32.0, 32.0, 0.0, 0.0, 1.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.set_blend_constant(GpuColor{0.25, 0.25, 0.25, 0.25});
+    pass.draw_range(&opaque, &vb, 0, 6, 0, 1);
+    pass.draw_range(&constant, &vb, 6, 6, 0, 1);
+    pass.draw_range(&fade, &vb, 12, 6, 0, 1);
+    pass.draw_range(&alpha, &vb, 18, 6, 0, 1);
+    pass.draw_range(&hidden, &vb, 24, 6, 0, 1);
+    pass.draw_range(&add, &vb, 30, 6, 0, 1);
+    pass.end()?;
+    read_golden("blend", &t, px)?;
+    expect("blend constant", px, 4, 4, 191, 0, 64);
+    expect("custom blend state", px, 20, 4, 64, 128, 0);
+    expect("alpha", px, 4, 20, 255, 128, 128);
+    expect("color writes off", px, 20, 20, 255, 0, 0);
+    expect("additive", px, 28, 28, 255, 255, 0);
+    return Ok<int, string>(0);
+}
+
+// Depth32Float with Less (writing), Always (not writing) and a Less draw that
+// fails against the first one's depth where the Always draw did not write.
+Result<int, string> depth(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.texture(32, 32, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    d.depth = true;
+    d.depth_format = WGPUTextureFormat_Depth32Float;
+    GpuPipeline less = gpu.pipeline(&d)?;
+    defer less.release();
+    d.depth_compare = WGPUCompareFunction_Always;
+    d.depth_read_only = true;
+    GpuPipeline always = gpu.pipeline(&d)?;
+    defer always.release();
+
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 24.0, 24.0, 0.5, 0.0, 1.0, 0.0, 1.0);
+    rect(&v, 8.0, 8.0, 32.0, 32.0, 0.7, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 4.0, 4.0, 12.0, 12.0, 0.9, 0.0, 0.0, 1.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 4.0, 0.6, 1.0, 1.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &z);
+    pass.draw_range(&less, &vb, 0, 6, 0, 1);
+    pass.draw_range(&less, &vb, 6, 6, 0, 1);
+    pass.draw_range(&always, &vb, 12, 6, 0, 1);
+    pass.draw_range(&less, &vb, 18, 6, 0, 1);
+    pass.end()?;
+    read_golden("depth", &t, px)?;
+    expect("nearer green wins", px, 16, 16, 0, 255, 0);
+    expect("red behind green", px, 28, 28, 255, 0, 0);
+    expect("always draws over", px, 8, 8, 0, 0, 255);
+    expect("less fails where Always did not write", px, 1, 1, 0, 255, 0);
+    expect("less passes on cleared depth", px, 28, 1, 255, 255, 0);
+    return Ok<int, string>(0);
+}
+
+// A pass that keeps the color and depth of the one before, and one that keeps
+// the color only.
+Result<int, string> load(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.depth(32, 32)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    d.depth = true;
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 16.0, 32.0, 0.3, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.5, 0.0, 1.0, 0.0, 1.0);
+    rect(&v, 0.0, 24.0, 32.0, 32.0, 0.9, 1.0, 1.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass first = gpu.pass(t.view, GpuColor{0.0, 0.0, 1.0, 1.0}, &z);
+    first.draw_range(&pipe, &vb, 0, 6, 0, 1);
+    first.end()?;
+    GpuPassOptions both = GpuPassOptions{clear: GpuColor{1.0, 1.0, 1.0, 1.0}, load: true, depth: &z, depth_load: true};
+    GpuPass second = gpu.pass_with(t.view, &both);
+    second.draw_range(&pipe, &vb, 6, 6, 0, 1);
+    second.end()?;
+    GpuPassOptions color = GpuPassOptions{load: true, depth: &z};
+    GpuPass third = gpu.pass_with(t.view, &color);
+    third.draw_range(&pipe, &vb, 12, 6, 0, 1);
+    third.end()?;
+    read_golden("load", &t, px)?;
+    expect("first pass kept", px, 4, 4, 255, 0, 0);
+    expect("second pass over the cleared part", px, 28, 4, 0, 255, 0);
+    expect("third pass over cleared depth", px, 4, 28, 255, 255, 0);
+    return Ok<int, string>(0);
+}
+
+// Three passes over two targets in one submission, and a frame error reported
+// by submit().
+Result<int, string> encoder(*Gpu gpu, *uint8 px) {
+    GpuTexture a = gpu.target(32, 32)?;
+    defer a.release();
+    GpuTexture b = gpu.target(32, 32)?;
+    defer b.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 32.0, 16.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 0.0, 16.0, 32.0, 32.0, 0.0, 0.0, 1.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuEncoder enc = gpu.encoder();
+    GpuPass p1 = enc.pass(a.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    p1.draw_range(&pipe, &vb, 0, 6, 0, 1);
+    p1.end()?;
+    GpuPassOptions keep = GpuPassOptions{load: true};
+    GpuPass p2 = enc.pass_with(a.view, &keep);
+    p2.draw_range(&pipe, &vb, 6, 6, 0, 1);
+    p2.end()?;
+    GpuPass p3 = enc.pass(b.view, GpuColor{1.0, 1.0, 1.0, 1.0}, null);
+    p3.end()?;
+    enc.submit()?;
+    read_golden("encoder", &a, px)?;
+    expect("first pass", px, 4, 4, 255, 0, 0);
+    expect("second pass", px, 4, 28, 0, 255, 0);
+    b.read(px)?;
+    expect("third pass on the other target", px, 16, 16, 255, 255, 255);
+
+    GpuTexture s = gpu.target_with(32, 32, WGPUTextureFormat_RGBA8UnormSrgb)?;
+    defer s.release();
+    GpuEncoder bad = gpu.encoder();
+    GpuPass wrong = bad.pass(s.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    wrong.draw_range(&pipe, &vb, 0, 6, 0, 1);
+    wrong.end()?;
+    Result<int, string> r = bad.submit();
+    check("a pipeline of another format fails at submit", !r.ok);
+    return Ok<int, string>(0);
+}
+
+// A per-vertex quad and a per-instance offset, size and color in a second
+// buffer; draw_range starts at an instance.
+Result<int, string> instancing(*Gpu gpu, *uint8 px) {
+    string shader =
+        "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+        "@vertex fn vs(@location(0) q: vec2<f32>, @location(1) o: vec3<f32>, @location(2) c: vec4<f32>) -> V {\n"
+        "    let p = o.xy + q * o.z;\n"
+        "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, 0.0, 1.0), c);\n"
+        "}\n"
+        "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuVertexLayout[2] vls;
+    vls[0] = GpuVertexLayout{stride: 8};
+    vls[0].add(WGPUVertexFormat_Float32x2, 0);
+    vls[1] = GpuVertexLayout{stride: 28, step: WGPUVertexStepMode_Instance, location: 1};
+    vls[1].add(WGPUVertexFormat_Float32x3, 0);
+    vls[1].add(WGPUVertexFormat_Float32x4, 12);
+    defer vls[0].release();
+    defer vls[1].release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: t.format, layouts: &vls[0], layout_count: 2};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    float[12] quad = {0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0};
+    float[28] inst = {0.0, 0.0, 8.0, 1.0, 0.0, 0.0, 1.0,
+                      8.0, 8.0, 8.0, 0.0, 1.0, 0.0, 1.0,
+                      16.0, 16.0, 8.0, 0.0, 0.0, 1.0, 1.0,
+                      24.0, 24.0, 8.0, 1.0, 1.0, 1.0, 1.0};
+    GpuBuffer qb = gpu.vertices(&quad, sizeof(quad))?;
+    defer qb.release();
+    GpuBuffer ib = gpu.vertices(&inst, sizeof(inst))?;
+    defer ib.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.set_vertices(1, &ib);
+    pass.draw(&pipe, &qb, 6, 2);
+    pass.draw_range(&pipe, &qb, 0, 6, 3, 1);
+    pass.end()?;
+    read_golden("instancing", &t, px)?;
+    expect("instance 0", px, 4, 4, 255, 0, 0);
+    expect("instance 1", px, 12, 12, 0, 255, 0);
+    expect("instance 2 skipped", px, 20, 20, 0, 0, 0);
+    expect("instance 3", px, 28, 28, 255, 255, 255);
+    return Ok<int, string>(0);
+}
+
+// A viewport on the right half, a scissor on the top left corner, and a
+// viewport on a quarter of the left half.
+Result<int, string> scissor_viewport(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 1.0, 0.0, 1.0);
+    rect(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 0.0, 0.0, 1.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.set_viewport(16.0, 0.0, 16.0, 32.0);
+    pass.draw_range(&pipe, &vb, 0, 6, 0, 1);
+    pass.set_viewport(0.0, 0.0, 32.0, 32.0, 0.0, 1.0);
+    pass.set_scissor(0, 0, 8, 8);
+    pass.draw_range(&pipe, &vb, 6, 6, 0, 1);
+    pass.set_scissor(0, 0, 32, 32);
+    pass.set_viewport(0.0, 16.0, 16.0, 16.0);
+    pass.draw_range(&pipe, &vb, 12, 6, 0, 1);
+    pass.end()?;
+    read_golden("scissor_viewport", &t, px)?;
+    expect("viewport right half", px, 20, 4, 255, 0, 0);
+    expect("left half untouched", px, 12, 4, 0, 0, 0);
+    expect("scissor", px, 4, 4, 0, 255, 0);
+    expect("outside the scissor", px, 4, 12, 0, 0, 0);
+    expect("small viewport", px, 4, 20, 0, 0, 255);
+    expect("outside the small viewport", px, 12, 28, 0, 0, 0);
+    return Ok<int, string>(0);
+}
+
+// write_region on an 8x8 texture sampled through an explicit layout with an
+// unfilterable texture and a NonFiltering sampler.
+Result<int, string> write_region(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture tex = gpu.texture(8, 8, WGPUTextureFormat_RGBA8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    defer tex.release();
+    uint8[256] gray;
+    for (i in 0..64) {
+        gray[i * 4] = 100;
+        gray[i * 4 + 1] = 100;
+        gray[i * 4 + 2] = 100;
+        gray[i * 4 + 3] = 255;
+    }
+    tex.write(&gray);
+    uint8[32] red = {255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                     255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255};
+    tex.write_region(2, 3, 4, 2, &red);
+    uint8[4] blue = {0, 0, 255, 255};
+    tex.write_region(7, 7, 1, 1, &blue);
+    GpuSamplerOptions so = GpuSamplerOptions{nearest: true};
+    GpuSampler samp = gpu.sampler_with(&so)?;
+    defer samp.release();
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_UnfilterableFloat);
+    bl.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_NonFiltering);
+    *GpuBindLayout[1] groups = {&bl};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: copy_shader, vertex: "vs", fragment: "fs", format: t.format, groups: &groups[0], group_count: 1};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &tex);
+    g.sampler(1, &samp);
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.set_group(0, &g);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    read_golden("write_region", &t, px)?;
+    expect("outside the region", px, 2, 2, 100, 100, 100);
+    expect("region corner", px, 9, 13, 255, 0, 0);
+    expect("region end", px, 23, 19, 255, 0, 0);
+    expect("past the region", px, 25, 13, 100, 100, 100);
+    expect("one texel", px, 30, 30, 0, 0, 255);
+    return Ok<int, string>(0);
+}
+
+// A target drawn in one pass and sampled in the next, in one encoder; the
+// result also comes back through an async readback.
+Result<int, string> render_to_texture(*Gpu gpu, *uint8 px) {
+    GpuTexture rt = gpu.target(16, 16)?;
+    defer rt.release();
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = flat_desc(&l);
+    GpuPipeline flat_pipe = gpu.pipeline(&d)?;
+    defer flat_pipe.release();
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, 0);
+    bl.sampler(1, WGPUShaderStage_Fragment, 0);
+    *GpuBindLayout[1] groups = {&bl};
+    GpuPipelineDesc cd = GpuPipelineDesc{wgsl: copy_shader, vertex: "vs", fragment: "fs", format: t.format, groups: &groups[0], group_count: 1};
+    GpuPipeline copy = gpu.pipeline(&cd)?;
+    defer copy.release();
+    GpuSampler samp = gpu.sampler(false)?;
+    defer samp.release();
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &rt);
+    g.sampler(1, &samp);
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    rect(&v, 16.0, 16.0, 32.0, 32.0, 0.0, 1.0, 1.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuEncoder enc = gpu.encoder();
+    GpuPass p1 = enc.pass(rt.view, GpuColor{0.0, 0.0, 1.0, 1.0}, null);
+    p1.draw_range(&flat_pipe, &vb, 0, 6, 0, 1);
+    p1.end()?;
+    GpuPass p2 = enc.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    p2.set_group(0, &g);
+    p2.draw(&copy, null, 3, 1);
+    p2.draw_range(&flat_pipe, &vb, 6, 6, 0, 1);
+    p2.end()?;
+    enc.submit()?;
+    read_golden("render_to_texture", &t, px)?;
+    expect("sampled red quarter", px, 8, 8, 255, 0, 0);
+    expect("sampled blue clear", px, 24, 8, 0, 0, 255);
+    expect("drawn after sampling", px, 24, 24, 255, 255, 0);
+
+    GpuReadback rb = t.read_async()?;
+    defer rb.release();
+    int polls = 0;
+    while (!rb.ready() && polls < 1000000) polls++;
+    check("readback ready", rb.ready());
+    *uint8 back = alloc<uint8>(32 * 32 * 4);
+    defer free(back);
+    rb.take(back)?;
+    golden("readback", back);
+    check("readback matches the blocking read", memcmp(back, px, 32 * 32 * 4) == 0);
+    Result<int, string> twice = rb.take(back);
+    check("a readback is taken once", !twice.ok);
+    return Ok<int, string>(0);
+}
+
+// Two layouts (a uniform tint, a texture and sampler) shared by two pipelines;
+// four groups made once and kept across frames until a binding changes, and
+// the same for a pipeline's own group from bind().
+Result<int, string> bind_groups(*Gpu gpu, *uint8 px) {
+    string shader =
+        "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+        "@group(0) @binding(0) var<uniform> tint: vec4<f32>;\n"
+        "@group(1) @binding(0) var tex: texture_2d<f32>;\n"
+        "@group(1) @binding(1) var samp: sampler;\n"
+        "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> V {\n"
+        "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, p.z, 1.0), c);\n"
+        "}\n"
+        "@fragment fn fs_tex(v: V) -> @location(0) vec4<f32> { return textureSample(tex, samp, v.pos.xy / 32.0) * tint * v.color; }\n"
+        "@fragment fn fs_tint(v: V) -> @location(0) vec4<f32> { return tint * v.color; }\n";
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuBindLayout scene = gpu.bind_layout();
+    defer scene.release();
+    scene.uniform(0, WGPUShaderStage_Fragment);
+    GpuBindLayout mat = gpu.bind_layout();
+    defer mat.release();
+    mat.texture(0, WGPUShaderStage_Fragment, 0);
+    mat.sampler(1, WGPUShaderStage_Fragment, 0);
+    *GpuBindLayout[2] groups = {&scene, &mat};
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs_tex", format: t.format, layout: &l, groups: &groups[0], group_count: 2};
+    GpuPipeline textured = gpu.pipeline(&d)?;
+    defer textured.release();
+    d.fragment = "fs_tint";
+    GpuPipeline tinted = gpu.pipeline(&d)?;
+    defer tinted.release();
+
+    uint8[4] white_px = {255, 255, 255, 255};
+    uint8[4] green_px = {0, 255, 0, 255};
+    GpuTexture white = gpu.image(1, 1, &white_px)?;
+    defer white.release();
+    GpuTexture green = gpu.image(1, 1, &green_px)?;
+    defer green.release();
+    GpuSampler samp = gpu.sampler(false)?;
+    defer samp.release();
+    float[4] full = {1.0, 1.0, 1.0, 1.0};
+    float[4] half = {0.5, 0.5, 0.5, 1.0};
+    GpuBuffer u1 = gpu.uniform(&full, 16)?;
+    defer u1.release();
+    GpuBuffer u2 = gpu.uniform(&half, 16)?;
+    defer u2.release();
+    GpuBindGroup s1 = scene.group()?;
+    defer s1.release();
+    s1.buffer(0, &u1);
+    GpuBindGroup s2 = scene.group()?;
+    defer s2.release();
+    s2.buffer(0, &u2);
+    GpuBindGroup m1 = mat.group()?;
+    defer m1.release();
+    m1.texture(0, &white);
+    m1.sampler(1, &samp);
+    GpuBindGroup m2 = mat.group()?;
+    defer m2.release();
+    m2.texture(0, &green);
+    m2.sampler(1, &samp);
+
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+    rect(&v, 16.0, 0.0, 32.0, 16.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 16.0, 16.0, 32.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+    rect(&v, 16.0, 16.0, 32.0, 32.0, 0.0, 1.0, 1.0, 1.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+
+    WGPUBindGroup[4] first;
+    for (frame in 0..2) {
+        GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+        pass.set_group(0, &s1);
+        pass.set_group(1, &m1);
+        pass.draw_range(&textured, &vb, 0, 6, 0, 1);
+        pass.set_group(1, &m2);
+        pass.draw_range(&textured, &vb, 6, 6, 0, 1);
+        pass.set_group(0, &s2);
+        pass.draw_range(&tinted, &vb, 12, 6, 0, 1);
+        pass.set_group(1, &m1);
+        pass.draw_range(&textured, &vb, 18, 6, 0, 1);
+        pass.end()?;
+        if (frame == 0) {
+            first[0] = s1.handle;
+            first[1] = s2.handle;
+            first[2] = m1.handle;
+            first[3] = m2.handle;
+        }
+    }
+    check("groups made once", s1.handle == first[0] && s2.handle == first[1] && m1.handle == first[2] && m2.handle == first[3]);
+    read_golden("bind_groups", &t, px)?;
+    expect("white texture, full tint", px, 8, 8, 255, 255, 255);
+    expect("green texture", px, 24, 8, 0, 255, 0);
+    expect("tint only", px, 8, 24, 128, 128, 128);
+    expect("white texture, half tint", px, 24, 24, 128, 128, 128);
+
+    m2.texture(0, &white);
+    GpuPass again = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    again.set_group(0, &s1);
+    again.set_group(1, &m2);
+    again.draw_range(&textured, &vb, 6, 6, 0, 1);
+    again.end()?;
+    check("a changed group is made again", m2.handle != first[3]);
+    t.read(px)?;
+    expect("changed group", px, 24, 8, 255, 255, 255);
+
+    GpuPipelineDesc fd = flat_desc(&l);
+    string own_shader =
+        "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+        "@group(0) @binding(0) var<uniform> tint: vec4<f32>;\n"
+        "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> V {\n"
+        "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, p.z, 1.0), c);\n"
+        "}\n"
+        "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return tint * v.color; }\n";
+    fd.wgsl = own_shader;
+    GpuPipeline own = gpu.pipeline(&fd)?;
+    defer own.release();
+    own.bind(0, &u1);
+    WGPUBindGroup kept = null;
+    for (frame in 0..2) {
+        GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+        pass.draw_range(&own, &vb, 0, 6, 0, 1);
+        pass.draw_range(&own, &vb, 6, 6, 0, 1);
+        pass.end()?;
+        if (frame == 0) kept = own.group;
+    }
+    check("bind() group kept across draws and passes", kept != null && own.group == kept);
+    own.bind(0, &u2);
+    GpuPass last = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    last.draw_range(&own, &vb, 0, 6, 0, 1);
+    last.end()?;
+    check("bind() again makes a new group", own.group != kept);
+    t.read(px)?;
+    expect("rebound uniform", px, 8, 8, 128, 128, 128);
+    return Ok<int, string>(0);
+}
+
+// The strip of tests/data/skin_anim.gltf (x -0.5..0.5, rows at y 0, 1 and 2,
+// the middle row half on each joint) with the tip joint moved up 0.5, skinned
+// by a vertex shader from the joint buffer: a rectangle up to y 2.5, shaded
+// by height.
+Result<int, string> skinning(*Gpu gpu, *uint8 px) {
+    string shader =
+        "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+        "@group(0) @binding(0) var<storage, read> joints: array<mat4x4<f32>>;\n"
+        "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) j: vec4<f32>, @location(2) w: vec4<f32>) -> V {\n"
+        "    let skin = joints[u32(j.x)] * w.x + joints[u32(j.y)] * w.y + joints[u32(j.z)] * w.z + joints[u32(j.w)] * w.w;\n"
+        "    let q = skin * vec4<f32>(p, 1.0);\n"
+        "    return V(vec4<f32>(q.x, q.y * 0.5 - 1.0, 0.0, 1.0), vec4<f32>(1.0, 1.0 - q.y / 2.5, q.y / 2.5, 1.0));\n"
+        "}\n"
+        "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+    Gltf g = gltf_load("tests/data/skin_anim.gltf")?;
+    defer g.free();
+    g.nodes.data[2].translation = Vec3{0.0, 1.5, 0.0};
+    GpuJoints joints = gpu.joints(&g, 0)?;
+    defer joints.release();
+    float[32] got;
+    joints.buffer.read(&got, sizeof(got))?;
+    Mat4[2] want;
+    Mat4[3] world;
+    g.world(&world[0]);
+    g.joint_matrices(0, &world[0], &want[0]);
+    bool same = true;
+    for (k in 0..16) {
+        if (fabs((double)(got[k] - want[0].m[k])) > 0.00001 || fabs((double)(got[16 + k] - want[1].m[k])) > 0.00001) same = false;
+    }
+    check("joint buffer holds the joint matrices", same && joints.count == 2);
+    check("tip joint matrix moves up 0.5", fabs((double)(got[29] - 0.5)) < 0.00001);
+
+    GpuJoints uj = gpu.joints_uniform(&g, 0, 4)?;
+    defer uj.release();
+    float[64] ugot;
+    uj.buffer.read(&ugot, sizeof(ugot))?;
+    check("uniform joint buffer", fabs((double)(ugot[29] - 0.5)) < 0.00001 && ugot[32] == 1.0 && ugot[37] == 1.0);
+    Result<GpuJoints, string> small = gpu.joints_uniform(&g, 0, 1);
+    check("capacity below the joint count fails", !small.ok);
+    Result<GpuJoints, string> none = gpu.joints(&g, 3);
+    check("missing skin fails", !none.ok);
+
+    GltfPrimitive* p = &g.meshes.data[0].primitives.data[0];
+    List<float> v;
+    defer List_free(&v);
+    for (i in 0..p.vertex_count) {
+        for (k in 0..3) List_push(&v, p.positions[i * 3 + k]);
+        for (k in 0..4) List_push(&v, (float)p.joints[i * 4 + k]);
+        for (k in 0..4) List_push(&v, p.weights[i * 4 + k]);
+    }
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuBuffer ib = gpu.indices(p.indices, (uint64)p.index_count)?;
+    defer ib.release();
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 44};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x4, 12);
+    l.add(WGPUVertexFormat_Float32x4, 28);
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.storage(0, WGPUShaderStage_Vertex, true);
+    *GpuBindLayout[1] groups = {&bl};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: t.format, layout: &l, groups: &groups[0], group_count: 1};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    GpuBindGroup bg = bl.group()?;
+    defer bg.release();
+    bg.buffer(0, &joints.buffer);
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.set_group(0, &bg);
+    pass.draw_indexed(&pipe, &vb, &ib, p.index_count, 1);
+    pass.end()?;
+    read_golden("skinning", &t, px)?;
+    expect("root of the strip", px, 16, 31, 255, 249, 6);
+    expect("tip of the strip, moved up", px, 16, 12, 255, 6, 249);
+    expect("above the tip", px, 16, 11, 0, 0, 0);
+    expect("beside the strip", px, 7, 20, 0, 0, 0);
+    return Ok<int, string>(0);
+}
+
+void run_case(string name, Result<int, string> r) {
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+    }
+}
+
+int main() {
+    Result<Gpu, string> opened = gpu_open();
+    if (!opened.ok) {
+        printf("error: %s\n", opened.error);
+        return 1;
+    }
+    Gpu gpu = opened.value;
+    defer gpu.release();
+    *uint8 px = alloc<uint8>(32 * 32 * 4);
+    defer free(px);
+    run_case("blend", blend(&gpu, px));
+    run_case("depth", depth(&gpu, px));
+    run_case("load", load(&gpu, px));
+    run_case("encoder", encoder(&gpu, px));
+    run_case("instancing", instancing(&gpu, px));
+    run_case("scissor_viewport", scissor_viewport(&gpu, px));
+    run_case("write_region", write_region(&gpu, px));
+    run_case("render_to_texture", render_to_texture(&gpu, px));
+    run_case("bind_groups", bind_groups(&gpu, px));
+    run_case("skinning", skinning(&gpu, px));
+    printf("render api: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}
