@@ -143,6 +143,107 @@ In a uniform or storage buffer a WGSL `vec3<f32>` takes 16 bytes, so a field the
 reads as `vec3` is a `Vec4` (or a `Vec3` and a `float`) on the Eskiu side. Both quit with Escape, or after N frames
 with `--frames N`.
 
+### Frames with several passes, bind groups, blending and depth
+
+A game frame usually draws the scene, then the interface over it, and samples render targets
+in later passes. A `GpuEncoder` records several passes and submits them once; each pass
+clears or keeps (`load`) its color and depth:
+
+```eskiu
+GpuEncoder enc = gpu.encoder();
+GpuPass scene = enc.pass(frame.view, GpuColor{0.1, 0.1, 0.1, 1.0}, &depth);
+scene.set_group(0, &camera_group);
+scene.set_group(1, &tiles_group);
+scene.draw_range(&tiles, &tile_vertices, first, count, 0, 1);
+scene.end()?;
+GpuPassOptions over = GpuPassOptions{load: true};
+GpuPass ui = enc.pass_with(frame.view, &over);
+ui.set_scissor(x, y, w, h);
+ui.draw(&panel, &panel_vertices, 6, 1);
+ui.end()?;
+enc.submit()?;   // the frame's errors come back here
+surface.present(&frame);
+```
+
+`gpu.pass(...)` and `gpu.pass_with(view, &options)` are a pass with an encoder of its own,
+submitted by `end()`.
+
+A `GpuBindLayout` describes one `@group` and is shared by every pipeline that names it in
+`GpuPipelineDesc.groups`; a `GpuBindGroup` made from it holds the resources and is set on
+a pass by index. The WebGPU bind group is made the first time it is set and kept until one
+of its bindings changes, so thousands of draws a frame create no bind groups:
+
+```eskiu
+GpuBindLayout cam = gpu.bind_layout();
+cam.uniform(0, WGPUShaderStage_Vertex);
+GpuBindLayout mat = gpu.bind_layout();
+mat.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+mat.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+*GpuBindLayout[2] groups = {&cam, &mat};
+GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format,
+    layout: &vertex_layout, groups: &groups[0], group_count: 2,
+    blend_mode: GPU_BLEND_ALPHA, depth: true, depth_format: WGPUTextureFormat_Depth32Float};
+GpuPipeline sprites = gpu.pipeline(&d)?;
+GpuBindGroup camera_group = cam.group()?;
+camera_group.buffer(0, &camera_uniform);
+```
+
+A texture that is not filterable (`R32Float`, or one sampled only with nearest filtering)
+takes `WGPUTextureSampleType_UnfilterableFloat` and a `WGPUSamplerBindingType_NonFiltering`
+sampler. Bindings set with `pipe.bind()`, `bind_texture()` and `bind_sampler()` still work
+for group 0 of a pipeline without `groups`.
+
+The rest of `GpuPipelineDesc`:
+
+| Field | Zero value | Other values |
+|---|---|---|
+| `blend_mode` | `GPU_BLEND_NONE` (`blend: true` is `GPU_BLEND_ALPHA`) | `GPU_BLEND_ALPHA`, `PREMULTIPLIED`, `ADDITIVE`, `MULTIPLY`, `CONSTANT` (mixes by the pass's `set_blend_constant`) |
+| `blend_state` | null | any `*WGPUBlendState`, such as `SrcAlpha` plus `Constant` for a fade |
+| `no_color_write` | colors written | `true` for a depth-only draw |
+| `depth_format` | `Depth24Plus` | `Depth32Float` (make the texture with `gpu.texture(w, h, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)`) |
+| `depth_compare` | `Less` | any `WGPUCompareFunction`, such as `Always` for overlays |
+| `depth_read_only` | depth written | `true` turns depth writes off |
+| `depth_bias`, `depth_bias_slope` | 0 | a depth offset |
+| `layouts`, `layout_count` | the one `layout` | up to 8 vertex buffers, each a `GpuVertexLayout` with a `step` (`WGPUVertexStepMode_Instance` for per-instance data) and a first `location` |
+
+Per-instance data goes in a second vertex buffer, set with `pass.set_vertices(1, &instances)`;
+`pass.draw_range(&pipe, &vertices, first, count, first_instance, instances)` draws part of a
+buffer. `pass.set_viewport(x, y, w, h)` and `pass.set_scissor(x, y, w, h)` take pixels from
+the top left.
+
+`texture.write_region(x, y, w, h, pixels)` updates part of a texture, such as one glyph of
+an atlas. Targets from `gpu.target` (RGBA8) or `gpu.target_with` (another format) can be
+sampled by a later pass. `target.read(pixels)` waits for the GPU; `target.read_async()`
+returns a `GpuReadback` that a later frame takes without stalling:
+
+```eskiu
+GpuReadback rb = target.read_async()?;   // after the frame's submit
+// ...a later frame:
+if (rb.ready()) {
+    rb.take(pixels)?;
+    rb.release();
+}
+```
+
+For skinning in your own shader, `gpu.joints(&gltf, skin)` (from `<gpu/model>`) is a storage
+buffer of a skin's joint matrices (`array<mat4x4<f32>>`, joint j at byte j * 64) and
+`gpu.joints_uniform(&gltf, skin, capacity)` a uniform buffer of `capacity` matrices;
+`joints.update(&gltf)` refreshes them from the current pose (after `gltf.animate`). Bind
+`joints.buffer` like any buffer.
+
+[`tests/render_api.esk`](tests/render_api.esk) draws each of these into a small image and
+compares it with `tests/data/render_*.rgba`.
+
+**Upgrading from 0.3.** The bind group that `pipe.bind()`, `bind_texture()` and
+`bind_sampler()` make now belongs to the pipeline: it is made at the first draw after a
+binding changes and reused by later draws and passes, where 0.3 made one per draw and
+released them at the end of the pass. Two things follow. A buffer or texture bound to a
+pipeline stays alive (on the GPU) until it is replaced by another `bind` call or the
+pipeline is released. And after releasing a bound resource and making a new one, call
+`bind` again: a draw without it uses the old resource instead of failing. `pass.end()` and
+`enc.submit()` now return a pass's validation errors without submitting the invalid
+commands, which wgpu-native answered by aborting the program.
+
 ## Models
 
 ```eskiu
@@ -293,13 +394,13 @@ window, as in `eskiuc build -L/opt/homebrew/lib`.
 |---|---|
 | `<gpu>` | `<gpu/core>` and `<gpu/render>` together |
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
-| `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
+| `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
 | `<gpu/ui>` | `GpuView`, `use_gpu_surface` and `gpu_ui_surface` for `eskiu-lang/ui` apps on iOS and Android |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
-| `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight` |
+| `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight`, `GpuJoints` (joint matrices for your own skinning shader) |
 | `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
 | `<gpu/nn>` | `NnTensor` (f32, f16, Q8_0, Q4_0), `NnProgram` with matvec, RMSNorm, RoPE, attention, SwiGLU, argmax |
 | `<gpu/train>` | `NnGraph`: inputs, parameters, matmul, bias, ReLU, tanh, cross entropy, MSE, `backward`, Adam, SGD |
