@@ -10,7 +10,28 @@
 //     surface.present(&frame);
 //
 // Bindings set on a pipeline with bind(), bind_texture() and bind_sampler()
-// apply to group 0 of its shaders.
+// apply to group 0 of its shaders; the bind group they make is kept by the
+// pipeline and reused until a binding changes. For several groups, or groups
+// shared by pipelines, describe each with a GpuBindLayout, list them in
+// GpuPipelineDesc.groups, and set GpuBindGroups on the pass:
+//
+//     GpuBindLayout scene = gpu.bind_layout();
+//     scene.uniform(0, WGPUShaderStage_Vertex);
+//     GpuBindGroup sg = scene.group()?;
+//     sg.buffer(0, &camera);
+//     pass.set_group(0, &sg);
+//
+// Several passes go into one submission through a GpuEncoder:
+//
+//     GpuEncoder enc = gpu.encoder();
+//     GpuPass scene = enc.pass(frame.view, clear, &depth);
+//     ...
+//     scene.end()?;
+//     GpuPassOptions keep = GpuPassOptions{load: true};
+//     GpuPass ui = enc.pass_with(frame.view, &keep);
+//     ...
+//     ui.end()?;
+//     enc.submit()?;
 
 import <io>;
 import <mem>;
@@ -56,13 +77,46 @@ struct GpuSampler {
     WGPUSampler handle;
 }
 
-// The vertex buffer layout of a pipeline: one attribute per shader
-// @location, numbered in the order they are added.
+// The layout of one vertex buffer of a pipeline: one attribute per shader
+// @location, numbered in the order they are added from location (0 by
+// default). step is WGPUVertexStepMode_Instance for a buffer read once per
+// instance; the zero value reads it once per vertex.
 struct GpuVertexLayout {
     uint64 stride;
     List<WGPUVertexAttribute> attrs;
+    WGPUVertexStepMode step;
+    uint32 location;
 }
 
+// How a pipeline blends its output with the target. NONE replaces the
+// target; ALPHA is source over (straight alpha), PREMULTIPLIED the same for
+// premultiplied colors, ADDITIVE adds the color scaled by its alpha, MULTIPLY
+// multiplies the target by the color, and CONSTANT mixes the source and the
+// target by the pass's blend constant (GpuPass_set_blend_constant): 1.0 is
+// all source, 0.0 keeps the target.
+enum GpuBlend {
+    GPU_BLEND_NONE,
+    GPU_BLEND_ALPHA,
+    GPU_BLEND_PREMULTIPLIED,
+    GPU_BLEND_ADDITIVE,
+    GPU_BLEND_MULTIPLY,
+    GPU_BLEND_CONSTANT
+}
+
+// A render pipeline's description. The zero value of each field is the
+// common case:
+// - layout is the one vertex buffer; layouts and layout_count list several
+//   (up to 8, bound with GpuPass_set_vertices; layouts wins when both are set).
+// - groups and group_count list the bind group layouts, one per @group index;
+//   without them the pipeline takes its layout from the shader and binds group
+//   0 with bind(), bind_texture() and bind_sampler().
+// - blend: true is GPU_BLEND_ALPHA; blend_mode picks a preset and blend_state,
+//   when not null, is any WGPUBlendState. no_color_write leaves the color
+//   target untouched (a depth-only draw).
+// - depth turns on the depth test against a depth_format texture (default
+//   Depth24Plus, also Depth32Float) with depth_compare (default Less);
+//   depth_read_only turns depth writes off. depth_bias and depth_bias_slope
+//   offset the depth written.
 struct GpuPipelineDesc {
     string wgsl;
     string vertex;
@@ -74,6 +128,17 @@ struct GpuPipelineDesc {
     bool blend;
     WGPUPrimitiveTopology topology;
     WGPUCullMode cull;
+    *GpuVertexLayout layouts;
+    uint32 layout_count;
+    **GpuBindLayout groups;
+    uint32 group_count;
+    GpuBlend blend_mode;
+    *WGPUBlendState blend_state;
+    bool no_color_write;
+    WGPUTextureFormat depth_format;
+    WGPUCompareFunction depth_compare;
+    int32 depth_bias;
+    float depth_bias_slope;
 }
 
 struct GpuPipeline {
@@ -82,6 +147,47 @@ struct GpuPipeline {
     WGPURenderPipeline handle;
     WGPUBindGroupLayout layout;
     List<WGPUBindGroupEntry> entries;
+    WGPUPipelineLayout pipeline_layout;
+    WGPUBindGroup group;
+    bool group_stale;
+}
+
+// The bindings of one @group, shared by the pipelines and bind groups made
+// from it. Add every entry before the first pipeline or group uses it.
+// visibility is a set of WGPUShaderStage bits (0 is vertex and fragment).
+struct GpuBindLayout {
+    Gpu gpu;
+    WGPUBindGroupLayout handle;
+    List<WGPUBindGroupLayoutEntry> entries;
+}
+
+// Resources for the bindings of a GpuBindLayout, set on a pass with
+// GpuPass_set_group. The WebGPU bind group is made on first use and kept until
+// a binding changes, so a group set every frame costs nothing to rebuild.
+struct GpuBindGroup {
+    Gpu gpu;
+    WGPUBindGroupLayout layout;
+    List<WGPUBindGroupEntry> entries;
+    WGPUBindGroup handle;
+    bool stale;
+}
+
+// A command encoder that passes are opened from (GpuEncoder_pass), sent to
+// the GPU in one submission by GpuEncoder_submit.
+struct GpuEncoder {
+    Gpu gpu;
+    WGPUCommandEncoder enc;
+    List<WGPUBindGroup> groups;
+}
+
+// A pass's attachments: the color target is cleared to clear, or keeps its
+// pixels with load; the depth texture, when given, is cleared to 1.0, or keeps
+// its values with depth_load.
+struct GpuPassOptions {
+    GpuColor clear;
+    bool load;
+    *GpuTexture depth;
+    bool depth_load;
 }
 
 struct GpuPass {
@@ -89,6 +195,18 @@ struct GpuPass {
     WGPUCommandEncoder enc;
     WGPURenderPassEncoder pass;
     List<WGPUBindGroup> groups;
+    *GpuEncoder encoder;
+}
+
+// A texture copy on its way back from the GPU (GpuTexture_read_async).
+struct GpuReadback {
+    Gpu gpu;
+    WGPUBuffer staging;
+    *_GpuWait wait;
+    uint32 width;
+    uint32 height;
+    uint32 row;
+    uint32 padded;
 }
 
 struct GpuSurface {
@@ -144,10 +262,25 @@ Result<GpuTexture, string> _gpu_texture(*Gpu self, uint32 width, uint32 height, 
     return Ok<GpuTexture, string>(tex);
 }
 
-// An RGBA8 texture to render into and read back.
+// An RGBA8 texture to render into, sample in a later pass and read back.
 Result<GpuTexture, string> Gpu_target(*Gpu self, uint32 width, uint32 height) {
-    return Gpu_texture(self, width, height, WGPUTextureFormat_RGBA8Unorm,
+    return Gpu_target_with(self, width, height, WGPUTextureFormat_RGBA8Unorm);
+}
+
+// Gpu_target in another format (RGBA8UnormSrgb, BGRA8Unorm, RGBA16Float...).
+Result<GpuTexture, string> Gpu_target_with(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format) {
+    return Gpu_texture(self, width, height, format,
         WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding);
+}
+
+// Bytes per texel of the color formats the texture calls copy (4 for the
+// formats not listed).
+uint32 _gpu_texel_bytes(WGPUTextureFormat f) {
+    if (f == WGPUTextureFormat_R8Unorm) return 1;
+    if (f == WGPUTextureFormat_RG8Unorm || f == WGPUTextureFormat_R16Float) return 2;
+    if (f == WGPUTextureFormat_RGBA16Float || f == WGPUTextureFormat_RG32Float) return 8;
+    if (f == WGPUTextureFormat_RGBA32Float) return 16;
+    return 4;
 }
 
 // An RGBA8 texture for shaders to sample, filled from width * height pixels
@@ -255,18 +388,33 @@ void GpuTexture_write(*GpuTexture self, *void rgba) {
     wgpuQueueWriteTexture(self.gpu.queue, &dst, rgba, (uint64)self.width * self.height * 4, &layout, &size);
 }
 
-// Copies the texture's pixels (4 bytes each, rows packed) to out, after the
-// work submitted so far has finished.
-Result<int, string> GpuTexture_read(*GpuTexture self, *void out) {
+// Replaces a width x height rectangle of the texture's pixels at (x, y),
+// from rows packed at the texture format's texel size (4 bytes for RGBA8):
+// an atlas update or a scrolling tile layer.
+void GpuTexture_write_region(*GpuTexture self, uint32 x, uint32 y, uint32 width, uint32 height, *void pixels) {
+    uint32 texel = _gpu_texel_bytes(self.format);
+    WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: self.handle, origin: WGPUOrigin3D{x, y, 0}, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, width * texel, height};
+    WGPUExtent3D size = WGPUExtent3D{width, height, 1};
+    wgpuQueueWriteTexture(self.gpu.queue, &dst, pixels, (uint64)width * height * texel, &layout, &size);
+}
+
+// Records a copy of the texture into a new MapRead buffer with rows padded
+// to 256 bytes, and submits it.
+Result<GpuReadback, string> _gpu_read_start(*GpuTexture self) {
     *Gpu g = &self.gpu;
-    uint32 row = self.width * 4;
-    uint32 padded = (row + 255) / 256 * 256;
-    GpuBuffer staging = Gpu_buffer(g, (uint64)padded * self.height, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
-    defer GpuBuffer_release(&staging);
+    GpuReadback rb;
+    rb.gpu = *g;
+    rb.width = self.width;
+    rb.height = self.height;
+    rb.row = self.width * _gpu_texel_bytes(self.format);
+    rb.padded = (rb.row + 255) / 256 * 256;
+    GpuBuffer staging = Gpu_buffer(g, (uint64)rb.padded * self.height, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
+    rb.staging = staging.handle;
     _gpu_push(g);
     WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
     WGPUTexelCopyTextureInfo src = WGPUTexelCopyTextureInfo{texture: self.handle, aspect: WGPUTextureAspect_All};
-    WGPUTexelCopyBufferInfo dst = WGPUTexelCopyBufferInfo{WGPUTexelCopyBufferLayout{0, padded, self.height}, staging.handle};
+    WGPUTexelCopyBufferInfo dst = WGPUTexelCopyBufferInfo{WGPUTexelCopyBufferLayout{0, rb.padded, self.height}, rb.staging};
     WGPUExtent3D size = WGPUExtent3D{self.width, self.height, 1};
     wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
@@ -274,14 +422,67 @@ Result<int, string> GpuTexture_read(*GpuTexture self, *void out) {
     wgpuCommandBufferRelease(cmd);
     wgpuCommandEncoderRelease(enc);
     string err = _gpu_pop(g, "read");
-    if (err != null) return Err<int, string>(err);
-    *uint8 rows = alloc<uint8>((int)(padded * self.height));
-    defer free(rows);
-    GpuBuffer_read_mapped(&staging, rows, (uint64)padded * self.height)?;
-    for (y in 0..self.height) {
-        memcpy((*uint8)out + y * row, rows + y * padded, (int64)row);
+    if (err != null) {
+        wgpuBufferRelease(rb.staging);
+        return Err<GpuReadback, string>(err);
     }
+    rb.wait = alloc<_GpuWait>(1);
+    WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: rb.wait};
+    wgpuBufferMapAsync(rb.staging, WGPUMapMode_Read, 0, (uint64)rb.padded * rb.height, mi);
+    return Ok<GpuReadback, string>(rb);
+}
+
+// Copies the texture's pixels (rows packed) to out, after the work submitted
+// so far has finished.
+Result<int, string> GpuTexture_read(*GpuTexture self, *void out) {
+    GpuReadback rb = _gpu_read_start(self)?;
+    defer GpuReadback_release(&rb);
+    return GpuReadback_take(&rb, out);
+}
+
+// Starts copying the texture's pixels back without waiting for the GPU: after
+// the frame's submission, take the pixels once ready() says so (or call take(),
+// which waits), then release the readback.
+//
+//     GpuReadback rb = target.read_async()?;
+//     ...later frames:
+//     if (rb.ready()) { rb.take(pixels)?; rb.release(); }
+Result<GpuReadback, string> GpuTexture_read_async(*GpuTexture self) {
+    return _gpu_read_start(self);
+}
+
+// Whether the pixels have arrived; it checks without blocking.
+bool GpuReadback_ready(*GpuReadback self) {
+    if (self.wait == null) return false;
+    if (self.wait.done == 0) wgpuDevicePoll(self.gpu.device, 0, null);
+    return self.wait.done != 0;
+}
+
+// Copies the pixels (rows packed) to out, waiting for them if needed; once.
+Result<int, string> GpuReadback_take(*GpuReadback self, *void out) {
+    if (self.wait == null || self.staging == null) return Err<int, string>(_gpu_fail("read: no readback, or already taken", null));
+    _gpu_wait(&self.gpu, self.wait);
+    if (self.wait.done == 0 || self.wait.status != WGPUMapAsyncStatus_Success) return Err<int, string>(_gpu_fail("read", &self.wait.msg));
+    uint64 bytes = (uint64)self.padded * self.height;
+    *uint8 rows = (*uint8)wgpuBufferGetConstMappedRange(self.staging, 0, bytes);
+    for (y in 0..self.height) {
+        memcpy((*uint8)out + (uint64)y * self.row, rows + (uint64)y * self.padded, (int64)self.row);
+    }
+    wgpuBufferUnmap(self.staging);
+    wgpuBufferRelease(self.staging);
+    self.staging = null;
     return Ok<int, string>(0);
+}
+
+void GpuReadback_release(*GpuReadback self) {
+    if (self.wait != null) {
+        _gpu_wait(&self.gpu, self.wait);
+        String_free(&self.wait.msg);
+        free(self.wait);
+    }
+    if (self.staging != null) wgpuBufferRelease(self.staging);
+    self.wait = null;
+    self.staging = null;
 }
 
 void GpuTexture_release(*GpuTexture self) {
@@ -320,11 +521,29 @@ void GpuSampler_release(*GpuSampler self) {
 }
 
 void GpuVertexLayout_add(*GpuVertexLayout self, WGPUVertexFormat format, uint64 offset) {
-    List_push(&self.attrs, WGPUVertexAttribute{format: format, offset: offset, shaderLocation: (uint32)self.attrs.size});
+    List_push(&self.attrs, WGPUVertexAttribute{format: format, offset: offset, shaderLocation: self.location + (uint32)self.attrs.size});
 }
 
 void GpuVertexLayout_release(*GpuVertexLayout self) {
     List_free(&self.attrs);
+}
+
+WGPUBlendState _gpu_blend_state(GpuBlend mode) {
+    WGPUBlendComponent over = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha};
+    if (mode == GPU_BLEND_PREMULTIPLIED) return WGPUBlendState{over, over};
+    if (mode == GPU_BLEND_ADDITIVE) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_One},
+            WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Zero, WGPUBlendFactor_One}};
+    }
+    if (mode == GPU_BLEND_MULTIPLY) {
+        return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Dst, WGPUBlendFactor_Zero},
+            WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Zero, WGPUBlendFactor_One}};
+    }
+    if (mode == GPU_BLEND_CONSTANT) {
+        WGPUBlendComponent mix = WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_Constant, WGPUBlendFactor_OneMinusConstant};
+        return WGPUBlendState{mix, mix};
+    }
+    return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha}, over};
 }
 
 Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
@@ -337,27 +556,55 @@ Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
         GpuPipeline_release(&p);
         return Err<GpuPipeline, string>(err);
     }
-    WGPUVertexBufferLayout vb;
-    uint64 nbuf = 0;
-    if (d.layout != null) {
-        vb = WGPUVertexBufferLayout{stepMode: WGPUVertexStepMode_Vertex, arrayStride: d.layout.stride,
-            attributeCount: (uint64)d.layout.attrs.size, attributes: d.layout.attrs.data};
-        nbuf = 1;
+    *GpuVertexLayout vls = d.layout_count > 0 ? d.layouts : d.layout;
+    uint32 nbuf = d.layout_count > 0 ? d.layout_count : (d.layout != null ? (uint32)1 : (uint32)0);
+    if (nbuf > 8) {
+        GpuPipeline_release(&p);
+        return Err<GpuPipeline, string>(_gpu_fail("pipeline: more than 8 vertex buffers", null));
     }
-    WGPUBlendState blend = WGPUBlendState{
-        WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha},
-        WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_One, WGPUBlendFactor_OneMinusSrcAlpha}};
-    WGPUColorTargetState target = WGPUColorTargetState{format: d.format, writeMask: WGPUColorWriteMask_All};
-    if (d.blend) target.blend = &blend;
+    WGPUVertexBufferLayout[8] vb;
+    for (i in 0..nbuf) {
+        vb[i] = WGPUVertexBufferLayout{stepMode: vls[i].step != 0 ? vls[i].step : WGPUVertexStepMode_Vertex, arrayStride: vls[i].stride,
+            attributeCount: (uint64)vls[i].attrs.size, attributes: vls[i].attrs.data};
+    }
+    if (d.group_count > 0) {
+        WGPUBindGroupLayout[8] bgl;
+        if (d.group_count > 8) {
+            GpuPipeline_release(&p);
+            return Err<GpuPipeline, string>(_gpu_fail("pipeline: more than 8 bind groups", null));
+        }
+        for (i in 0..d.group_count) {
+            Result<int, string> made = _gpu_bind_layout_make(d.groups[i]);
+            if (!made.ok) {
+                GpuPipeline_release(&p);
+                return Err<GpuPipeline, string>(made.error);
+            }
+            bgl[i] = d.groups[i].handle;
+        }
+        _gpu_push(self);
+        WGPUPipelineLayoutDescriptor pld = WGPUPipelineLayoutDescriptor{bindGroupLayoutCount: (uint64)d.group_count, bindGroupLayouts: &bgl[0]};
+        p.pipeline_layout = wgpuDeviceCreatePipelineLayout(self.device, &pld);
+        err = _gpu_pop(self, "pipeline layout");
+        if (err != null) {
+            GpuPipeline_release(&p);
+            return Err<GpuPipeline, string>(err);
+        }
+    }
+    GpuBlend mode = d.blend_mode;
+    if (mode == GPU_BLEND_NONE && d.blend) mode = GPU_BLEND_ALPHA;
+    WGPUBlendState blend = _gpu_blend_state(mode);
+    WGPUColorTargetState target = WGPUColorTargetState{format: d.format, writeMask: d.no_color_write ? WGPUColorWriteMask_None : WGPUColorWriteMask_All};
+    if (d.blend_state != null) target.blend = d.blend_state;
+    else if (mode != GPU_BLEND_NONE) target.blend = &blend;
     WGPUFragmentState frag = WGPUFragmentState{module: p.module, entryPoint: gpu_str(d.fragment), targetCount: 1, targets: &target};
-    WGPUDepthStencilState ds = WGPUDepthStencilState{format: WGPUTextureFormat_Depth24Plus,
+    WGPUDepthStencilState ds = WGPUDepthStencilState{format: d.depth_format != 0 ? d.depth_format : WGPUTextureFormat_Depth24Plus,
         depthWriteEnabled: d.depth_read_only ? WGPUOptionalBool_False : WGPUOptionalBool_True,
-        depthCompare: WGPUCompareFunction_Less,
+        depthCompare: d.depth_compare != 0 ? d.depth_compare : WGPUCompareFunction_Less,
         stencilFront: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
         stencilBack: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
-        stencilReadMask: 0xFFFFFFFF, stencilWriteMask: 0xFFFFFFFF};
-    WGPURenderPipelineDescriptor rd = WGPURenderPipelineDescriptor{
-        vertex: WGPUVertexState{module: p.module, entryPoint: gpu_str(d.vertex), bufferCount: nbuf, buffers: &vb},
+        stencilReadMask: 0xFFFFFFFF, stencilWriteMask: 0xFFFFFFFF, depthBias: d.depth_bias, depthBiasSlopeScale: d.depth_bias_slope};
+    WGPURenderPipelineDescriptor rd = WGPURenderPipelineDescriptor{layout: p.pipeline_layout,
+        vertex: WGPUVertexState{module: p.module, entryPoint: gpu_str(d.vertex), bufferCount: (uint64)nbuf, buffers: &vb[0]},
         primitive: WGPUPrimitiveState{topology: d.topology != 0 ? d.topology : WGPUPrimitiveTopology_TriangleList,
             frontFace: WGPUFrontFace_CCW, cullMode: d.cull != 0 ? d.cull : WGPUCullMode_None},
         multisample: WGPUMultisampleState{count: 1, mask: 0xFFFFFFFF},
@@ -373,15 +620,21 @@ Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
     return Ok<GpuPipeline, string>(p);
 }
 
-void _gpu_pipeline_entry(*GpuPipeline self, WGPUBindGroupEntry e) {
-    if (self.layout == null) self.layout = wgpuRenderPipelineGetBindGroupLayout(self.handle, 0);
-    for (i in 0..self.entries.size) {
-        if (self.entries.data[i].binding == e.binding) {
-            self.entries.data[i] = e;
+// Sets entry e.binding in entries, replacing an entry of the same binding.
+void _gpu_set_entry(List<WGPUBindGroupEntry>* entries, WGPUBindGroupEntry e) {
+    for (i in 0..entries.size) {
+        if (entries.data[i].binding == e.binding) {
+            entries.data[i] = e;
             return;
         }
     }
-    List_push(&self.entries, e);
+    List_push(entries, e);
+}
+
+void _gpu_pipeline_entry(*GpuPipeline self, WGPUBindGroupEntry e) {
+    if (self.layout == null) self.layout = wgpuRenderPipelineGetBindGroupLayout(self.handle, 0);
+    _gpu_set_entry(&self.entries, e);
+    self.group_stale = true;
 }
 
 void GpuPipeline_bind(*GpuPipeline self, uint32 binding, *GpuBuffer b) {
@@ -397,51 +650,255 @@ void GpuPipeline_bind_sampler(*GpuPipeline self, uint32 binding, *GpuSampler s) 
 }
 
 void GpuPipeline_release(*GpuPipeline self) {
+    if (self.group != null) wgpuBindGroupRelease(self.group);
     if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
     if (self.handle != null) wgpuRenderPipelineRelease(self.handle);
+    if (self.pipeline_layout != null) wgpuPipelineLayoutRelease(self.pipeline_layout);
     if (self.module != null) wgpuShaderModuleRelease(self.module);
     List_free(&self.entries);
+    self.group = null;
     self.layout = null;
     self.handle = null;
+    self.pipeline_layout = null;
     self.module = null;
+}
+
+// An empty bind group layout; add its entries, then name it in
+// GpuPipelineDesc.groups and make groups from it with group().
+GpuBindLayout Gpu_bind_layout(*Gpu self) {
+    GpuBindLayout l;
+    l.gpu = *self;
+    return l;
+}
+
+WGPUShaderStage _gpu_visibility(WGPUShaderStage v) {
+    return v != 0 ? v : WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+}
+
+// A uniform buffer (var<uniform>) at binding.
+void GpuBindLayout_uniform(*GpuBindLayout self, uint32 binding, WGPUShaderStage visibility) {
+    List_push(&self.entries, WGPUBindGroupLayoutEntry{binding: binding, visibility: _gpu_visibility(visibility),
+        buffer: WGPUBufferBindingLayout{type_: WGPUBufferBindingType_Uniform}});
+}
+
+// A storage buffer (var<storage, read> when read_only, else read_write; the
+// vertex stage may only read).
+void GpuBindLayout_storage(*GpuBindLayout self, uint32 binding, WGPUShaderStage visibility, bool read_only) {
+    WGPUBufferBindingType t = read_only ? WGPUBufferBindingType_ReadOnlyStorage : WGPUBufferBindingType_Storage;
+    List_push(&self.entries, WGPUBindGroupLayoutEntry{binding: binding, visibility: _gpu_visibility(visibility),
+        buffer: WGPUBufferBindingLayout{type_: t}});
+}
+
+// A 2D texture; sample_type is a WGPUTextureSampleType (0 is Float, the
+// filterable kind; UnfilterableFloat goes with a NonFiltering sampler).
+void GpuBindLayout_texture(*GpuBindLayout self, uint32 binding, WGPUShaderStage visibility, WGPUTextureSampleType sample_type) {
+    List_push(&self.entries, WGPUBindGroupLayoutEntry{binding: binding, visibility: _gpu_visibility(visibility),
+        texture: WGPUTextureBindingLayout{sampleType: sample_type != 0 ? sample_type : WGPUTextureSampleType_Float,
+            viewDimension: WGPUTextureViewDimension_2D}});
+}
+
+// A sampler; kind is a WGPUSamplerBindingType (0 is Filtering; NonFiltering
+// for nearest-only samplers over unfilterable textures; Comparison).
+void GpuBindLayout_sampler(*GpuBindLayout self, uint32 binding, WGPUShaderStage visibility, WGPUSamplerBindingType kind) {
+    List_push(&self.entries, WGPUBindGroupLayoutEntry{binding: binding, visibility: _gpu_visibility(visibility),
+        sampler: WGPUSamplerBindingLayout{type_: kind != 0 ? kind : WGPUSamplerBindingType_Filtering}});
+}
+
+// Makes the WebGPU layout the first time it is needed.
+Result<int, string> _gpu_bind_layout_make(*GpuBindLayout self) {
+    if (self.handle != null) return Ok<int, string>(0);
+    _gpu_push(&self.gpu);
+    WGPUBindGroupLayoutDescriptor d = WGPUBindGroupLayoutDescriptor{entryCount: (uint64)self.entries.size, entries: self.entries.data};
+    self.handle = wgpuDeviceCreateBindGroupLayout(self.gpu.device, &d);
+    string err = _gpu_pop(&self.gpu, "bind layout");
+    if (err != null) {
+        if (self.handle != null) wgpuBindGroupLayoutRelease(self.handle);
+        self.handle = null;
+        return Err<int, string>(err);
+    }
+    return Ok<int, string>(0);
+}
+
+// A bind group for this layout, to fill with buffer(), texture() and
+// sampler(). It keeps the layout alive.
+Result<GpuBindGroup, string> GpuBindLayout_group(*GpuBindLayout self) {
+    _gpu_bind_layout_make(self)?;
+    wgpuBindGroupLayoutAddRef(self.handle);
+    GpuBindGroup g;
+    g.gpu = self.gpu;
+    g.layout = self.handle;
+    return Ok<GpuBindGroup, string>(g);
+}
+
+void GpuBindLayout_release(*GpuBindLayout self) {
+    if (self.handle != null) wgpuBindGroupLayoutRelease(self.handle);
+    List_free(&self.entries);
+    self.handle = null;
+}
+
+void GpuBindGroup_buffer(*GpuBindGroup self, uint32 binding, *GpuBuffer b) {
+    _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, buffer: b.handle, size: b.size});
+    self.stale = true;
+}
+
+void GpuBindGroup_texture(*GpuBindGroup self, uint32 binding, *GpuTexture t) {
+    _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, textureView: t.view});
+    self.stale = true;
+}
+
+void GpuBindGroup_sampler(*GpuBindGroup self, uint32 binding, *GpuSampler s) {
+    _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, sampler: s.handle});
+    self.stale = true;
+}
+
+void GpuBindGroup_release(*GpuBindGroup self) {
+    if (self.handle != null) wgpuBindGroupRelease(self.handle);
+    if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
+    List_free(&self.entries);
+    self.handle = null;
+    self.layout = null;
+}
+
+// The bind group for layout and entries: cached in *group, rebuilt when stale.
+// A replaced group is kept by the pass until it ends, since the commands
+// recorded so far may use it.
+void _gpu_group_for(*GpuPass self, WGPUBindGroupLayout layout, List<WGPUBindGroupEntry>* entries, *WGPUBindGroup group, *bool stale) {
+    if (*group != null && !*stale) return;
+    if (*group != null) List_push(&self.groups, *group);
+    WGPUBindGroupDescriptor bd = WGPUBindGroupDescriptor{layout: layout, entryCount: (uint64)entries.size, entries: entries.data};
+    *group = wgpuDeviceCreateBindGroup(self.gpu.device, &bd);
+    *stale = false;
+}
+
+// A command encoder for several passes and one submission.
+GpuEncoder Gpu_encoder(*Gpu self) {
+    GpuEncoder e;
+    e.gpu = *self;
+    _gpu_push(self);
+    e.enc = wgpuDeviceCreateCommandEncoder(self.device, null);
+    return e;
+}
+
+void _gpu_begin(*GpuPass p, WGPUTextureView target, *GpuPassOptions o) {
+    WGPURenderPassColorAttachment color = WGPURenderPassColorAttachment{view: target, depthSlice: WGPU_DEPTH_SLICE_UNDEFINED,
+        loadOp: o.load ? WGPULoadOp_Load : WGPULoadOp_Clear, storeOp: WGPUStoreOp_Store, clearValue: o.clear};
+    WGPURenderPassDepthStencilAttachment da;
+    WGPURenderPassDescriptor rd = WGPURenderPassDescriptor{colorAttachmentCount: 1, colorAttachments: &color};
+    if (o.depth != null) {
+        da = WGPURenderPassDepthStencilAttachment{view: o.depth.view, depthLoadOp: o.depth_load ? WGPULoadOp_Load : WGPULoadOp_Clear,
+            depthStoreOp: WGPUStoreOp_Store, depthClearValue: 1.0};
+        rd.depthStencilAttachment = &da;
+    }
+    p.pass = wgpuCommandEncoderBeginRenderPass(p.enc, &rd);
+}
+
+// A pass recorded into the encoder: end() closes it, and the encoder's
+// submit() sends it with the others and reports its errors.
+GpuPass GpuEncoder_pass(*GpuEncoder self, WGPUTextureView target, GpuColor clear, *GpuTexture depth) {
+    GpuPassOptions o = GpuPassOptions{clear: clear, depth: depth};
+    return GpuEncoder_pass_with(self, target, &o);
+}
+
+GpuPass GpuEncoder_pass_with(*GpuEncoder self, WGPUTextureView target, *GpuPassOptions o) {
+    GpuPass p;
+    p.gpu = self.gpu;
+    p.enc = self.enc;
+    p.encoder = self;
+    _gpu_begin(&p, target, o);
+    return p;
+}
+
+// Sends the passes to the GPU and reports the errors of the whole frame.
+Result<int, string> GpuEncoder_submit(*GpuEncoder self) {
+    string err = _gpu_finish(&self.gpu, self.enc, "frame");
+    self.enc = null;
+    for (i in 0..self.groups.size) wgpuBindGroupRelease(self.groups.data[i]);
+    List_free(&self.groups);
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+// Finishes enc and pops the error scope pushed when it was made; the commands
+// are submitted only when they are valid (wgpu-native aborts on submitting
+// invalid ones). Releases enc.
+string _gpu_finish(*Gpu g, WGPUCommandEncoder enc, string what) {
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
+    wgpuCommandEncoderRelease(enc);
+    string err = _gpu_pop(g, what);
+    if (err == null && cmd != null) wgpuQueueSubmit(g.queue, 1, &cmd);
+    if (cmd != null) wgpuCommandBufferRelease(cmd);
+    return err;
 }
 
 // Starts a render pass that clears target to clear (and depth, when given, to
 // 1.0). Errors in the pass are reported by end().
 GpuPass Gpu_pass(*Gpu self, WGPUTextureView target, GpuColor clear, *GpuTexture depth) {
+    GpuPassOptions o = GpuPassOptions{clear: clear, depth: depth};
+    return Gpu_pass_with(self, target, &o);
+}
+
+// Gpu_pass with load ops per attachment: a pass that draws over what an
+// earlier pass left (a UI over the scene).
+GpuPass Gpu_pass_with(*Gpu self, WGPUTextureView target, *GpuPassOptions o) {
     GpuPass p;
     p.gpu = *self;
     _gpu_push(self);
     p.enc = wgpuDeviceCreateCommandEncoder(self.device, null);
-    WGPURenderPassColorAttachment color = WGPURenderPassColorAttachment{view: target, depthSlice: WGPU_DEPTH_SLICE_UNDEFINED,
-        loadOp: WGPULoadOp_Clear, storeOp: WGPUStoreOp_Store, clearValue: clear};
-    WGPURenderPassDepthStencilAttachment da;
-    WGPURenderPassDescriptor rd = WGPURenderPassDescriptor{colorAttachmentCount: 1, colorAttachments: &color};
-    if (depth != null) {
-        da = WGPURenderPassDepthStencilAttachment{view: depth.view, depthLoadOp: WGPULoadOp_Clear,
-            depthStoreOp: WGPUStoreOp_Store, depthClearValue: 1.0};
-        rd.depthStencilAttachment = &da;
-    }
-    p.pass = wgpuCommandEncoderBeginRenderPass(p.enc, &rd);
+    _gpu_begin(&p, target, o);
     return p;
 }
 
 void _gpu_pass_setup(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices) {
     wgpuRenderPassEncoderSetPipeline(self.pass, pipe.handle);
     if (pipe.entries.size > 0) {
-        WGPUBindGroupDescriptor bd = WGPUBindGroupDescriptor{layout: pipe.layout, entryCount: (uint64)pipe.entries.size, entries: pipe.entries.data};
-        WGPUBindGroup group = wgpuDeviceCreateBindGroup(self.gpu.device, &bd);
-        List_push(&self.groups, group);
-        wgpuRenderPassEncoderSetBindGroup(self.pass, 0, group, 0, null);
+        _gpu_group_for(self, pipe.layout, &pipe.entries, &pipe.group, &pipe.group_stale);
+        wgpuRenderPassEncoderSetBindGroup(self.pass, 0, pipe.group, 0, null);
     }
     if (vertices != null) wgpuRenderPassEncoderSetVertexBuffer(self.pass, 0, vertices.handle, 0, vertices.size);
 }
 
+// Sets bind group index for the draws that follow (it stays set across
+// pipelines whose layouts agree on it).
+void GpuPass_set_group(*GpuPass self, uint32 index, *GpuBindGroup g) {
+    _gpu_group_for(self, g.layout, &g.entries, &g.handle, &g.stale);
+    wgpuRenderPassEncoderSetBindGroup(self.pass, index, g.handle, 0, null);
+}
+
+// Sets vertex buffer slot for the draws that follow; slot 0 is also set by
+// the vertices argument of draw() when it is not null.
+void GpuPass_set_vertices(*GpuPass self, uint32 slot, *GpuBuffer b) {
+    wgpuRenderPassEncoderSetVertexBuffer(self.pass, slot, b.handle, 0, b.size);
+}
+
+// Clips the draws that follow to a rectangle of the target, in pixels from
+// the top left.
+void GpuPass_set_scissor(*GpuPass self, uint32 x, uint32 y, uint32 width, uint32 height) {
+    wgpuRenderPassEncoderSetScissorRect(self.pass, x, y, width, height);
+}
+
+// Maps clip space to a rectangle of the target, in pixels from the top left,
+// and depth to min_depth..max_depth.
+void GpuPass_set_viewport(*GpuPass self, float x, float y, float width, float height, float min_depth = 0.0, float max_depth = 1.0) {
+    wgpuRenderPassEncoderSetViewport(self.pass, x, y, width, height, min_depth, max_depth);
+}
+
+// The constant of the GPU_BLEND_CONSTANT preset and of WGPUBlendFactor_Constant.
+void GpuPass_set_blend_constant(*GpuPass self, GpuColor c) {
+    wgpuRenderPassEncoderSetBlendConstant(self.pass, &c);
+}
+
 // Draws count vertices instances times; vertices may be null for a shader
-// that makes its own (from @builtin(vertex_index)).
+// that makes its own (from @builtin(vertex_index)) or for buffers set with
+// set_vertices().
 void GpuPass_draw(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, uint32 count, uint32 instances) {
     _gpu_pass_setup(self, pipe, vertices);
     wgpuRenderPassEncoderDraw(self.pass, count, instances, 0, 0);
+}
+
+// GpuPass_draw from vertex first and instance first_instance.
+void GpuPass_draw_range(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, uint32 first, uint32 count, uint32 first_instance, uint32 instances) {
+    _gpu_pass_setup(self, pipe, vertices);
+    wgpuRenderPassEncoderDraw(self.pass, count, instances, first, first_instance);
 }
 
 void GpuPass_draw_indexed(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, *GpuBuffer indices, uint32 count, uint32 instances) {
@@ -450,18 +907,22 @@ void GpuPass_draw_indexed(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices,
     wgpuRenderPassEncoderDrawIndexed(self.pass, count, instances, 0, 0, 0);
 }
 
-// Ends the pass and submits it.
+// Ends the pass and submits it; a pass from a GpuEncoder is submitted (and
+// its errors reported) by the encoder's submit().
 Result<int, string> GpuPass_end(*GpuPass self) {
     *Gpu g = &self.gpu;
     wgpuRenderPassEncoderEnd(self.pass);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(self.enc, null);
-    wgpuQueueSubmit(g.queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
     wgpuRenderPassEncoderRelease(self.pass);
-    wgpuCommandEncoderRelease(self.enc);
+    self.pass = null;
+    if (self.encoder != null) {
+        for (i in 0..self.groups.size) List_push(&self.encoder.groups, self.groups.data[i]);
+        List_free(&self.groups);
+        return Ok<int, string>(0);
+    }
+    string err = _gpu_finish(g, self.enc, "render pass");
+    self.enc = null;
     for (i in 0..self.groups.size) wgpuBindGroupRelease(self.groups.data[i]);
     List_free(&self.groups);
-    string err = _gpu_pop(g, "render pass");
     if (err != null) return Err<int, string>(err);
     return Ok<int, string>(0);
 }
