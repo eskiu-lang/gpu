@@ -637,3 +637,62 @@ void GpuModel_release(*GpuModel self) {
     if (self.world != null) free(self.world);
     self.world = null;
 }
+
+// A skin's joint matrices in a GPU buffer, for skinning in your own shader:
+// joint j's matrix (joint world matrix times inverse bind matrix) is the
+// mat4x4<f32> at byte j * 64. Gpu_joints makes a storage buffer
+// (var<storage, read> joints: array<mat4x4<f32>>); Gpu_joints_uniform a
+// uniform buffer of capacity matrices (var<uniform> joints:
+// array<mat4x4<f32>, capacity>), for targets without vertex storage buffers.
+// As in glTF, a skinned mesh ignores its own node's transform:
+//
+//     let skin = joints[j.x] * w.x + joints[j.y] * w.y + joints[j.z] * w.z + joints[j.w] * w.w;
+//     out.pos = view_proj * skin * vec4(p, 1.0);
+//
+// update() recomputes the matrices from the Gltf's current pose.
+struct GpuJoints {
+    GpuBuffer buffer;
+    int skin;
+    int count;
+    *Mat4 world;
+    *Mat4 matrices;
+}
+
+Result<GpuJoints, string> Gpu_joints(*Gpu self, *Gltf data, int skin) {
+    return _gpu_joints(self, data, skin, 0, WGPUBufferUsage_Storage);
+}
+
+Result<GpuJoints, string> Gpu_joints_uniform(*Gpu self, *Gltf data, int skin, int capacity) {
+    return _gpu_joints(self, data, skin, capacity, WGPUBufferUsage_Uniform);
+}
+
+Result<GpuJoints, string> _gpu_joints(*Gpu self, *Gltf data, int skin, int capacity, WGPUBufferUsage usage) {
+    if (skin < 0 || skin >= data.skins.size) return Err<GpuJoints, string>(_gpu_fail("joints: no such skin", null));
+    GpuJoints j;
+    j.skin = skin;
+    j.count = data.skins.data[skin].joints.size;
+    if (capacity > 0 && capacity < j.count) return Err<GpuJoints, string>(_gpu_fail("joints: the skin has more joints than capacity", null));
+    int n = capacity > 0 ? capacity : j.count;
+    if (n < 1) n = 1;
+    j.buffer = Gpu_buffer(self, (uint64)n * 64, usage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc)?;
+    j.world = alloc<Mat4>(data.nodes.size + 1);
+    j.matrices = alloc<Mat4>(n);
+    for (i in 0..n) j.matrices[i] = mat4_identity();
+    j.buffer.write(0, j.matrices, (uint64)n * 64);
+    GpuJoints_update(&j, data);
+    return Ok<GpuJoints, string>(j);
+}
+
+void GpuJoints_update(*GpuJoints self, *Gltf data) {
+    Gltf_world(data, self.world);
+    Gltf_joint_matrices(data, self.skin, self.world, self.matrices);
+    if (self.count > 0) self.buffer.write(0, self.matrices, (uint64)self.count * 64);
+}
+
+void GpuJoints_release(*GpuJoints self) {
+    self.buffer.release();
+    if (self.world != null) free(self.world);
+    if (self.matrices != null) free(self.matrices);
+    self.world = null;
+    self.matrices = null;
+}
