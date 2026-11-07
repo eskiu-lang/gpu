@@ -200,11 +200,61 @@ The rest of `GpuPipelineDesc`:
 | `blend_mode` | `GPU_BLEND_NONE` (`blend: true` is `GPU_BLEND_ALPHA`) | `GPU_BLEND_ALPHA`, `PREMULTIPLIED`, `ADDITIVE`, `MULTIPLY`, `CONSTANT` (mixes by the pass's `set_blend_constant`) |
 | `blend_state` | null | any `*WGPUBlendState`, such as `SrcAlpha` plus `Constant` for a fade |
 | `no_color_write` | colors written | `true` for a depth-only draw |
-| `depth_format` | `Depth24Plus` | `Depth32Float` (make the texture with `gpu.texture(w, h, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)`) |
+| `depth_format` | `Depth24Plus` | `Depth32Float` (make the texture with `gpu.texture(w, h, WGPUTextureFormat_Depth32Float, WGPUTextureUsage_RenderAttachment)`), `Depth24PlusStencil8`, `Depth32FloatStencil8` (when `gpu.depth32_stencil8`), `Stencil8` |
 | `depth_compare` | `Less` | any `WGPUCompareFunction`, such as `Always` for overlays |
 | `depth_read_only` | depth written | `true` turns depth writes off |
 | `depth_bias`, `depth_bias_slope` | 0 | a depth offset |
 | `layouts`, `layout_count` | the one `layout` | up to 8 vertex buffers, each a `GpuVertexLayout` with a `step` (`WGPUVertexStepMode_Instance` for per-instance data) and a first `location` |
+| `stencil_front`, `stencil_back` | Always, Keep (back is front) | a `GpuStencilFace` |
+| `stencil_read_mask`, `stencil_write_mask` | 0xFF | any 8-bit mask |
+| `samples` | 1 | 4 (with `gpu.target_msaa` attachments) |
+
+### Stencil and multisampling
+
+A depth format with a stencil (`Depth24PlusStencil8` from `gpu.depth_stencil(w, h)`, available
+everywhere; `Depth32FloatStencil8` when `gpu.depth32_stencil8`) gives each pixel an 8-bit
+value that draws test and update. A pipeline's `stencil_front` and `stencil_back` are
+`GpuStencilFace{compare, fail, depth_fail, pass}` (zero: Always and Keep; a zero
+`stencil_back` is `stencil_front`), `stencil_read_mask`/`stencil_write_mask` are 0xFF when 0,
+and the pass sets the reference with `set_stencil_reference`. The stencil needs `depth: true`;
+a stencil-only draw sets `depth_compare: WGPUCompareFunction_Always, depth_read_only: true`,
+and `no_color_write: true` draws into the stencil alone. Outlines, for instance:
+
+```eskiu
+GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format,
+    depth: true, depth_format: WGPUTextureFormat_Depth24PlusStencil8,
+    depth_compare: WGPUCompareFunction_Always, depth_read_only: true, no_color_write: true,
+    stencil_front: GpuStencilFace{pass: WGPUStencilOperation_Replace}};
+GpuPipeline mark = gpu.pipeline(&d)?;
+d.no_color_write = false;
+d.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_NotEqual};
+GpuPipeline outline = gpu.pipeline(&d)?;
+// ...
+pass.set_stencil_reference(3);
+pass.draw(&mark, &object, n, 1);
+pass.draw(&outline, &bigger_object, n, 1);
+```
+
+`GpuPassOptions` clears the stencil to `stencil_clear` (0 by default, `0xFF` for PICA-style
+code) or keeps it with `stencil_load`.
+
+For 4x antialiasing, draw into multisampled attachments and resolve into the frame:
+
+```eskiu
+GpuTexture color = gpu.target_msaa(w, h, surface.format, 4)?;
+GpuTexture depth = gpu.target_msaa(w, h, WGPUTextureFormat_Depth24Plus, 4)?;
+GpuPipelineDesc d = GpuPipelineDesc{..., depth: true, samples: 4};
+// every frame
+GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.1, 0.1, 0.1, 1.0}, depth: &depth,
+    resolve: frame.view, discard: true};
+GpuPass pass = gpu.pass_with(color.view, &o);
+```
+
+Every pipeline in the pass needs the attachments' sample count (`end()` returns an `Err`
+otherwise). `discard` drops the multisampled pixels once resolved, which saves memory traffic
+on phones. A multisampled texture cannot be sampled or read back: read the resolve target.
+
+### Instances, ranges, viewport and scissor
 
 Per-instance data goes in a second vertex buffer, set with `pass.set_vertices(1, &instances)`;
 `pass.draw_range(&pipe, &vertices, first, count, first_instance, instances)` draws part of a
@@ -326,7 +376,7 @@ g.adam(0.001);       // and the optimizer step
 | WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | not yet |
 | `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | no |
 | `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
-| `<gpu/math>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
+| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
 
 On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
 `gpu_ui_surface(&gpu)`) or directly into a `CAMetalLayer` (`gpu.surface_metal(layer)`) or
@@ -334,32 +384,69 @@ On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_
 (through emscripten's `emdawnwebgpu`), which cannot block on the GPU as `wgpuDevicePoll`
 does.
 
+A game holds its `Gpu` and `GpuSurface` while the surface lives and draws once per display
+frame with eskiu-ui's `use_frame`, which runs while its first argument is true:
+
 ```eskiu
 import <ui>;
 import <gpu/ui>;
 #if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 import <gpu>;
+
+Gpu gpu;
+GpuSurface surface;
+bool live = false;
 #endif
 
 void App() {
+    *GpuTouches touches = use_gpu_touches();
+    *Signal<bool> ready = use_signal<bool>(false);
     use_gpu_surface(void(uint32 w, uint32 h) {
 #if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
-        if (w == 0) { return; }   // the surface went away (the app went to the background)
-        Gpu gpu = gpu_open().value;
-        defer gpu.release();
-        GpuSurface surface = gpu_ui_surface(&gpu).value;
-        defer surface.release();
+        if (live) { surface.release(); gpu.release(); live = false; }
+        if (w != 0) {   // (0, 0): the surface went away (the app went to the background)
+            gpu = gpu_open().value;
+            surface = gpu_ui_surface(&gpu).value;
+            live = true;
+        }
+#endif
+        ready.set(w != 0);
+    });
+    use_frame(ready.get(), void(Tick tick) {
+#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
+        int n = touches.count();   // fingers down; touches.down has each one's id and position
         GpuFrame frame = surface.frame().value;
-        GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
-        pass.end();
+        GpuPass pass = gpu.pass(frame.view, GpuColor{n > 0 ? 0.6 : 0.08, 0.08, 0.1, 1.0}, null);
+        (void)pass.end();
         surface.present(&frame);
 #endif
+        touches.end_frame();
     });
     Column(Style{grow: 1}) {
         GpuView(Style{grow: 1});
+        ButtonWith(Style{absolute: true, right: 24, bottom: 48}, "Attack") { /* ... */ }
     }
 }
 ```
+
+### Touches
+
+A `GpuView` takes several fingers at once. `use_gpu_touch(fn(GpuTouch))` calls its handler
+with each change: `id` (the same from down to up, reused by a later finger after that),
+`phase` (`GPU_TOUCH_DOWN`, `GPU_TOUCH_MOVE`, `GPU_TOUCH_UP`, `GPU_TOUCH_CANCEL`), `x` and `y`
+in pixels from the view's top left (the units of `use_gpu_surface`'s size) and `time` in
+seconds. `use_gpu_touches()` keeps them as a `GpuTouches` for a game to read each frame:
+`down` holds the fingers that are down in the order they went down (position, start position
+and time, `began` for one that went down since the last frame), `released` those lifted or
+cancelled since the last `end_frame`, so a tap between two frames is still seen. `find(id)`
+gives one finger. When the surface goes away every finger is released as cancelled.
+`<gpu/touch>` has the types and the state on their own, with no `<ui>` dependency.
+
+Each finger goes to the view under it, so eskiu-ui controls placed over the `GpuView`
+(`absolute` children after it) keep their own touches while other fingers move on the
+view, and gestures elsewhere are unaffected. A finger that starts on the `GpuView` stays
+its own even when it drags across a pan or scroll around it. Put a `GpuView` neither inside
+a `Scroll` (iOS cancels its touches for the scroll) nor inside a `Pressable`.
 
 On the web and in the desktop hosts `GpuView` is an empty box and `use_gpu_surface` never
 fires, so the same app builds there; the WebGPU modules and `gpu_ui_surface` exist on iOS and
@@ -396,7 +483,8 @@ window, as in `eskiuc build -L/opt/homebrew/lib`.
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
 | `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
-| `<gpu/ui>` | `GpuView`, `use_gpu_surface` and `gpu_ui_surface` for `eskiu-lang/ui` apps on iOS and Android |
+| `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-lang/ui` apps on iOS and Android |
+| `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |

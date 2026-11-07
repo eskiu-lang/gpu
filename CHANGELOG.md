@@ -3,7 +3,30 @@
 All notable changes to this package are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.4.0] - 2026-11-07
+## [Unreleased]
+
+### Added
+
+- Stencil in `<gpu/render>`: `GpuStencilFace` and `GpuPipelineDesc.stencil_front`,
+  `stencil_back`, `stencil_read_mask`, `stencil_write_mask`; `GpuPassOptions.stencil_clear`
+  and `stencil_load`; `GpuPass_set_stencil_reference`; `Gpu_depth_stencil`
+  (Depth24PlusStencil8), and Depth32FloatStencil8 when the device has it
+  (`Gpu.depth32_stencil8`). Passes set stencil ops only for formats with a stencil.
+- Multisampling: `GpuPipelineDesc.samples`, `Gpu_target_msaa` for color and depth
+  attachments, `GpuTexture.samples`, and `GpuPassOptions.resolve` and `discard`.
+- Multitouch on the mobile `GpuView` (`<gpu/ui>`): `use_gpu_touch(fn(GpuTouch))` gets each
+  finger's down, move, up and cancel with a stable id and its position in the view's pixels;
+  `use_gpu_touches()` keeps the fingers that are down (`GpuTouches`) for a `use_frame`
+  handler to read. Android sends every pointer of a `MotionEvent`, iOS enables
+  `multipleTouchEnabled`. Controls over the view keep their own touches.
+- `<gpu/touch>`: `GpuTouch`, `GpuTouches` and the touch payload parser, without `<ui>`.
+
+### Fixed
+
+- Reading back a texture that cannot be copied (such as a multisampled one) returns an `Err`
+  instead of aborting in wgpu-native.
+
+## [0.4.0]
 
 ### Added
 
