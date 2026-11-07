@@ -38,6 +38,10 @@ struct _GpuState {
 // Metal does not report them and Apple GPUs use 32);
 // max_buffer is the largest buffer the device allows; depth32_stencil8 says
 // whether textures may be Depth32FloatStencil8 (Depth24PlusStencil8 always can).
+// float32_filterable says whether R32Float, RG32Float and RGBA32Float textures
+// may be sampled with linear filtering; bc, etc2 and astc whether textures may
+// be in those block-compressed formats (BC on desktop GPUs, ETC2 and ASTC on
+// phones and Apple Silicon). gpu_open turns on each one the adapter has.
 struct Gpu {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -50,6 +54,10 @@ struct Gpu {
     uint32 subgroup_min;
     uint32 subgroup_max;
     bool depth32_stencil8;
+    bool float32_filterable;
+    bool bc;
+    bool etc2;
+    bool astc;
 }
 
 struct GpuBuffer {
@@ -129,6 +137,14 @@ void _gpu_wait(*Gpu g, *_GpuWait w) {
     }
 }
 
+// Adds feature to the list when the adapter has it.
+bool _gpu_want(*Gpu g, WGPUFeatureName feature, *WGPUFeatureName list, *uint64 n) {
+    if (wgpuAdapterHasFeature(g.adapter, feature) == 0) return false;
+    list[*n] = feature;
+    *n = *n + 1;
+    return true;
+}
+
 Result<Gpu, string> gpu_open() {
     Gpu g;
     g.instance = wgpuCreateInstance(null);
@@ -150,7 +166,7 @@ Result<Gpu, string> gpu_open() {
     // storage buffer at 128 MB, too little for model weights.
     WGPULimits limits;
     wgpuAdapterGetLimits(g.adapter, &limits);
-    WGPUFeatureName[3] features;
+    WGPUFeatureName[8] features;
     uint64 nfeatures = 0;
     if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_ShaderF16) != 0) {
         features[nfeatures] = WGPUFeatureName_ShaderF16;
@@ -171,6 +187,10 @@ Result<Gpu, string> gpu_open() {
         nfeatures++;
         g.depth32_stencil8 = true;
     }
+    g.float32_filterable = _gpu_want(&g, WGPUFeatureName_Float32Filterable, &features[0], &nfeatures);
+    g.bc = _gpu_want(&g, WGPUFeatureName_TextureCompressionBC, &features[0], &nfeatures);
+    g.etc2 = _gpu_want(&g, WGPUFeatureName_TextureCompressionETC2, &features[0], &nfeatures);
+    g.astc = _gpu_want(&g, WGPUFeatureName_TextureCompressionASTC, &features[0], &nfeatures);
     g.max_buffer = limits.maxBufferSize;
     WGPUAdapterInfo info;
     wgpuAdapterGetInfo(g.adapter, &info);
