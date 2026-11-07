@@ -52,6 +52,7 @@ struct _Png {
     int plte_n;
     bool trns;
     int[3] tkey;
+    int64 max_pixels;
 }
 
 const int[7] _PNG_X0 = {0, 4, 0, 2, 0, 1, 0};
@@ -202,7 +203,7 @@ string _png_header(*_Png p, *uint8 d) {
     p.ct = (int)d[9];
     p.interlace = (int)d[12];
     if (p.w == 0 || p.h == 0 || p.w > 0x1000000 || p.h > 0x1000000) return "png: bad size";
-    if (p.w * p.h > 0x10000000) return "png: image too large";
+    if (p.w * p.h > p.max_pixels) return "png: image too large";
     if (d[10] != 0 || d[11] != 0 || p.interlace > 1) return "png: bad header";
     int dp = p.depth;
     bool ok = false;
@@ -291,6 +292,12 @@ string _png_chunks(*_Png p, *uint8 data, uint64 len, *uint8 idat, *uint64 idat_l
 
 // Decodes a PNG held in memory. The pixels are always RGBA8.
 Result<Bitmap, string> png_decode(*uint8 data, uint64 len) {
+    return png_decode_with(data, len, null);
+}
+
+// png_decode with options (null for the defaults): images of more than
+// max_pixels pixels are rejected before anything is allocated for them.
+Result<Bitmap, string> png_decode_with(*uint8 data, uint64 len, *ImageOptions o) {
     if (data == null || len < 8) return Err<Bitmap, string>("png: bad signature");
     if (data[0] != 137 || data[1] != 80 || data[2] != 78 || data[3] != 71 || data[4] != 13 || data[5] != 10 || data[6] != 26 || data[7] != 10) {
         return Err<Bitmap, string>("png: bad signature");
@@ -299,6 +306,7 @@ Result<Bitmap, string> png_decode(*uint8 data, uint64 len) {
     if (p == null) return Err<Bitmap, string>("png: out of memory");
     defer free((*void)p);
     for (i in 0..256) p.plte[i * 4 + 3] = 255;
+    p.max_pixels = o != null && o.max_pixels > 0 ? o.max_pixels : (int64)0x10000000;
     uint64 zlen = 0;
     string e = _png_chunks(p, data, len, null, &zlen);
     if (e != null) return Err<Bitmap, string>(e);

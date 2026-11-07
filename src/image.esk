@@ -5,6 +5,8 @@
 // signature and hands the bytes to png_decode or jpeg_decode; image_load reads
 // a file first. The decoders are pure Eskiu and need no GPU. Radiance .hdr
 // files decode to floats instead (hdr_decode, hdr_load: an HdrBitmap).
+// image_decode_with takes ImageOptions: a pixel limit, and turning a JPEG
+// upright by its EXIF orientation.
 //
 //     Bitmap img = image_load("albedo.png")?;
 //     defer img.free();
@@ -22,6 +24,22 @@ struct Bitmap {
     *uint8 rgba;
 }
 
+// The decoders reject an image of more pixels than this (268,435,456: 1 GiB
+// of RGBA8) unless ImageOptions.max_pixels says otherwise.
+const int64 IMAGE_MAX_PIXELS = 0x10000000;
+
+// Decoding options; the zero value is what image_decode does:
+// - max_pixels: images with more pixels (width times height) are rejected
+//   from their header, before the pixels are allocated; 0 is
+//   IMAGE_MAX_PIXELS.
+// - orient: turn a JPEG upright by its EXIF orientation (Bitmap_orient), so
+//   the bitmap shows what a photo viewer shows; otherwise the pixels stay as
+//   stored and image_orientation tells how to show them.
+struct ImageOptions {
+    int64 max_pixels;
+    bool orient;
+}
+
 void Bitmap_free(*Bitmap self) {
     if (self.rgba != null) free((*void)self.rgba);
     self.rgba = null;
@@ -31,17 +49,80 @@ void Bitmap_free(*Bitmap self) {
 
 // Decodes a PNG or JPEG held in memory, chosen by its first bytes.
 Result<Bitmap, string> image_decode(*uint8 data, uint64 len) {
+    return image_decode_with(data, len, null);
+}
+
+// image_decode with options (null for the defaults).
+Result<Bitmap, string> image_decode_with(*uint8 data, uint64 len, *ImageOptions o) {
     if (data == null) return Err<Bitmap, string>("image: no data");
-    if (len >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71) return png_decode(data, len);
-    if (len >= 3 && data[0] == 255 && data[1] == 216 && data[2] == 255) return jpeg_decode(data, len);
+    if (len >= 8 && data[0] == 137 && data[1] == 80 && data[2] == 78 && data[3] == 71) return png_decode_with(data, len, o);
+    if (len >= 3 && data[0] == 255 && data[1] == 216 && data[2] == 255) return jpeg_decode_with(data, len, o);
     return Err<Bitmap, string>("image: unknown format");
 }
 
 // Reads a file and decodes it.
 Result<Bitmap, string> image_load(string path) {
+    return image_load_with(path, null);
+}
+
+// Reads a file and decodes it with options (null for the defaults).
+Result<Bitmap, string> image_load_with(string path, *ImageOptions o) {
     int64 n = 0;
     *uint8 data = fs_read_all(path, &n);
     if (data == null) return Err<Bitmap, string>("image: cannot read file");
     defer free((*void)data);
-    return image_decode(data, (uint64)n);
+    return image_decode_with(data, (uint64)n, o);
+}
+
+// The EXIF orientation of an encoded image (see jpeg_orientation): 1 to 8,
+// 1 for a PNG or an image without one.
+int image_orientation(*uint8 data, uint64 len) {
+    return jpeg_orientation(data, len);
+}
+
+// Rearranges the pixels by an EXIF orientation (1 to 8) so that the image is
+// upright: 2 mirrors left and right, 3 turns it half a turn, 4 flips top and
+// bottom, 5 transposes, 6 turns it a quarter clockwise, 7 transverses, 8 a
+// quarter counterclockwise. 5 to 8 swap width and height. Other values do
+// nothing.
+void Bitmap_orient(*Bitmap self, int orientation) {
+    if (orientation < 2 || orientation > 8 || self.rgba == null) return;
+    int64 w = (int64)self.width;
+    int64 h = (int64)self.height;
+    bool swap = orientation >= 5;
+    int64 ow = swap ? h : w;
+    int64 oh = swap ? w : h;
+    *uint8 out = alloc<uint8>(w * h * 4);
+    if (out == null) return;
+    *uint32 src = (*uint32)self.rgba;
+    *uint32 dst = (*uint32)out;
+    for (y in 0..oh) {
+        for (x in 0..ow) {
+            int64 sx = x;
+            int64 sy = y;
+            if (orientation == 2) sx = w - 1 - x;
+            else if (orientation == 3) {
+                sx = w - 1 - x;
+                sy = h - 1 - y;
+            } else if (orientation == 4) sy = h - 1 - y;
+            else if (orientation == 5) {
+                sx = y;
+                sy = x;
+            } else if (orientation == 6) {
+                sx = y;
+                sy = h - 1 - x;
+            } else if (orientation == 7) {
+                sx = w - 1 - y;
+                sy = h - 1 - x;
+            } else {
+                sx = w - 1 - y;
+                sy = x;
+            }
+            dst[y * ow + x] = src[sy * w + sx];
+        }
+    }
+    free((*void)self.rgba);
+    self.rgba = out;
+    self.width = (uint32)ow;
+    self.height = (uint32)oh;
 }

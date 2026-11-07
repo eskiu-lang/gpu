@@ -5,7 +5,10 @@
 // component ids 'R' 'G' 'B'), any sampling factors from 1 to 4 that divide the
 // largest one, restart markers and any number of DHT/DQT segments. Arithmetic
 // coding, lossless and hierarchical frames, 12-bit samples and CMYK are
-// rejected. EXIF orientation is ignored.
+// rejected. The EXIF orientation (APP1 tag 0x0112) is read, and applied when
+// asked (ImageOptions.orient); jpeg_orientation reads it alone. Images of more
+// than ImageOptions.max_pixels pixels (IMAGE_MAX_PIXELS by default) are
+// rejected before anything is allocated for them.
 //
 // The pipeline follows libjpeg: the accurate integer IDCT (jidctint), "fancy"
 // triangle-filter chroma upsampling for 2x1, 1x2 and 2x2 subsampling (pixel
@@ -95,6 +98,8 @@ struct _Jpeg {
     int adobe;
     bool jfif;
     string err;
+    int64 max_pixels;
+    int orientation;
 }
 
 int _j_be16(*uint8 p) {
@@ -560,7 +565,7 @@ string _j_sof(*_Jpeg j, *uint8 s, int n, int kind) {
     j.nc = (int)s[5];
     if (j.h == 0) return "jpeg: DNL height not supported";
     if (j.w == 0) return "jpeg: bad size";
-    if (j.w * j.h > 0x10000000) return "jpeg: image too large";
+    if (j.w * j.h > j.max_pixels) return "jpeg: image too large";
     if (j.nc == 4) return "jpeg: cmyk not supported";
     if (j.nc != 1 && j.nc != 3) return "jpeg: bad component count";
     if (n != 6 + 3 * j.nc) return "jpeg: bad SOF";
@@ -771,6 +776,9 @@ string _j_parse(*_Jpeg j) {
             if (j.marker < 0) _j_skip_junk(j);
         } else if (m == 0xEE) {
             if (n >= 12 && memcmp((*void)s, (*void)"Adobe", 5) == 0) j.adobe = (int)s[11];
+        } else if (m == 0xE1) {
+            int o = _j_exif_orientation(s, n);
+            if (o != 0 && j.orientation == 0) j.orientation = o;
         } else if (m == 0xE0) {
             if (n >= 5 && memcmp((*void)s, (*void)"JFIF", 5) == 0) j.jfif = true;
         }
@@ -856,14 +864,82 @@ void _j_release(*_Jpeg j) {
     free((*void)j);
 }
 
+// The orientation in an APP1 Exif segment's body s (n bytes): 1 to 8, or 0
+// when there is none. The TIFF header gives the byte order (II or MM); the tag
+// is 0x0112 in IFD0, a SHORT.
+int _j_exif_orientation(*uint8 s, int n) {
+    if (n < 14 || memcmp((*void)s, (*void)"Exif", 4) != 0 || s[4] != 0 || s[5] != 0) return 0;
+    *uint8 t = s + 6;
+    int64 tn = (int64)n - 6;
+    bool le = t[0] == 73 && t[1] == 73;
+    bool be = t[0] == 77 && t[1] == 77;
+    if (!le && !be) return 0;
+    if (_j_tiff16(t + 2, le) != 42) return 0;
+    int64 ifd = _j_tiff32(t + 4, le);
+    if (ifd < 8 || ifd + 2 > tn) return 0;
+    int count = _j_tiff16(t + ifd, le);
+    for (i in 0..count) {
+        int64 e = ifd + 2 + (int64)i * 12;
+        if (e + 12 > tn) return 0;
+        if (_j_tiff16(t + e, le) != 0x0112) continue;
+        if (_j_tiff16(t + e + 2, le) != 3 || _j_tiff32(t + e + 4, le) < 1) return 0;
+        int v = _j_tiff16(t + e + 8, le);
+        return v >= 1 && v <= 8 ? v : 0;
+    }
+    return 0;
+}
+
+int _j_tiff16(*uint8 p, bool le) {
+    return le ? ((int)p[0] | (int)p[1] << 8) : ((int)p[0] << 8 | (int)p[1]);
+}
+
+int64 _j_tiff32(*uint8 p, bool le) {
+    if (le) return (int64)p[0] | (int64)p[1] << 8 | (int64)p[2] << 16 | (int64)p[3] << 24;
+    return (int64)p[0] << 24 | (int64)p[1] << 16 | (int64)p[2] << 8 | (int64)p[3];
+}
+
+// The EXIF orientation of a JPEG held in memory, from the APP1 segments before
+// its first scan: 1 (as stored) to 8, as the TIFF tag 0x0112 numbers them
+// (2 mirrored, 3 turned half a turn, 4 flipped, 5 transposed, 6 to be turned a
+// quarter clockwise, 7 transversed, 8 a quarter counterclockwise). 1 when it
+// has none or is not a JPEG.
+int jpeg_orientation(*uint8 data, uint64 len) {
+    if (data == null || len < 4 || data[0] != 255 || data[1] != 0xD8) return 1;
+    uint64 pos = 2;
+    while (pos + 4 <= len) {
+        if (data[pos] != 255) return 1;
+        while (pos < len && data[pos] == 255) pos++;
+        if (pos >= len) return 1;
+        int m = (int)data[pos];
+        pos++;
+        if ((m >= 0xD0 && m <= 0xD7) || m == 1) continue;
+        if (m == 0xDA || m == 0xD9 || pos + 2 > len) return 1;
+        int seg = _j_be16(data + pos);
+        if (seg < 2 || pos + (uint64)seg > len) return 1;
+        if (m == 0xE1) {
+            int o = _j_exif_orientation(data + pos + 2, seg - 2);
+            if (o != 0) return o;
+        }
+        pos += (uint64)seg;
+    }
+    return 1;
+}
+
 // Decodes a JPEG held in memory. The pixels are RGBA8 with alpha 255.
 Result<Bitmap, string> jpeg_decode(*uint8 data, uint64 len) {
+    return jpeg_decode_with(data, len, null);
+}
+
+// jpeg_decode with options (null for the defaults): a pixel limit, and
+// orient to turn the image upright by its EXIF orientation.
+Result<Bitmap, string> jpeg_decode_with(*uint8 data, uint64 len, *ImageOptions o) {
     if (data == null) return Err<Bitmap, string>("jpeg: bad signature");
     *_Jpeg j = alloc<_Jpeg>(1);
     if (j == null) return Err<Bitmap, string>("jpeg: out of memory");
     defer _j_release(j);
     j.d = data;
     j.len = len;
+    j.max_pixels = o != null && o.max_pixels > 0 ? o.max_pixels : (int64)0x10000000;
     string e = _j_parse(j);
     if (e != null) return Err<Bitmap, string>(e);
 
@@ -919,5 +995,7 @@ Result<Bitmap, string> jpeg_decode(*uint8 data, uint64 len) {
             o[3] = 255;
         }
     }
-    return Ok<Bitmap, string>(Bitmap{(uint32)w, (uint32)h, rgba});
+    Bitmap out = Bitmap{(uint32)w, (uint32)h, rgba};
+    if (o != null && o.orient && j.orientation > 1) Bitmap_orient(&out, j.orientation);
+    return Ok<Bitmap, string>(out);
 }
