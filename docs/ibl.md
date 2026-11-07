@@ -1,8 +1,8 @@
 # Image-based lighting
 
 `<gpu/ibl>` lights physically based materials with an environment map, and `<gpu/model>`
-uses it in place of its hemisphere ambient term. The short example is in the
-[README](models.md#loading-and-drawing-a-model).
+uses it in place of its hemisphere ambient term. A model is loaded as in
+[Models](models.md#loading-and-drawing-a-model).
 
 API reference: [`<gpu/ibl>`](api.md#gpuibl), [`<gpu/hdr>`](api.md#gpuhdr).
 

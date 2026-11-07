@@ -1,6 +1,6 @@
 # Models
 
-`<gpu/gltf>`, `<gpu/obj>` and `<gpu/model>`: loading glTF 2.0 and OBJ files and drawing them. The short example is in [Models](models.md#loading-and-drawing-a-model).
+`<gpu/gltf>`, `<gpu/obj>` and `<gpu/model>`: loading glTF 2.0 and OBJ files and drawing them. The first example is [below](#loading-and-drawing-a-model).
 
 ## Loading and drawing a model
 
