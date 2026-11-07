@@ -18,6 +18,9 @@ import <gpu/png>;
 import <gpu/jpeg>;
 import <gpu/hdr>;
 
+// An 8-bit RGBA image: width * height * 4 bytes at rgba, rows packed with the top row
+// first, the color values as the file stores them (normally sRGB-encoded). The bitmap owns
+// rgba; free it with free().
 struct Bitmap {
     uint32 width;
     uint32 height;
@@ -40,6 +43,7 @@ struct ImageOptions {
     bool orient;
 }
 
+// Frees the pixels and zeroes the bitmap; a second call does nothing.
 void Bitmap_free(*Bitmap self) {
     if (self.rgba != null) free((*void)self.rgba);
     self.rgba = null;

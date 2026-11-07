@@ -25,6 +25,7 @@ struct HdrBitmap {
     *float rgba;
 }
 
+// Frees the pixels and zeroes the bitmap; a second call does nothing.
 void HdrBitmap_free(*HdrBitmap self) {
     if (self.rgba != null) free((*void)self.rgba);
     self.rgba = null;

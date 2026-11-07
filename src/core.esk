@@ -60,12 +60,17 @@ struct Gpu {
     bool astc;
 }
 
+// A buffer in GPU memory: handle is the WebGPU buffer and size its length in bytes. It
+// keeps a copy of the Gpu that made it, so it must be released before that Gpu is.
 struct GpuBuffer {
     Gpu gpu;
     WGPUBuffer handle;
     uint64 size;
 }
 
+// A compute pipeline made by Gpu_kernel: the shader module, the pipeline, the layout of
+// its bind group 0 and the buffers bound so far with bind(). It keeps a copy of the Gpu
+// that made it.
 struct GpuKernel {
     Gpu gpu;
     WGPUShaderModule module;
@@ -74,6 +79,8 @@ struct GpuKernel {
     List<WGPUBindGroupEntry> entries;
 }
 
+// A WebGPU string view over s, without copying it; null gives an empty view. For calls
+// into <gpu/raw>.
 WGPUStringView gpu_str(string s) {
     if (s == null) return WGPUStringView{null, 0};
     return WGPUStringView{s, (uint64)strlen(s)};
@@ -145,6 +152,9 @@ bool _gpu_want(*Gpu g, WGPUFeatureName feature, *WGPUFeatureName list, *uint64 n
     return true;
 }
 
+// Opens the high-performance adapter and a device with the adapter's full limits and every
+// optional feature listed on Gpu that it has. Fails with "no WebGPU instance", "no GPU
+// adapter" or "no GPU device" and the driver's message.
 Result<Gpu, string> gpu_open() {
     Gpu g;
     g.instance = wgpuCreateInstance(null);
@@ -218,6 +228,8 @@ Result<Gpu, string> gpu_open() {
     return Ok<Gpu, string>(g);
 }
 
+// Releases the queue, device, adapter and instance and zeroes the Gpu. Release every
+// object made from it first.
 void Gpu_release(*Gpu self) {
     if (self.queue != null) wgpuQueueRelease(self.queue);
     if (self.device != null) wgpuDeviceRelease(self.device);
@@ -259,6 +271,8 @@ string _gpu_pop(*Gpu g, string what) {
     return _gpu_fail(what, &w.msg);
 }
 
+// A buffer of size bytes with the given WGPUBufferUsage flags, its contents zero. Fails
+// with the validation message, for example when size is above max_buffer.
 Result<GpuBuffer, string> Gpu_buffer(*Gpu self, uint64 size, WGPUBufferUsage usage) {
     _gpu_push(self);
     WGPUBufferDescriptor d = WGPUBufferDescriptor{usage: usage, size: size};
@@ -279,6 +293,9 @@ Result<GpuBuffer, string> Gpu_storage(*Gpu self, *void data, uint64 bytes) {
     return Ok<GpuBuffer, string>(b);
 }
 
+// Copies bytes bytes from data into the buffer at byte offset offset. The copy is queued:
+// data can be reused as soon as the call returns, and the write lands before the next
+// submitted work. offset and bytes must be multiples of 4.
 void GpuBuffer_write(*GpuBuffer self, uint64 offset, *void data, uint64 bytes) {
     wgpuQueueWriteBuffer(self.gpu.queue, self.handle, offset, data, bytes);
 }
@@ -326,6 +343,7 @@ Result<int, string> GpuBuffer_read_mapped(*GpuBuffer self, *void out, uint64 byt
     return Ok<int, string>(0);
 }
 
+// Releases the buffer; a second call does nothing.
 void GpuBuffer_release(*GpuBuffer self) {
     if (self.handle != null) wgpuBufferRelease(self.handle);
     self.handle = null;
@@ -397,6 +415,8 @@ Result<int, string> GpuKernel_dispatch(*GpuKernel self, uint32 x, uint32 y, uint
     return Ok<int, string>(0);
 }
 
+// Releases the pipeline, its layout and shader module, and the list of bindings (not the
+// bound buffers).
 void GpuKernel_release(*GpuKernel self) {
     if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
     if (self.pipeline != null) wgpuComputePipelineRelease(self.pipeline);

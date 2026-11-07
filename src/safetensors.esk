@@ -21,6 +21,9 @@ import <result>;
 import <json>;
 import <fs>;
 
+// One tensor of a file: dtype as the file names it ("F32", "F16", "BF16", "I8"...), shape
+// the ndims dimensions with the slowest-varying first (row-major), count the number of
+// values, and data the size bytes of raw little-endian values inside the file.
 struct SafeTensor {
     String name;
     String dtype;
@@ -31,6 +34,9 @@ struct SafeTensor {
     uint64 size;
 }
 
+// A loaded safetensors file: file is the whole file in memory (len bytes) and tensors its
+// tensors in header order, whose data pointers point into file. The __metadata__ entry is
+// skipped.
 struct Safetensors {
     *uint8 file;
     uint64 len;
@@ -68,6 +74,10 @@ int safetensors_dtype_size(string d) {
     return 0;
 }
 
+// Reads the file at path and parses it with safetensors_parse. Errors start with
+// "safetensors: ": the file cannot be read, its header is not a JSON object, or a tensor
+// has an unknown dtype, a bad shape, or a byte range that is outside the file or does not
+// match its shape.
 Result<Safetensors, string> safetensors_load(string path) {
     int64 n = 0;
     *uint8 data = fs_read_all(path, &n);
@@ -142,6 +152,8 @@ Result<Safetensors, string> safetensors_parse(*uint8 data, uint64 len) {
     return Ok<Safetensors, string>(st);
 }
 
+// The tensor called name, or null when there is none. The pointer lives as long as the
+// Safetensors.
 SafeTensor* Safetensors_tensor(*Safetensors self, string name) {
     for (i in 0..self.tensors.size) {
         if (strcmp(self.tensors.data[i].name.data, name) == 0) return &self.tensors.data[i];
@@ -201,6 +213,7 @@ bool SafeTensor_floats(SafeTensor* self, *float out) {
     return false;
 }
 
+// Frees the tensor table but not the file bytes (file), which the caller then owns.
 void Safetensors_free_entries(*Safetensors self) {
     for (i in 0..self.tensors.size) {
         String_free(&self.tensors.data[i].name);
@@ -209,6 +222,7 @@ void Safetensors_free_entries(*Safetensors self) {
     List_free(&self.tensors);
 }
 
+// Frees the tensor table and the file bytes; every tensor's data becomes invalid.
 void Safetensors_free(*Safetensors self) {
     Safetensors_free_entries(self);
     if (self.file != null) free(self.file);
@@ -225,6 +239,9 @@ void SafetensorsWriter_add(SafetensorsWriter* self, string name, *float data, ui
     List_push(&self.entries, e);
 }
 
+// Writes the added tensors to path as F32, in the order they were added, with the header
+// padded to a multiple of 8 bytes. Fails when the file cannot be opened for writing. The
+// writer keeps its entries; free it with free().
 Result<int, string> SafetensorsWriter_save(SafetensorsWriter* self, string path) {
     String header;
     defer String_free(&header);
@@ -256,6 +273,7 @@ Result<int, string> SafetensorsWriter_save(SafetensorsWriter* self, string path)
     return Ok<int, string>(0);
 }
 
+// Frees the writer's entry list (not the tensors' data, which the caller owns).
 void SafetensorsWriter_free(SafetensorsWriter* self) {
     for (i in 0..self.entries.size) String_free(&self.entries.data[i].name);
     List_free(&self.entries);

@@ -154,6 +154,7 @@ Result<Ktx2, string> ktx2_load(string path) {
     return ktx2_decode(data, (uint64)n);
 }
 
+// Frees the image data and the level index; a second call does nothing.
 void Ktx2_free(*Ktx2 self) {
     if (self.data != null) free((*void)self.data);
     List_free(&self.level_index);

@@ -11,17 +11,20 @@
 
 import <libc>;
 
+// A 2D vector of floats (8 bytes, the layout of WGSL vec2<f32>).
 struct Vec2 {
     float x;
     float y;
 }
 
+// A 3D vector of floats (12 bytes; see the note above on vec3 in buffers).
 struct Vec3 {
     float x;
     float y;
     float z;
 }
 
+// A 4D vector of floats (16 bytes, the layout of WGSL vec4<f32>).
 struct Vec4 {
     float x;
     float y;
@@ -37,6 +40,8 @@ struct Quat {
     float w;
 }
 
+// A 4x4 matrix in column-major order: m[c * 4 + r] is row r of column c, so the
+// translation is m[12], m[13], m[14]. 64 bytes, the layout of WGSL mat4x4<f32>.
 struct Mat4 {
     float[16] m;
 }
@@ -45,18 +50,24 @@ float _m_sqrt(float x) {
     return (float)sqrt((double)x);
 }
 
+// Component-wise sum (Vec2, Vec3 and Vec4).
 Vec2 operator +(Vec2 a, Vec2 b) {
     return Vec2{a.x + b.x, a.y + b.y};
 }
 
+// a - b is the component-wise difference and -a negates every component (Vec2, Vec3 and
+// Vec4).
 Vec2 operator -(Vec2 a, Vec2 b) {
     return Vec2{a.x - b.x, a.y - b.y};
 }
 
+// A vector times a scalar scales every component (Vec2, Vec3 and Vec4).
 Vec2 operator *(Vec2 a, float s) {
     return Vec2{a.x * s, a.y * s};
 }
 
+// A vector divided by a scalar divides every component (Vec2, Vec3 and Vec4); dividing by
+// zero gives infinities or NaN.
 Vec2 operator /(Vec2 a, float s) {
     return Vec2{a.x / s, a.y / s};
 }
@@ -65,20 +76,24 @@ Vec2 operator -(Vec2 a) {
     return Vec2{-a.x, -a.y};
 }
 
+// The dot product with b.
 float Vec2_dot(const Vec2* self, Vec2 b) {
     return self.x * b.x + self.y * b.y;
 }
 
+// The Euclidean length.
 float Vec2_length(const Vec2* self) {
     return _m_sqrt(self.x * self.x + self.y * self.y);
 }
 
+// The vector scaled to length 1 (the zero vector stays zero).
 Vec2 Vec2_normalize(const Vec2* self) {
     float l = Vec2_length(self);
     if (l == 0.0) return *self;
     return Vec2{self.x / l, self.y / l};
 }
 
+// Linear interpolation: self at t = 0, b at t = 1; t is not clamped.
 Vec2 Vec2_lerp(const Vec2* self, Vec2 b, float t) {
     return Vec2{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t};
 }
@@ -103,14 +118,17 @@ Vec3 operator -(Vec3 a) {
     return Vec3{-a.x, -a.y, -a.z};
 }
 
+// The dot product with b.
 float Vec3_dot(const Vec3* self, Vec3 b) {
     return self.x * b.x + self.y * b.y + self.z * b.z;
 }
 
+// The cross product self x b (right-handed: x cross y is z).
 Vec3 Vec3_cross(const Vec3* self, Vec3 b) {
     return Vec3{self.y * b.z - self.z * b.y, self.z * b.x - self.x * b.z, self.x * b.y - self.y * b.x};
 }
 
+// The Euclidean length.
 float Vec3_length(const Vec3* self) {
     return _m_sqrt(Vec3_dot(self, *self));
 }
@@ -122,6 +140,7 @@ Vec3 Vec3_normalize(const Vec3* self) {
     return Vec3{self.x / l, self.y / l, self.z / l};
 }
 
+// Linear interpolation: self at t = 0, b at t = 1; t is not clamped.
 Vec3 Vec3_lerp(const Vec3* self, Vec3 b, float t) {
     return Vec3{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t, self.z + (b.z - self.z) * t};
 }
@@ -131,6 +150,7 @@ Vec3 Vec3_mul(const Vec3* self, Vec3 b) {
     return Vec3{self.x * b.x, self.y * b.y, self.z * b.z};
 }
 
+// The vector with w appended: 1 for a point, 0 for a direction.
 Vec4 Vec3_to_vec4(const Vec3* self, float w) {
     return Vec4{self.x, self.y, self.z, w};
 }
@@ -155,23 +175,28 @@ Vec4 operator -(Vec4 a) {
     return Vec4{-a.x, -a.y, -a.z, -a.w};
 }
 
+// The dot product with b.
 float Vec4_dot(const Vec4* self, Vec4 b) {
     return self.x * b.x + self.y * b.y + self.z * b.z + self.w * b.w;
 }
 
+// The Euclidean length.
 float Vec4_length(const Vec4* self) {
     return _m_sqrt(Vec4_dot(self, *self));
 }
 
+// Linear interpolation: self at t = 0, b at t = 1; t is not clamped.
 Vec4 Vec4_lerp(const Vec4* self, Vec4 b, float t) {
     return Vec4{self.x + (b.x - self.x) * t, self.y + (b.y - self.y) * t,
         self.z + (b.z - self.z) * t, self.w + (b.w - self.w) * t};
 }
 
+// The first three components (w dropped, not divided by).
 Vec3 Vec4_xyz(const Vec4* self) {
     return Vec3{self.x, self.y, self.z};
 }
 
+// The rotation that does nothing (0, 0, 0, 1).
 Quat quat_identity() {
     return Quat{0.0, 0.0, 0.0, 1.0};
 }
@@ -200,10 +225,12 @@ Quat quat_euler(float pitch, float yaw, float roll) {
     return qy * qx * qz;
 }
 
+// The dot product of the two quaternions as 4D vectors.
 float Quat_dot(const Quat* self, Quat b) {
     return self.x * b.x + self.y * b.y + self.z * b.z + self.w * b.w;
 }
 
+// The quaternion scaled to length 1; the zero quaternion gives the identity.
 Quat Quat_normalize(const Quat* self) {
     float l = _m_sqrt(Quat_dot(self, *self));
     if (l == 0.0) return quat_identity();
@@ -239,6 +266,7 @@ Quat quat_slerp(Quat a, Quat b, float t) {
     return Quat{a.x * sa + b.x * sb, a.y * sa + b.y * sb, a.z * sa + b.z * sb, a.w * sa + b.w * sb};
 }
 
+// The identity matrix.
 Mat4 mat4_identity() {
     Mat4 r;
     r.m[0] = 1.0;
@@ -298,6 +326,7 @@ Vec3 Mat4_point(const Mat4* self, Vec3 p) {
     return Vec3{r.x, r.y, r.z};
 }
 
+// The transposed matrix (rows become columns).
 Mat4 Mat4_transpose(const Mat4* self) {
     Mat4 r;
     for (c in 0..4) {
@@ -358,6 +387,7 @@ Mat4 mat4_rotate(float angle, Vec3 axis) {
     return q.to_mat4();
 }
 
+// A translation by t.
 Mat4 mat4_translate(Vec3 t) {
     Mat4 r = mat4_identity();
     r.m[12] = t.x;
@@ -366,6 +396,7 @@ Mat4 mat4_translate(Vec3 t) {
     return r;
 }
 
+// A scale by s.x, s.y and s.z along the axes.
 Mat4 mat4_scale(Vec3 s) {
     Mat4 r = mat4_identity();
     r.m[0] = s.x;

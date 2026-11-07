@@ -29,15 +29,20 @@ import <url>;
 import <libc>;
 import <gpu/math>;
 
+// Alpha modes (GltfMaterial.alpha_mode): opaque, cut out below alpha_cutoff, or blended.
 const int GLTF_OPAQUE = 0;
 const int GLTF_MASK = 1;
 const int GLTF_BLEND = 2;
 
+// What an animation channel moves (GltfAnimChannel.path): a node's translation, rotation,
+// scale or morph target weights.
 const int GLTF_TRANSLATION = 0;
 const int GLTF_ROTATION = 1;
 const int GLTF_SCALE = 2;
 const int GLTF_WEIGHTS = 3;
 
+// Key interpolation (GltfAnimSampler.interpolation): linear (rotations along the sphere),
+// step (hold each key) or cubic spline.
 const int GLTF_LINEAR = 0;
 const int GLTF_STEP = 1;
 const int GLTF_CUBIC = 2;
@@ -89,6 +94,12 @@ struct GltfTextureRef {
     float scale;
 }
 
+// A metallic-roughness material, with the glTF defaults for what the file leaves out:
+// base_color (linear RGBA) 1, metallic and roughness 1, emissive 0 (already multiplied by
+// KHR_materials_emissive_strength), alpha_mode GLTF_OPAQUE, alpha_cutoff 0.5. The factors
+// multiply their textures; the metallic-roughness texture holds roughness in G and
+// metallic in B, and a texture reference's scale is the normal scale or the occlusion
+// strength. unlit is set by KHR_materials_unlit.
 struct GltfMaterial {
     String name;
     Vec4 base_color;
@@ -106,6 +117,9 @@ struct GltfMaterial {
     bool unlit;
 }
 
+// A texture: image is an index into Gltf.images and sampler into Gltf.samplers, each -1
+// when missing or out of range (a KHR_texture_basisu or EXT_texture_webp source counts as
+// the image).
 struct GltfTexture {
     int image;
     int sampler;
@@ -130,6 +144,11 @@ struct GltfSampler {
     int wrap_t;
 }
 
+// A scene node. mesh and skin are indices into Gltf.meshes and Gltf.skins, or -1; parent
+// is the parent node or -1 for a root; children are node indices. The local transform is
+// matrix when has_matrix (column-major) else translation, rotation and scale; Gltf_animate
+// writes the latter and clears has_matrix. weights are the node's current morph target
+// weights, one per target of its mesh.
 struct GltfNode {
     String name;
     int mesh;
@@ -144,6 +163,9 @@ struct GltfNode {
     List<float> weights;
 }
 
+// A skin: joints are node indices, inverse_bind holds one column-major 4x4 matrix (16
+// floats) per joint (identity when the file has none), and skeleton is the root joint node
+// or -1.
 struct GltfSkin {
     String name;
     List<int> joints;
@@ -151,6 +173,9 @@ struct GltfSkin {
     int skeleton;
 }
 
+// One animated property: node is the node index, path one of GLTF_TRANSLATION,
+// GLTF_ROTATION, GLTF_SCALE and GLTF_WEIGHTS, and sampler an index into the animation's
+// samplers. Channels with a bad index or an unknown path are dropped on load.
 struct GltfAnimChannel {
     int node;
     int path;
@@ -170,6 +195,8 @@ struct GltfAnimSampler {
     uint32 value_count;
 }
 
+// An animation: its channels, the samplers they use, and duration, the last key time in
+// seconds over all samplers.
 struct GltfAnimation {
     String name;
     List<GltfAnimChannel> channels;
@@ -208,6 +235,9 @@ struct _GltfAccessor {
     uint64 sparse_value_offset;
 }
 
+// A loaded glTF model. Every index field refers to these lists; roots are the root nodes
+// of the default scene (every parentless node when the file has no scene). Free it with
+// free().
 struct Gltf {
     List<GltfMesh> meshes;
     List<GltfMaterial> materials;
@@ -296,6 +326,10 @@ uint32 _gltf_u32(*uint8 p) {
     return (uint32)p[0] | (uint32)p[1] << 8 | (uint32)p[2] << 16 | (uint32)p[3] << 24;
 }
 
+// Reads a .gltf or .glb file and parses it with gltf_parse, reading external buffers and
+// images relative to the file's directory. Errors start with "gltf: ": the file cannot be
+// read, is not glTF 2.0, its JSON or binary data is invalid, or it requires an unsupported
+// extension (Draco, meshopt).
 Result<Gltf, string> gltf_load(string path) {
     int64 n = 0;
     *uint8 data = fs_read_all(path, &n);
@@ -1085,6 +1119,8 @@ string _gltf_read(*Gltf g, *JsonValue root, *uint8 bin, uint64 bin_len, string b
 
 // ── Scene evaluation ─────────────────────────────────────────────────────────
 
+// The local matrix of node (an index into nodes): matrix when the node has one, else
+// translation * rotation * scale.
 Mat4 Gltf_local(*Gltf self, int node) {
     GltfNode* n = &self.nodes.data[node];
     if (n.has_matrix) return n.matrix;
@@ -1263,12 +1299,17 @@ void Gltf_bounds(*Gltf self, Vec3* lo, Vec3* hi) {
 
 // ── Freeing ──────────────────────────────────────────────────────────────────
 
+// Frees the skin's name, joint list and inverse bind matrices. Gltf_free calls it for
+// every skin.
 void GltfSkin_free(GltfSkin* s) {
     String_free(&s.name);
     List_free(&s.joints);
     if (s.inverse_bind != null) free(s.inverse_bind);
 }
 
+// Frees everything the model holds: vertex and index arrays, morph targets, images it read
+// or decoded from data URIs, buffers, names and lists. Pointers into the model become
+// invalid.
 void Gltf_free(*Gltf self) {
     for (i in 0..self.meshes.size) {
         GltfMesh* m = &self.meshes.data[i];

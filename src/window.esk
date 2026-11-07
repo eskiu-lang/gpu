@@ -48,6 +48,9 @@ const uint64 _SDL_WINDOW_RESIZABLE = 0x20;
 const uint64 _SDL_WINDOW_HIGH_PIXEL_DENSITY = 0x2000;
 const uint64 _SDL_WINDOW_METAL = 0x20000000;
 
+// Event kinds (WindowEvent.kind): none, the user closed the window, the drawable size
+// changed, a key went down or up, the mouse moved, a mouse button went down or up, and the
+// wheel turned.
 const int WINDOW_NONE = 0;
 const int WINDOW_QUIT = 1;
 const int WINDOW_RESIZE = 2;
@@ -66,6 +69,8 @@ const int KEY_LEFT = 1073741904;
 const int KEY_DOWN = 1073741905;
 const int KEY_UP = 1073741906;
 
+// A desktop window: sdl is the SDL_Window and metal its Metal view on macOS (null
+// elsewhere).
 struct Window {
     *void sdl;
     *void metal;
@@ -88,6 +93,9 @@ struct WindowEvent {
     uint32 height;
 }
 
+// Opens a resizable, high-density window of width x height points (the drawable size in
+// pixels may be larger: Window_size). It starts SDL's video system first. Fails with SDL's
+// error message.
 Result<Window, string> window_open(string title, int width, int height) {
     if (!SDL_Init(_SDL_INIT_VIDEO)) return Err<Window, string>(SDL_GetError());
     uint64 flags = _SDL_WINDOW_RESIZABLE | _SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -103,6 +111,8 @@ Result<Window, string> window_open(string title, int width, int height) {
     return Ok<Window, string>(w);
 }
 
+// Destroys the window and shuts SDL down, so a program has one window at a time. Release
+// the window's GpuSurface first.
 void Window_release(*Window self) {
     if (self.metal != null) SDL_Metal_DestroyView(self.metal);
     if (self.sdl != null) SDL_DestroyWindow(self.sdl);
@@ -111,6 +121,7 @@ void Window_release(*Window self) {
     SDL_Quit();
 }
 
+// Sets the title shown in the window's title bar (UTF-8).
 void Window_set_title(*Window self, string title) {
     SDL_SetWindowTitle(self.sdl, title);
 }

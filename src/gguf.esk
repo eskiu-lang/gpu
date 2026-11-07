@@ -18,6 +18,9 @@ import <result>;
 import <fs>;
 import <libc>;
 
+// Tensor types (GgufTensor.type), with ggml's numbering. The _K types are the k-quant
+// formats in blocks of 256 values; the others hold 32 values per block, except F32, F16
+// and BF16.
 const int GGML_F32 = 0;
 const int GGML_F16 = 1;
 const int GGML_Q4_0 = 2;
@@ -70,6 +73,9 @@ struct GgufTensor {
     uint64 size;
 }
 
+// A loaded GGUF file: file is the whole file in memory (len bytes), meta its key/value
+// metadata in file order and tensors its tensor table, whose data pointers point into
+// file.
 struct Gguf {
     *uint8 file;
     uint64 len;
@@ -245,6 +251,9 @@ void _ggml_block(int type, *uint64 bytes, *uint64 values) {
     }
 }
 
+// Reads the file at path and parses it with gguf_parse. Errors start with "gguf: ": the
+// file cannot be read, is not GGUF version 2 or 3, is truncated, or has a tensor of an
+// unsupported type.
 Result<Gguf, string> gguf_load(string path) {
     int64 n = 0;
     *uint8 data = fs_read_all(path, &n);
@@ -336,6 +345,8 @@ Result<Gguf, string> gguf_parse(*uint8 data, uint64 len) {
     return Ok<Gguf, string>(g);
 }
 
+// The metadata value of key, or null when there is none. The pointer lives as long as the
+// Gguf.
 GgufValue* Gguf_value(*Gguf self, string key) {
     for (i in 0..self.meta.size) {
         if (strcmp(self.meta.data[i].key.data, key) == 0) return &self.meta.data[i];
@@ -343,18 +354,24 @@ GgufValue* Gguf_value(*Gguf self, string key) {
     return null;
 }
 
+// The value of key as an integer (a float is truncated), or dflt when the key is missing
+// or holds a string or an array.
 int64 Gguf_int(*Gguf self, string key, int64 dflt) {
     GgufValue* v = Gguf_value(self, key);
     if (v == null || v.type == _GGUF_STRING || v.type == _GGUF_ARRAY) return dflt;
     return v.inum;
 }
 
+// The value of key as a double, or dflt when the key is missing or holds a string or an
+// array.
 double Gguf_float(*Gguf self, string key, double dflt) {
     GgufValue* v = Gguf_value(self, key);
     if (v == null || v.type == _GGUF_STRING || v.type == _GGUF_ARRAY) return dflt;
     return v.num;
 }
 
+// The string value of key, or null when the key is missing or not a string. The text
+// belongs to the Gguf.
 string Gguf_string(*Gguf self, string key) {
     GgufValue* v = Gguf_value(self, key);
     if (v == null || v.type != _GGUF_STRING) return null;
@@ -394,6 +411,8 @@ uint64 Gguf_floats(*Gguf self, string key, *float out, uint64 count) {
     return n;
 }
 
+// The tensor called name, or null when there is none. The pointer lives as long as the
+// Gguf.
 GgufTensor* Gguf_tensor(*Gguf self, string name) {
     for (i in 0..self.tensors.size) {
         if (strcmp(self.tensors.data[i].name.data, name) == 0) return &self.tensors.data[i];
@@ -401,6 +420,8 @@ GgufTensor* Gguf_tensor(*Gguf self, string name) {
     return null;
 }
 
+// Frees the metadata and the tensor table but not the file bytes (file), which the caller
+// then owns.
 void Gguf_free_meta(*Gguf self) {
     for (i in 0..self.meta.size) {
         String_free(&self.meta.data[i].key);
@@ -411,6 +432,8 @@ void Gguf_free_meta(*Gguf self) {
     List_free(&self.tensors);
 }
 
+// Frees the metadata, the tensor table and the file bytes; every tensor's data becomes
+// invalid.
 void Gguf_free(*Gguf self) {
     Gguf_free_meta(self);
     if (self.file != null) free(self.file);
@@ -419,6 +442,7 @@ void Gguf_free(*Gguf self) {
 
 // ── Dequantization ───────────────────────────────────────────────────────────
 
+// The IEEE half-precision float in the two little-endian bytes at p, as a float.
 float ggml_half(*uint8 p) {
     uint32 h = (uint32)p[0] | (uint32)p[1] << 8;
     uint32 sign = (h & 0x8000) << 16;

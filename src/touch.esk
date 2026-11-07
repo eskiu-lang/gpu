@@ -15,6 +15,8 @@
 import <mem>;
 import <list>;
 
+// A touch's phase: a finger went down, moved, went up, or was cancelled by the system (the
+// gesture was taken over or the view went away).
 const int GPU_TOUCH_DOWN = 0;
 const int GPU_TOUCH_MOVE = 1;
 const int GPU_TOUCH_UP = 2;
@@ -98,6 +100,7 @@ void GpuTouches_apply(*GpuTouches self, GpuTouch t) {
     return at < 0 ? null : &self.down.data[at];
 }
 
+// The number of fingers that are down.
 int GpuTouches_count(*GpuTouches self) {
     return self.down.size;
 }
@@ -113,6 +116,7 @@ void GpuTouches_cancel_all(*GpuTouches self, double time) {
     while (self.down.size > 0) _gpu_touch_release(self, 0, GPU_TOUCH_CANCEL, time);
 }
 
+// Frees both lists.
 void GpuTouches_free(*GpuTouches self) {
     self.down.free();
     self.released.free();

@@ -35,6 +35,8 @@ struct NnTensor {
     GpuBuffer scales;
 }
 
+// Tensor kinds (NnTensor.kind): 32-bit floats, 16-bit floats, and the GGUF Q8_0 and Q4_0
+// block formats (32 values per block with an f32 scale each).
 const int NN_F32 = 0;
 const int NN_F16 = 1;
 const int NN_Q8_0 = 2;
@@ -55,6 +57,12 @@ struct _NnPipe {
     WGPUBindGroupLayout layout;
 }
 
+// A recorded list of dispatches, made by Gpu_nn_program. step holds the step values set
+// with set_step(); eps (1e-5) is the epsilon of rmsnorm, rope_base (10000) the RoPE
+// frequency base and rope_neox the RoPE layout, each read when an operation is recorded,
+// so set them before recording. The other fields hold the dispatches, their pipelines (one
+// per kernel kind, shared) and their parameter buffers. It keeps a copy of the Gpu that
+// made it.
 struct NnProgram {
     Gpu gpu;
     List<_NnOp> ops;
@@ -67,6 +75,8 @@ struct NnProgram {
     bool rope_neox;
 }
 
+// An f32 tensor of count values in a storage buffer, zeroed (with 16 bytes of padding at
+// the end).
 Result<NnTensor, string> Gpu_nn_tensor(*Gpu self, uint64 count) {
     GpuBuffer b = Gpu_buffer(self, count * 4 + 16, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst)?;
     return Ok<NnTensor, string>(NnTensor{buf: b, count: count, kind: NN_F32});
@@ -205,11 +215,13 @@ Result<int, string> NnTensor_read(*NnTensor self, *float out, uint64 count) {
     return GpuBuffer_read(&self.buf, out, count * 4);
 }
 
+// Releases the tensor's buffer, and its scales for a quantized tensor.
 void NnTensor_release(*NnTensor self) {
     GpuBuffer_release(&self.buf);
     if (self.kind == NN_Q8_0 || self.kind == NN_Q4_0) GpuBuffer_release(&self.scales);
 }
 
+// An empty program, with eps 1e-5, rope_base 10000 and the step values zero.
 Result<NnProgram, string> Gpu_nn_program(*Gpu self) {
     NnProgram p;
     p.gpu = *self;
@@ -294,6 +306,8 @@ Result<int, string> NnProgram_run(*NnProgram self) {
     return Ok<int, string>(0);
 }
 
+// Releases every recorded dispatch, pipeline and parameter buffer and the step buffer; not
+// the tensors the operations use.
 void NnProgram_release(*NnProgram self) {
     for (i in 0..self.ops.size) wgpuBindGroupRelease(self.ops.data[i].group);
     for (i in 0..self.pipes.size) {

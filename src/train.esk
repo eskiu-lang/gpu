@@ -59,6 +59,11 @@ struct NnVar {
     int id;
 }
 
+// A training graph, made by Gpu_nn_graph. batch is the number of examples per step; nodes
+// are the values in declaration order (an NnVar is an index into it). fwd is the forward-
+// only program and step the training program, both recorded by backward(); adam_t counts
+// the steps run, for Adam's bias correction, and seed drives the parameters' random
+// initialization. It keeps a copy of the Gpu that made it.
 struct NnGraph {
     Gpu gpu;
     uint32 batch;
@@ -72,6 +77,8 @@ struct NnGraph {
     uint64 seed;
 }
 
+// An empty graph for batches of batch examples. Declare its values, then call backward()
+// and an optimizer before the first run().
 Result<NnGraph, string> Gpu_nn_graph(*Gpu self, uint32 batch) {
     NnGraph g;
     g.gpu = *self;
@@ -162,11 +169,13 @@ NnVar NnGraph_bias(*NnGraph self, NnVar a, NnVar b) {
     return _nn_node(self, _NN_BIAS, a.id, b.id, na.rows, na.cols, true);
 }
 
+// max(a, 0), element-wise; same shape as a.
 NnVar NnGraph_relu(*NnGraph self, NnVar a) {
     _NnNode* na = &self.nodes.data[a.id];
     return _nn_node(self, _NN_RELU, a.id, -1, na.rows, na.cols, _nn_grad(self, a.id));
 }
 
+// tanh(a), element-wise; same shape as a.
 NnVar NnGraph_tanh(*NnGraph self, NnVar a) {
     _NnNode* na = &self.nodes.data[a.id];
     return _nn_node(self, _NN_TANH, a.id, -1, na.rows, na.cols, _nn_grad(self, a.id));
@@ -188,11 +197,14 @@ NnVar NnGraph_mse(*NnGraph self, NnVar a, NnVar target) {
     return &self.nodes.data[v.id].value;
 }
 
+// Sets the value of input v from batch * cols floats at data (row-major, one row per
+// example), for the next run.
 void NnGraph_set_input(*NnGraph self, NnVar v, *float data) {
     _NnNode* n = &self.nodes.data[v.id];
     GpuBuffer_write(&n.value.buf, 0, data, (uint64)n.rows * n.cols * 4);
 }
 
+// Sets labels v from batch class indices at classes (stored as floats), for the next run.
 void NnGraph_set_labels(*NnGraph self, NnVar v, *int classes) {
     _NnNode* n = &self.nodes.data[v.id];
     *float f = alloc<float>((int64)n.rows);
@@ -207,6 +219,8 @@ Result<int, string> NnGraph_read(*NnGraph self, NnVar v, *float out) {
     return NnTensor_read(&n.value, out, (uint64)n.rows * n.cols);
 }
 
+// The first value of v (the loss, for a 1 x 1 value), after the work submitted so far has
+// finished.
 Result<float, string> NnGraph_read_scalar(*NnGraph self, NnVar v) {
     float[4] x;
     NnTensor_read(&self.nodes.data[v.id].value, &x[0], 1)?;
@@ -481,6 +495,9 @@ void NnGraph_adam(*NnGraph self, float lr) {
     NnGraph_adam_with(self, lr, 0.9, 0.999, 0.0);
 }
 
+// Appends an Adam update of every parameter with learning rate lr, the given betas and an
+// L2 weight decay (weight_decay times the parameter added to its gradient; 0 for none).
+// Call it once, after backward().
 void NnGraph_adam_with(*NnGraph self, float lr, float beta1, float beta2, float weight_decay) {
     for (i in 0..self.nodes.size) {
         _NnNode* n = &self.nodes.data[i];
@@ -509,6 +526,7 @@ Result<int, string> NnGraph_forward(*NnGraph self) {
     return NnProgram_run(&self.fwd);
 }
 
+// Releases both programs and every value, gradient and optimizer tensor of the graph.
 void NnGraph_release(*NnGraph self) {
     NnProgram_release(&self.fwd);
     NnProgram_release(&self.step);

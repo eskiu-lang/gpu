@@ -49,6 +49,9 @@ import <gpu/core>;
 import <gpu/ktx2>;
 import <libc>;
 
+// A color as four doubles r, g, b, a (a pass's clear color, the blend constant). A clear
+// color for an sRGB target is in linear light and the GPU encodes it; for other formats
+// it is stored as given.
 type GpuColor = WGPUColor;
 
 // A texture and its view of the whole of it: a 2D view, a 2D-array view
@@ -144,6 +147,7 @@ struct GpuSamplerOptions {
     WGPUCompareFunction compare;
 }
 
+// A sampler made by Gpu_sampler or Gpu_sampler_with; release it with release().
 struct GpuSampler {
     WGPUSampler handle;
 }
@@ -258,6 +262,10 @@ struct GpuPipelineDesc {
     uint32 target_count;
 }
 
+// A render pipeline made by Gpu_pipeline: the shader module, the pipeline, and the group 0
+// bindings set with bind(), bind_texture(), bind_view() and bind_sampler() with the bind
+// group made from them (group, rebuilt when group_stale). It keeps a copy of the Gpu that
+// made it.
 struct GpuPipeline {
     Gpu gpu;
     WGPUShaderModule module;
@@ -336,6 +344,9 @@ struct GpuColorAttachment {
     bool discard;
 }
 
+// A render pass being recorded, from Gpu_pass, Gpu_pass_with or a GpuEncoder. Draw into
+// it, then end() it once. err holds a problem found when the pass began (too many color
+// attachments), reported by end() or by the encoder's submit().
 struct GpuPass {
     Gpu gpu;
     WGPUCommandEncoder enc;
@@ -375,6 +386,8 @@ struct GpuFrame {
     WGPUTextureView alt_view;
 }
 
+// A vertex buffer holding a copy of bytes bytes at data, laid out as the pipeline's
+// GpuVertexLayout says.
 Result<GpuBuffer, string> Gpu_vertices(*Gpu self, *void data, uint64 bytes) {
     GpuBuffer b = Gpu_buffer(self, bytes, WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst)?;
     GpuBuffer_write(&b, 0, data, bytes);
@@ -395,6 +408,9 @@ Result<GpuBuffer, string> Gpu_uniform(*Gpu self, *void data, uint64 bytes) {
     return Ok<GpuBuffer, string>(b);
 }
 
+// A single-level 2D texture of width x height texels in format, with the given
+// WGPUTextureUsage flags (0 for the defaults GpuTextureDesc lists). Gpu_texture_with takes
+// the other settings.
 Result<GpuTexture, string> Gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage) {
     return _gpu_texture(self, width, height, format, usage, 1, 1);
 }
@@ -654,6 +670,9 @@ void _gpu_write_mips(*GpuTexture t, *uint8 rgba, bool srgb) {
     if (owned != null) free(owned);
 }
 
+// A Depth24Plus depth texture of width x height for a pass's depth attachment, matching a
+// pipeline whose depth_format is left at its default. Make a new one when the target is
+// resized.
 Result<GpuTexture, string> Gpu_depth(*Gpu self, uint32 width, uint32 height) {
     return Gpu_texture(self, width, height, WGPUTextureFormat_Depth24Plus, WGPUTextureUsage_RenderAttachment);
 }
@@ -766,6 +785,7 @@ Result<GpuTextureView, string> GpuTexture_view_as(*GpuTexture self, WGPUTextureF
     return GpuTexture_view_with(self, &d);
 }
 
+// Releases the view (not its texture); a second call does nothing.
 void GpuTextureView_release(*GpuTextureView self) {
     if (self.view != null) wgpuTextureViewRelease(self.view);
     self.view = null;
@@ -856,6 +876,8 @@ Result<int, string> GpuReadback_take(*GpuReadback self, *void out) {
     return Ok<int, string>(0);
 }
 
+// Waits for the copy if it is still on its way, then frees the staging buffer, whether or
+// not the pixels were taken.
 void GpuReadback_release(*GpuReadback self) {
     if (self.wait != null) {
         _gpu_wait(&self.gpu, self.wait);
@@ -867,6 +889,8 @@ void GpuReadback_release(*GpuReadback self) {
     self.staging = null;
 }
 
+// Releases the texture and its view; a second call does nothing. Views made from it with
+// view_with or view_as are released separately.
 void GpuTexture_release(*GpuTexture self) {
     if (self.view != null) wgpuTextureViewRelease(self.view);
     if (self.handle != null) wgpuTextureRelease(self.handle);
@@ -881,6 +905,8 @@ Result<GpuSampler, string> Gpu_sampler(*Gpu self, bool linear) {
     return Gpu_sampler_with(self, &o);
 }
 
+// A sampler with the settings in o (see GpuSamplerOptions). Anisotropy is used only with
+// linear filtering and mipmaps; the third wrap axis (W) always repeats.
 Result<GpuSampler, string> Gpu_sampler_with(*Gpu self, *GpuSamplerOptions o) {
     WGPUFilterMode f = o.nearest ? WGPUFilterMode_Nearest : WGPUFilterMode_Linear;
     WGPUAddressMode u = o.wrap_u != 0 ? o.wrap_u : WGPUAddressMode_Repeat;
@@ -897,15 +923,20 @@ Result<GpuSampler, string> Gpu_sampler_with(*Gpu self, *GpuSamplerOptions o) {
     return Ok<GpuSampler, string>(GpuSampler{s});
 }
 
+// Releases the sampler; a second call does nothing.
 void GpuSampler_release(*GpuSampler self) {
     if (self.handle != null) wgpuSamplerRelease(self.handle);
     self.handle = null;
 }
 
+// Adds an attribute of format at byte offset offset in each vertex, at the next @location
+// (location plus the number of attributes added before).
 void GpuVertexLayout_add(*GpuVertexLayout self, WGPUVertexFormat format, uint64 offset) {
     List_push(&self.attrs, WGPUVertexAttribute{format: format, offset: offset, shaderLocation: self.location + (uint32)self.attrs.size});
 }
 
+// Frees the attribute list. A pipeline keeps no reference to its layouts, so they can be
+// released once Gpu_pipeline returns.
 void GpuVertexLayout_release(*GpuVertexLayout self) {
     List_free(&self.attrs);
 }
@@ -935,6 +966,9 @@ WGPUStencilFaceState _gpu_stencil_face(GpuStencilFace f) {
         f.pass != 0 ? f.pass : WGPUStencilOperation_Keep};
 }
 
+// A render pipeline from d (see GpuPipelineDesc). Fails with the WGSL compiler's or the
+// validation layer's message, or when d lists more than 8 vertex buffers, bind groups or
+// color targets.
 Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
     GpuPipeline p;
     p.gpu = *self;
@@ -1045,10 +1079,13 @@ void _gpu_pipeline_entry(*GpuPipeline self, WGPUBindGroupEntry e) {
     self.group_stale = true;
 }
 
+// Binds the whole of b (a uniform or storage buffer) to @binding(binding) of group 0,
+// replacing what was bound there, for the next draws with this pipeline.
 void GpuPipeline_bind(*GpuPipeline self, uint32 binding, *GpuBuffer b) {
     _gpu_pipeline_entry(self, WGPUBindGroupEntry{binding: binding, buffer: b.handle, size: b.size});
 }
 
+// Binds the texture's own view (the whole texture) to @binding(binding) of group 0.
 void GpuPipeline_bind_texture(*GpuPipeline self, uint32 binding, *GpuTexture t) {
     _gpu_pipeline_entry(self, WGPUBindGroupEntry{binding: binding, textureView: t.view});
 }
@@ -1058,10 +1095,13 @@ void GpuPipeline_bind_view(*GpuPipeline self, uint32 binding, *GpuTextureView v)
     _gpu_pipeline_entry(self, WGPUBindGroupEntry{binding: binding, textureView: v.view});
 }
 
+// Binds s to @binding(binding) of group 0.
 void GpuPipeline_bind_sampler(*GpuPipeline self, uint32 binding, *GpuSampler s) {
     _gpu_pipeline_entry(self, WGPUBindGroupEntry{binding: binding, sampler: s.handle});
 }
 
+// Releases the pipeline, its shader module, layouts and bind group, and the list of
+// bindings (not the bound resources).
 void GpuPipeline_release(*GpuPipeline self) {
     if (self.group != null) wgpuBindGroupRelease(self.group);
     if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
@@ -1147,17 +1187,23 @@ Result<GpuBindGroup, string> GpuBindLayout_group(*GpuBindLayout self) {
     return Ok<GpuBindGroup, string>(g);
 }
 
+// Releases the layout and its entry list. Pipelines and bind groups made from it hold
+// their own reference, so it can be released before them.
 void GpuBindLayout_release(*GpuBindLayout self) {
     if (self.handle != null) wgpuBindGroupLayoutRelease(self.handle);
     List_free(&self.entries);
     self.handle = null;
 }
 
+// Sets the whole of b to binding binding, replacing what was there; the bind group is
+// rebuilt at its next use.
 void GpuBindGroup_buffer(*GpuBindGroup self, uint32 binding, *GpuBuffer b) {
     _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, buffer: b.handle, size: b.size});
     self.stale = true;
 }
 
+// Sets the texture's own view (the whole texture) to binding binding; the bind group is
+// rebuilt at its next use.
 void GpuBindGroup_texture(*GpuBindGroup self, uint32 binding, *GpuTexture t) {
     _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, textureView: t.view});
     self.stale = true;
@@ -1169,11 +1215,14 @@ void GpuBindGroup_view(*GpuBindGroup self, uint32 binding, *GpuTextureView v) {
     self.stale = true;
 }
 
+// Sets s to binding binding; the bind group is rebuilt at its next use.
 void GpuBindGroup_sampler(*GpuBindGroup self, uint32 binding, *GpuSampler s) {
     _gpu_set_entry(&self.entries, WGPUBindGroupEntry{binding: binding, sampler: s.handle});
     self.stale = true;
 }
 
+// Releases the bind group, its reference to the layout, and the entry list (not the
+// resources in it).
 void GpuBindGroup_release(*GpuBindGroup self) {
     if (self.handle != null) wgpuBindGroupRelease(self.handle);
     if (self.layout != null) wgpuBindGroupLayoutRelease(self.layout);
@@ -1251,6 +1300,8 @@ GpuPass GpuEncoder_pass(*GpuEncoder self, WGPUTextureView target, GpuColor clear
     return GpuEncoder_pass_with(self, target, &o);
 }
 
+// GpuEncoder_pass with every attachment setting of GpuPassOptions (load instead of clear,
+// stencil, multisample resolve, several color targets).
 GpuPass GpuEncoder_pass_with(*GpuEncoder self, WGPUTextureView target, *GpuPassOptions o) {
     GpuPass p;
     p.gpu = self.gpu;
@@ -1359,6 +1410,8 @@ void GpuPass_draw_range(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, u
     wgpuRenderPassEncoderDraw(self.pass, count, instances, first, first_instance);
 }
 
+// Draws count indices from the uint32 index buffer indices, instances times, with the
+// vertices of vertices (or of the buffers set with set_vertices() when vertices is null).
 void GpuPass_draw_indexed(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, *GpuBuffer indices, uint32 count, uint32 instances) {
     _gpu_pass_setup(self, pipe, vertices);
     wgpuRenderPassEncoderSetIndexBuffer(self.pass, indices.handle, WGPUIndexFormat_Uint32, 0, indices.size);
@@ -1642,6 +1695,8 @@ void GpuSurface_present(*GpuSurface self, *GpuFrame frame) {
     wgpuTextureRelease(frame.texture);
 }
 
+// Unconfigures and releases the surface; a second call does nothing. Present or drop the
+// current frame first.
 void GpuSurface_release(*GpuSurface self) {
     if (self.handle != null) {
         wgpuSurfaceUnconfigure(self.handle);

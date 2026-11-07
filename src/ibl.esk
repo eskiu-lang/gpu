@@ -40,6 +40,11 @@ struct GpuIblOptions {
     uint32 brdf_samples;
 }
 
+// The lighting textures Gpu_ibl makes, all RGBA16Float cube maps except brdf: environment
+// (with its full mip chain), irradiance, specular (one mip level per roughness step, 0 to
+// 1) and brdf, the RG16Float split-sum table. sampler is linear, clamped and mipmapped,
+// for all of them. intensity scales the lighting (1 at creation); <gpu/model> reads it. It
+// keeps a copy of the Gpu that made it.
 struct GpuIbl {
     Gpu gpu;
     GpuTexture environment;
@@ -370,6 +375,7 @@ float GpuIbl_max_lod(*GpuIbl self) {
     return self.specular.mips > 0 ? (float)(self.specular.mips - 1) : 0.0;
 }
 
+// Releases the four textures and the sampler.
 void GpuIbl_release(*GpuIbl self) {
     GpuTexture_release(&self.environment);
     GpuTexture_release(&self.irradiance);

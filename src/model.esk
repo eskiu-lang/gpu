@@ -39,6 +39,9 @@ import <gpu/obj>;
 import <gpu/image>;
 import <gpu/ibl>;
 
+// A camera: view and proj are the view and projection matrices (WebGPU clip space) and eye
+// is the camera's position in world space, which the specular shading needs. gpu_camera
+// and GpuModel_camera make one.
 struct GpuCamera {
     Mat4 view;
     Mat4 proj;
@@ -92,6 +95,14 @@ struct _GpuTexKey {
     int slot;
 }
 
+// A glTF model on the GPU, made by Gpu_model. data is the Gltf it draws (not owned). light
+// is the directional light and ambient term; transform is the model matrix update() was
+// last given. encode_srgb says the shader writes sRGB values itself because the target
+// format is not an sRGB one. ibl is the environment set with GpuModel_set_ibl or null.
+// shadows, shadow and the shadow_ fields are the state GpuModel_enable_shadows sets up,
+// with light_view_proj the light's matrix of the last render_shadows. world holds each
+// node's world matrix from the last update(). The other fields are the model's pipelines,
+// textures, samplers, buffers and draw list.
 struct GpuModel {
     Gpu gpu;
     *Gltf data;
@@ -473,6 +484,11 @@ Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat forma
     return Ok<int, string>(0);
 }
 
+// Uploads data's meshes, materials and textures and builds the pipelines for color targets
+// of format (an sRGB format or not: the shader encodes sRGB itself when it is not). The
+// pipelines test against a Depth24Plus depth texture (Gpu_depth). Point and line
+// primitives are skipped. data must outlive the model. The light
+// starts as a warm white sun from above (intensity 3) with a gray-blue ambient.
 Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat format) {
     GpuModel m;
     m.gpu = *self;
@@ -749,6 +765,8 @@ Result<int, string> GpuModel_enable_shadows(*GpuModel self, *GpuShadowOptions o)
     return Ok<int, string>(0);
 }
 
+// Turns shadows off and releases the shadow map and its pipeline; does nothing when they
+// are off.
 void GpuModel_disable_shadows(*GpuModel self) {
     if (!self.shadows) return;
     self.shadow_map.release();
@@ -937,6 +955,8 @@ GpuCamera GpuModel_camera(*GpuModel self, float aspect) {
     return gpu_camera(eye, center, 0.8, aspect, radius * 0.05, radius * 20.0);
 }
 
+// Releases every GPU object of the model and its buffers of matrices. It does not free the
+// Gltf or the GpuIbl.
 void GpuModel_release(*GpuModel self) {
     for (i in 0..self.pipelines.size) self.pipelines.data[i].release();
     for (i in 0..self.textures.size) self.textures.data[i].release();
@@ -994,10 +1014,14 @@ struct GpuJoints {
     *Mat4 matrices;
 }
 
+// The joint matrices of skin (an index into data.skins) in a storage buffer, filled from
+// data's current pose. Fails when the skin does not exist.
 Result<GpuJoints, string> Gpu_joints(*Gpu self, *Gltf data, int skin) {
     return _gpu_joints(self, data, skin, 0, WGPUBufferUsage_Storage);
 }
 
+// The joint matrices of skin in a uniform buffer of capacity matrices (the unused ones are
+// identity). Fails when the skin does not exist or has more joints than capacity.
 Result<GpuJoints, string> Gpu_joints_uniform(*Gpu self, *Gltf data, int skin, int capacity) {
     return _gpu_joints(self, data, skin, capacity, WGPUBufferUsage_Uniform);
 }
@@ -1019,12 +1043,15 @@ Result<GpuJoints, string> _gpu_joints(*Gpu self, *Gltf data, int skin, int capac
     return Ok<GpuJoints, string>(j);
 }
 
+// Recomputes the joint matrices from data's current pose (after Gltf_animate) and writes
+// them to the buffer. data must be the Gltf the joints were made from.
 void GpuJoints_update(*GpuJoints self, *Gltf data) {
     Gltf_world(data, self.world);
     Gltf_joint_matrices(data, self.skin, self.world, self.matrices);
     if (self.count > 0) self.buffer.write(0, self.matrices, (uint64)self.count * 64);
 }
 
+// Releases the buffer and frees the matrices.
 void GpuJoints_release(*GpuJoints self) {
     self.buffer.release();
     if (self.world != null) free(self.world);

@@ -569,6 +569,10 @@ Result<Gltf, string> obj_parse(string text, string base_dir) {
     return Ok<Gltf, string>(o.g);
 }
 
+// Reads an OBJ file and parses it with obj_parse, reading its MTL files and textures
+// relative to the file's directory. Errors start with "obj: " and give the line for a
+// malformed face, vertex, texture coordinate or normal. The caller frees the result with
+// free().
 Result<Gltf, string> obj_load(string path) {
     int64 n = 0;
     *uint8 data = fs_read_all(path, &n);
