@@ -2,6 +2,60 @@
 
 The rendering API of `<gpu/render>` (also in `<gpu>`), past the first triangle in the [README](../README.md#rendering). Every call that can fail returns a `Result` with the WebGPU validation message.
 
+## A window and a triangle
+
+A window, a pipeline and one draw per frame (from [`examples/triangle.esk`](../examples/triangle.esk)):
+
+```eskiu
+Gpu gpu = gpu_open()?;
+defer gpu.release();
+Window win = window_open("Eskiu triangle", 800, 600)?;
+defer win.release();
+GpuSurface surface = win.surface(&gpu)?;
+defer surface.release();
+GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format};
+GpuPipeline pipe = gpu.pipeline(&d)?;
+defer pipe.release();
+
+bool running = true;
+WindowEvent ev;
+while (running) {
+    while (win.poll(&ev)) {
+        if (ev.kind == WINDOW_QUIT) running = false;
+        if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
+    }
+    GpuFrame frame = surface.frame()?;
+    GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    surface.present(&frame);
+}
+```
+
+[`examples/cube.esk`](../examples/cube.esk) adds a vertex and an index buffer, a texture, a
+depth buffer and a matrix uniform built with `<gpu/math>`:
+
+```eskiu
+Quat spin = quat_axis_angle(Vec3{0.4, 1.0, 0.2}, t);
+Mat4 mvp = proj * view * mat4_trs(position, spin, Vec3{1.0, 1.0, 1.0});
+ub.write(0, &mvp, sizeof(Mat4));
+```
+
+Both examples quit with Escape, or after N frames with `--frames N`.
+
+The rest of the rendering API is in [docs/rendering.md](rendering.md):
+
+- [textures and samplers](rendering.md#textures-and-samplers) from pixels, PNG and JPEG
+- [image decoding options](image.md): EXIF orientation and the pixel limit
+- [frames with several passes](rendering.md#frames-with-several-passes-bind-groups-blending-and-depth), bind groups, blending and depth
+- [stencil and multisampling](rendering.md#stencil-and-multisampling)
+- [several render targets](rendering.md#several-render-targets)
+- [layers, cube maps and mip levels](rendering.md#layers-cube-maps-and-mip-levels), mipmaps made on the GPU
+- [shadow maps](rendering.md#shadow-maps): depth textures and comparison samplers
+- [compressed textures, KTX2 and HDR images](rendering.md#compressed-textures-ktx2-and-hdr-images)
+- [sRGB and linear views](rendering.md#srgb-and-linear-views)
+- [instances, ranges, viewport and scissor](rendering.md#instances-ranges-viewport-and-scissor)
+
 API reference: [`<gpu/render>`](api.md#gpurender), [`<gpu/core>`](api.md#gpucore), [`<gpu/async>`](api.md#gpuasync).
 
 ## Textures and samplers

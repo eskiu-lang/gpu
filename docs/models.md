@@ -2,6 +2,39 @@
 
 `<gpu/gltf>`, `<gpu/obj>` and `<gpu/model>`: loading glTF 2.0 and OBJ files and drawing them. The short example is in the [README](../README.md#models).
 
+## Loading and drawing a model
+
+```eskiu
+Gltf data = model_load("helmet.glb")?;   // or a .gltf, or an .obj
+defer data.free();
+GpuModel model = gpu.model(&data, surface.format)?;
+defer model.release();
+
+// every frame
+data.animate(0, seconds);
+model.update(mat4_identity());
+GpuCamera cam = model.camera(aspect);
+GpuPass pass = gpu.pass(frame.view, GpuColor{0.1, 0.1, 0.1, 1.0}, &depth);
+model.draw(&pass, &cam);
+pass.end()?;
+```
+
+glTF (`.gltf`, `.glb`) and OBJ files load into the same `Gltf`, and `GpuModel` draws them with
+metallic-roughness shading, normal maps, skinning and animation.
+[`examples/model.esk`](../examples/model.esk) is a viewer. What the loaders read, the
+materials and the lighting are in [docs/models.md](models.md).
+
+Morph targets follow the glTF weights, from animations or `model.set_weights`
+([docs/morph.md](morph.md)). Image-based lighting from an HDR environment
+([docs/ibl.md](ibl.md)) and shadow maps from the light ([docs/shadows.md](shadows.md))
+are opt-in:
+
+```eskiu
+GpuIbl ibl = gpu.ibl(&sky, null)?;      // sky = hdr_load("sky.hdr")?
+model.set_ibl(&ibl);
+model.enable_shadows(null)?;            // then each frame, before the pass: model.render_shadows()?;
+```
+
 API reference: [`<gpu/gltf>`](api.md#gpugltf), [`<gpu/obj>`](api.md#gpuobj), [`<gpu/model>`](api.md#gpumodel).
 
 The loader reads meshes (every attribute type, sparse accessors, strips and fans), PBR

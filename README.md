@@ -30,10 +30,12 @@ WGSL.
   Eskiu memory.
 - **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
   render pipelines and passes, to an offscreen texture or a window; several render targets,
-  stencil, multisampling, cube and array targets, and shadow maps.
+  stencil, multisampling, cube and array targets, and shadow maps; in the browser too,
+  through emdawnwebgpu.
 - **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
   OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
-  based shading, normal maps, alpha modes, skinning and animation.
+  based shading, normal maps, alpha modes, skinning, morph targets, animation, image-based
+  lighting and shadows.
 - **Machine learning.** `<gpu/nn>` runs transformer inference (Llama 2 7B at 45 tokens per
   second on an M4 Pro, from GGUF, safetensors or llama2.c files) and `<gpu/train>` trains
   networks with automatic differentiation and Adam.
@@ -89,136 +91,16 @@ $ eskiuc run twice.esk
 510.0
 ```
 
-## Rendering
+## Documentation
 
-A window, a pipeline and one draw per frame (from [`examples/triangle.esk`](examples/triangle.esk)):
-
-```eskiu
-Gpu gpu = gpu_open()?;
-defer gpu.release();
-Window win = window_open("Eskiu triangle", 800, 600)?;
-defer win.release();
-GpuSurface surface = win.surface(&gpu)?;
-defer surface.release();
-GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: surface.format};
-GpuPipeline pipe = gpu.pipeline(&d)?;
-defer pipe.release();
-
-bool running = true;
-WindowEvent ev;
-while (running) {
-    while (win.poll(&ev)) {
-        if (ev.kind == WINDOW_QUIT) running = false;
-        if (ev.kind == WINDOW_RESIZE) surface.configure(ev.width, ev.height);
-    }
-    GpuFrame frame = surface.frame()?;
-    GpuPass pass = gpu.pass(frame.view, GpuColor{0.08, 0.08, 0.1, 1.0}, null);
-    pass.draw(&pipe, null, 3, 1);
-    pass.end()?;
-    surface.present(&frame);
-}
-```
-
-[`examples/cube.esk`](examples/cube.esk) adds a vertex and an index buffer, a texture, a
-depth buffer and a matrix uniform built with `<gpu/math>`:
-
-```eskiu
-Quat spin = quat_axis_angle(Vec3{0.4, 1.0, 0.2}, t);
-Mat4 mvp = proj * view * mat4_trs(position, spin, Vec3{1.0, 1.0, 1.0});
-ub.write(0, &mvp, sizeof(Mat4));
-```
-
-Both examples quit with Escape, or after N frames with `--frames N`.
-
-The rest of the rendering API is in [docs/rendering.md](docs/rendering.md):
-
-- [textures and samplers](docs/rendering.md#textures-and-samplers) from pixels, PNG and JPEG
-- [image decoding options](docs/image.md): EXIF orientation and the pixel limit
-- [frames with several passes](docs/rendering.md#frames-with-several-passes-bind-groups-blending-and-depth), bind groups, blending and depth
-- [stencil and multisampling](docs/rendering.md#stencil-and-multisampling)
-- [several render targets](docs/rendering.md#several-render-targets)
-- [layers, cube maps and mip levels](docs/rendering.md#layers-cube-maps-and-mip-levels), mipmaps made on the GPU
-- [shadow maps](docs/rendering.md#shadow-maps): depth textures and comparison samplers
-- [compressed textures, KTX2 and HDR images](docs/rendering.md#compressed-textures-ktx2-and-hdr-images)
-- [sRGB and linear views](docs/rendering.md#srgb-and-linear-views)
-- [instances, ranges, viewport and scissor](docs/rendering.md#instances-ranges-viewport-and-scissor)
-
-## Models
-
-```eskiu
-Gltf data = model_load("helmet.glb")?;   // or a .gltf, or an .obj
-defer data.free();
-GpuModel model = gpu.model(&data, surface.format)?;
-defer model.release();
-
-// every frame
-data.animate(0, seconds);
-model.update(mat4_identity());
-GpuCamera cam = model.camera(aspect);
-GpuPass pass = gpu.pass(frame.view, GpuColor{0.1, 0.1, 0.1, 1.0}, &depth);
-model.draw(&pass, &cam);
-pass.end()?;
-```
-
-glTF (`.gltf`, `.glb`) and OBJ files load into the same `Gltf`, and `GpuModel` draws them with
-metallic-roughness shading, normal maps, skinning and animation.
-[`examples/model.esk`](examples/model.esk) is a viewer. What the loaders read, the
-materials and the lighting are in [docs/models.md](docs/models.md).
-
-Morph targets follow the glTF weights, from animations or `model.set_weights`
-([docs/morph.md](docs/morph.md)). Image-based lighting from an HDR environment
-([docs/ibl.md](docs/ibl.md)) and shadow maps from the light ([docs/shadows.md](docs/shadows.md))
-are opt-in:
-
-```eskiu
-GpuIbl ibl = gpu.ibl(&sky, null)?;      // sky = hdr_load("sky.hdr")?
-model.set_ibl(&ibl);
-model.enable_shadows(null)?;            // then each frame, before the pass: model.render_shadows()?;
-```
-
-## Machine learning
-
-[`examples/llama2.esk`](examples/llama2.esk) is Llama 2 inference after Andrej Karpathy's
-llama2.c. It reads llama2.c checkpoints, llama GGUF files (Q4_0 and Q8_0 run quantized on
-the GPU, other types are converted to f16) and Hugging Face model directories:
-
-```
-$ eskiuc build && ./build/llama2 llama-2-7b.Q4_0.gguf -t 0 -i "The capital of France is"
-```
-
-| Model | Eskiu | Reference |
-|---|---|---|
-| stories110M (llama2.c, f16) | 350 tokens/s | llama2.c on the CPU: 22 tokens/s |
-| TinyLlama 1.1B Q4_0 (GGUF) | 178 tokens/s | llama.cpp (Metal): 260 tokens/s |
-| Llama 2 7B Q4_0 (GGUF) | 45 tokens/s | llama.cpp (Metal): 58 tokens/s |
-
-<sub>Apple M4 Pro, greedy decoding. The outputs match llama2.c byte for byte and llama.cpp
-and Hugging Face transformers token for token on the prompts tested.</sub>
-
-The forward pass is a program of `<gpu/nn>` operations recorded once and replayed as one
-compute pass per token: matrix-vector products in f32, f16, Q8_0 and Q4_0 (with subgroup
-reductions when the device has them), RMSNorm, rotary embeddings, attention over a KV cache,
-SwiGLU and argmax.
-
-`<gpu/train>` trains networks with automatic differentiation and Adam: an MNIST example and the
-API are in [docs/ml.md](docs/ml.md).
-
-## Platforms
-
-| Modules | macOS arm64 | Linux x86-64 | Windows x86-64 | iOS (arm64, simulator) | Android (arm64, x86-64) | WebAssembly |
-|---|---|---|---|---|---|---|
-| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | yes (the browser's WebGPU) |
-| `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | yes (the page's canvas) |
-| `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
-| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
-
-On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
-`gpu_ui_surface(&gpu)`) or directly into a `CAMetalLayer` (`gpu.surface_metal(layer)`) or
-`ANativeWindow*` (`gpu.surface_android(window)`). In a browser, WebGPU is the browser's own,
-through Emscripten's `emdawnwebgpu`: the build flags are in [docs/web.md](docs/web.md).
-
-A game in an eskiu-ui app (the surface's life cycle, one draw per display frame, several
-fingers at once) is in [docs/mobile.md](docs/mobile.md).
+- [Rendering](docs/rendering.md): windows, textures, passes, stencil, multisampling, render targets, cube maps, mipmaps, shadow maps, compressed textures
+- [Models](docs/models.md): glTF and OBJ, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
+- [Images](docs/image.md): PNG, JPEG, HDR, KTX2, EXIF orientation and limits
+- [Web](docs/web.md): the browser through emdawnwebgpu
+- [iOS and Android](docs/mobile.md): `GpuView`, the frame loop, touches
+- [Machine learning](docs/ml.md): `<gpu/nn>` inference and `<gpu/train>`
+- [Platforms, modules and contributing](docs/README.md)
+- [API reference](docs/api.md): every public function and type
 
 ## Install
 
@@ -229,65 +111,7 @@ eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.5.0
 eskiuc build
 ```
 
-The package's `eskiu.toml` names wgpu-native 29's own release archives for macOS (arm64 and
-x86-64), Linux (x86-64 and arm64), Windows x86-64, iOS (arm64 device, arm64 simulator and
-x86-64 simulator) and Android (arm64 and x86-64): the first build that links it
-(`eskiuc build`, `run`, `test`, or a `--target` cross-build) downloads the one for the
-target platform, checks its SHA-256 and keeps it in `~/.eskiu/native`, and every build links
-against it with no `-L` (on Windows the DLL is copied next to the program; `ui build ios`
-and `ui build android` link `libwgpu_native.a` into the app bundle). A program that only
-uses the pure Eskiu modules downloads nothing.
-
-`<gpu/window>` also needs SDL3, which publishes no prebuilt library for macOS or Linux: install
-it from your system (`brew install sdl3` on macOS, the SDL3 development package or
-[libsdl.org](https://libsdl.org) elsewhere) and give its directory to a build that opens a
-window, as in `eskiuc build -L/opt/homebrew/lib`.
-
-## Modules
-
-| Module | What it has |
-|---|---|
-| `<gpu>` | `<gpu/core>` and `<gpu/render>` together |
-| `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
-| `<gpu/render>` | `GpuTexture` (`Gpu_texture_with`: layers, cube maps, mip levels, view formats; `generate_mips`), `GpuTextureView`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window, mobile and canvas surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`, `surface_canvas`) |
-| `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
-| `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-lang/ui` apps on iOS and Android |
-| `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
-| `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8; `hdr_load`, `hdr_decode`: Radiance `.hdr` to floats (`HdrBitmap`) |
-| `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2` |
-| `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
-| `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
-| `<gpu/ibl>` | `Gpu_ibl`, `GpuIbl`: environment, irradiance and prefiltered specular cubes and the BRDF table from an HDR image; `Gpu_brdf_lut` |
-| `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight`, `GpuJoints` (joint matrices for your own skinning shader) |
-| `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |
-| `<gpu/nn>` | `NnTensor` (f32, f16, Q8_0, Q4_0), `NnProgram` with matvec, RMSNorm, RoPE, attention, SwiGLU, argmax |
-| `<gpu/train>` | `NnGraph`: inputs, parameters, matmul, bias, ReLU, tanh, cross entropy, MSE, `backward`, Adam, SGD |
-| `<gpu/gguf>` | `gguf_load`, metadata, tensors, dequantization of F32, F16, BF16, Q4_0 to Q8_0 and Q2_K to Q6_K |
-| `<gpu/safetensors>` | `safetensors_load`, `SafeTensor_floats`, `SafetensorsWriter` |
-| `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
-| `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
-
-Each object has a `release()` to pair with `defer`. The handles inside the `Gpu*` structs are
-the `<gpu/raw>` ones, so a program can drop down to the C API for anything the idiomatic
-layer does not cover.
-
-Every public function and type, with its documentation, is in the [API reference](docs/api.md).
-
-## Contributing
-
-Bug reports are welcome; please include the program, the `eskiuc --version` output and the
-adapter it ran on. The tests and the layout check run with:
-
-```bash
-eskiuc test
-tools/gen.py $(brew --prefix wgpu-native)/include            # regenerates src/raw.esk
-python3 -I tools/gen_test_models.py                          # regenerates the glTF test models
-tools/layout_check.sh $(brew --prefix wgpu-native)/include /opt/homebrew/lib
-```
-
-`tools/layout_check.sh` compiles a C program and an Eskiu program that print the size and
-field offsets of every WebGPU struct and compares their output. CI runs it and the tests on
-Linux (software Vulkan, no GPU needed) and macOS.
+The first build downloads wgpu-native for your platform and checks its SHA-256; `<gpu/window>` also needs SDL3 on the desktop. See [installation details](docs/README.md#installation-details).
 
 ## License
 
