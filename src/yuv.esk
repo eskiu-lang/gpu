@@ -1,0 +1,512 @@
+// yuv.esk: camera and video frames on the GPU (<gpu/yuv>).
+//
+// A GpuYuv uploads a frame's planes as they are (the luma plane as an R8
+// texture, an interleaved chroma plane as RG8, separate U and V planes as R8,
+// each with the frame's row stride) and turns them into RGB in a shader, with
+// the frame's matrix (BT.601 or BT.709) and range (full or limited). It draws
+// the picture into a render pass, turned upright and fitted to a rectangle,
+// or renders it into an RGBA texture of its own.
+//
+//     GpuYuv yuv = gpu.yuv(surface.format)?;
+//     defer yuv.release();
+//     ...
+//     yuv.upload((*GpuYuvImage)frame)?;       // a CameraFrame or a VideoFrame
+//     GpuPass pass = gpu.pass(out.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+//     GpuYuvDraw d = GpuYuvDraw{width: 1080.0, height: 1920.0, fit: GPU_YUV_COVER};
+//     yuv.draw(&pass, &d);
+//     pass.end()?;
+//
+// GpuYuvImage has the field layout of eskiu-lang/ui-camera's CameraFrame and
+// eskiu-lang/video's VideoFrame, so a pointer to either is a pointer to one.
+
+import <mem>;
+import <string>;
+import <result>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+
+// How a frame's pixels are laid out (the values of CameraFormat and
+// VideoFormat). NV12: a Y plane, then one plane of interleaved U and V (U
+// first). NV21: the same with V first. I420: Y, U and V planes, chroma a
+// quarter of the size. GPU_YUV_420: Y, U and V planes whose chroma samples are
+// pixel_stride bytes apart. RGBA: one plane of 4 bytes a pixel.
+enum GpuYuvFormat { GPU_YUV_NV12, GPU_YUV_NV21, GPU_YUV_I420, GPU_YUV_420, GPU_YUV_RGBA }
+
+// The matrix a frame's YUV is encoded with: BT.601 (standard definition,
+// JPEG, phone cameras) or BT.709 (HD video).
+enum GpuYuvMatrix { GPU_YUV_BT601, GPU_YUV_BT709 }
+
+// One plane of a frame: data, the bytes from one row to the next, from one
+// sample to the next in a row (2 in an interleaved chroma plane, from one U to
+// the next), and the bytes readable from data.
+struct GpuYuvPlane {
+    *uint8 data;
+    int row_stride;
+    int pixel_stride;
+    int64 size;
+}
+
+// A frame to upload, laid out like CameraFrame and VideoFrame. width and
+// height are in pixels; plane_count planes are set, as format (a
+// GpuYuvFormat) says; chroma planes are half the width and height, rounded
+// up. rotation (0, 90, 180 or 270) is how far to turn it clockwise to be
+// upright; matrix (a GpuYuvMatrix) and full_range say how its YUV maps to RGB.
+// timestamp_ns and front are not used here.
+struct GpuYuvImage {
+    int width;
+    int height;
+    int format;
+    int plane_count;
+    GpuYuvPlane[3] planes;
+    int rotation;
+    int64 timestamp_ns;
+    bool front;
+    int matrix;
+    bool full_range;
+}
+
+// How GpuYuv_draw fits the picture in its rectangle. STRETCH fills it,
+// CONTAIN shows the whole picture at its aspect ratio (the rest of the
+// rectangle keeps what the pass has), COVER fills it at the picture's aspect
+// ratio and crops what overflows.
+enum GpuYuvFit { GPU_YUV_STRETCH, GPU_YUV_CONTAIN, GPU_YUV_COVER }
+
+// Where and how GpuYuv_draw draws: the rectangle of the target in pixels from
+// the top left (x, y, width, height; it must lie inside the target), the fit,
+// whether to turn the picture by the frame's rotation (upright), to mirror it
+// left to right after turning (mirror, the way a front camera's preview is
+// shown), and to take the nearest texel instead of filtering (nearest).
+struct GpuYuvDraw {
+    float x;
+    float y;
+    float width;
+    float height;
+    GpuYuvFit fit;
+    bool upright = true;
+    bool mirror;
+    bool nearest;
+}
+
+// The uniforms of the conversion shader (80 bytes).
+struct _GpuYuvUniforms {
+    float[4] coeff0;
+    float[4] coeff1;
+    float[4] xform0;
+    float[4] xform1;
+    float[4] size;
+}
+
+// A frame uploader and converter made by Gpu_yuv; release it with release().
+// After upload, width, height, format and rotation are the frame's; rgba is
+// the texture GpuYuv_to_rgba renders into. The plane textures, pipelines and
+// buffers are kept from one frame to the next and made again only when the
+// frame's size or layout changes.
+struct GpuYuv {
+    Gpu gpu;
+    WGPUTextureFormat target_format;
+    GpuTexture[3] planes;
+    GpuTexture blank;
+    GpuSampler sampler;
+    GpuPipeline pipe;
+    GpuPipeline rgba_pipe;
+    GpuBuffer uniforms;
+    GpuBuffer rgba_uniforms;
+    GpuTexture rgba;
+    *uint8 scratch;
+    int64 scratch_size;
+    int width;
+    int height;
+    int format;
+    int rotation;
+    int matrix;
+    bool full_range;
+    bool chroma_swap;
+    bool loaded;
+}
+
+string _gpu_yuv_shader =
+    "struct U { coeff0: vec4<f32>, coeff1: vec4<f32>, xform0: vec4<f32>, xform1: vec4<f32>, size: vec4<f32> };\n"
+    "@group(0) @binding(0) var luma: texture_2d<f32>;\n"
+    "@group(0) @binding(1) var chroma: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var chroma2: texture_2d<f32>;\n"
+    "@group(0) @binding(3) var smp: sampler;\n"
+    "@group(0) @binding(4) var<uniform> u: U;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var o: V;\n"
+    "    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    o.uv = vec2<f32>(p.x, 1.0 - p.y);\n"
+    "    return o;\n"
+    "}\n"
+    "fn to_linear(c: vec3<f32>) -> vec3<f32> {\n"
+    "    let lo = c / 12.92;\n"
+    "    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));\n"
+    "    return select(hi, lo, c <= vec3<f32>(0.04045));\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let s = u.xform0.xy * v.uv.x + u.xform0.zw * v.uv.y + u.xform1.xy;\n"
+    "    let lsize = u.size.xy;\n"
+    "    let csize = u.size.zw;\n"
+    "    let lp = clamp(floor(s * lsize), vec2<f32>(0.0), lsize - 1.0);\n"
+    "    let cp = clamp(floor(lp * 0.5), vec2<f32>(0.0), csize - 1.0);\n"
+    "    let cs = s * lsize / (2.0 * csize);\n"
+    "    let near = u.xform1.z > 0.5;\n"
+    "    let y4 = select(textureSampleLevel(luma, smp, s, 0.0), textureLoad(luma, vec2<i32>(lp), 0), near);\n"
+    "    let c4 = select(textureSampleLevel(chroma, smp, cs, 0.0), textureLoad(chroma, vec2<i32>(cp), 0), near);\n"
+    "    let d4 = select(textureSampleLevel(chroma2, smp, cs, 0.0), textureLoad(chroma2, vec2<i32>(cp), 0), near);\n"
+    "    let mode = u.coeff1.z;\n"
+    "    var rgb: vec3<f32>;\n"
+    "    if (mode > 1.5) {\n"
+    "        rgb = y4.rgb;\n"
+    "    } else {\n"
+    "        var cb = c4.r;\n"
+    "        var cr = c4.g;\n"
+    "        if (mode > 0.5) { cr = d4.r; }\n"
+    "        if (u.coeff1.w > 0.5) { let t = cb; cb = cr; cr = t; }\n"
+    "        let yy = (y4.r * 255.0 - u.coeff0.x) * u.coeff0.y;\n"
+    "        let b = cb * 255.0 - 128.0;\n"
+    "        let r = cr * 255.0 - 128.0;\n"
+    "        rgb = vec3<f32>(yy + u.coeff0.z * r, yy - u.coeff0.w * b - u.coeff1.x * r, yy + u.coeff1.y * b) / 255.0;\n"
+    "    }\n"
+    "    rgb = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));\n"
+    "    if (u.xform1.w > 0.5) { rgb = to_linear(rgb); }\n"
+    "    return vec4<f32>(rgb, 1.0);\n"
+    "}\n";
+
+// A GpuYuv that draws into targets of target_format (a surface's format, or
+// RGBA8Unorm when 0). An sRGB target gets the picture's colors as they are:
+// the shader decodes them to linear light so the target's encoding gives them
+// back.
+Result<GpuYuv, string> Gpu_yuv(*Gpu self, WGPUTextureFormat target_format) {
+    GpuYuv y;
+    y.gpu = *self;
+    y.target_format = target_format != 0 ? target_format : WGPUTextureFormat_RGBA8Unorm;
+    y.format = -1;
+    Result<GpuTexture, string> blank = Gpu_texture(self, 1, 1, WGPUTextureFormat_R8Unorm, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
+    if (!blank.ok) return Err<GpuYuv, string>(blank.error);
+    y.blank = blank.value;
+    uint8[4] zero;
+    GpuTexture_write_region(&y.blank, 0, 0, 1, 1, &zero[0]);
+    GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    Result<GpuSampler, string> smp = Gpu_sampler_with(self, &so);
+    if (!smp.ok) {
+        GpuYuv_release(&y);
+        return Err<GpuYuv, string>(smp.error);
+    }
+    y.sampler = smp.value;
+    Result<GpuBuffer, string> ub = Gpu_uniform(self, null, sizeof(_GpuYuvUniforms));
+    if (!ub.ok) {
+        GpuYuv_release(&y);
+        return Err<GpuYuv, string>(ub.error);
+    }
+    y.uniforms = ub.value;
+    Result<GpuPipeline, string> pipe = _gpu_yuv_pipeline(&y, y.target_format, &y.uniforms);
+    if (!pipe.ok) {
+        GpuYuv_release(&y);
+        return Err<GpuYuv, string>(pipe.error);
+    }
+    y.pipe = pipe.value;
+    return Ok<GpuYuv, string>(y);
+}
+
+// The conversion pipeline for targets of format, its sampler and uniforms bound.
+Result<GpuPipeline, string> _gpu_yuv_pipeline(*GpuYuv self, WGPUTextureFormat format, *GpuBuffer uniforms) {
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_yuv_shader, vertex: "vs", fragment: "fs", format: format};
+    GpuPipeline p = Gpu_pipeline(&self.gpu, &d)?;
+    for (i in 0..3) GpuPipeline_bind_texture(&p, (uint32)i, &self.blank);
+    GpuPipeline_bind_sampler(&p, 3, &self.sampler);
+    GpuPipeline_bind(&p, 4, uniforms);
+    return Ok<GpuPipeline, string>(p);
+}
+
+// Checks that image describes a frame whose planes cover its pixels: a known
+// format, the plane count it needs, strides and sizes that keep every read
+// inside the planes. Returns null when it does, else what is wrong.
+string gpu_yuv_check(*GpuYuvImage image) {
+    if (image.width <= 0 || image.height <= 0 || image.width > 16384 || image.height > 16384) return "yuv: a frame size out of 1 to 16384";
+    if (image.format < GPU_YUV_NV12 || image.format > GPU_YUV_RGBA) return "yuv: an unknown format";
+    if (image.rotation != 0 && image.rotation != 90 && image.rotation != 180 && image.rotation != 270) return "yuv: a rotation that is not 0, 90, 180 or 270";
+    int want = 3;
+    if (image.format == GPU_YUV_NV12 || image.format == GPU_YUV_NV21) want = 2;
+    if (image.format == GPU_YUV_RGBA) want = 1;
+    if (image.plane_count != want) return "yuv: a plane count that does not fit the format";
+    for (i in 0..want) {
+        *GpuYuvPlane plane = &image.planes[i];
+        if (plane.data == null) return "yuv: a missing plane";
+        if (plane.row_stride <= 0 || plane.pixel_stride <= 0 || plane.pixel_stride > 8) return "yuv: a plane stride out of range";
+        int rows = image.height;
+        int samples = image.width;
+        if (i > 0) {
+            rows = (image.height + 1) / 2;
+            samples = (image.width + 1) / 2;
+        }
+        int tail = 1;
+        if (want == 2 && i == 1) tail = 2;
+        if (image.format == GPU_YUV_RGBA) tail = 4;
+        if (plane.pixel_stride < tail) return "yuv: a pixel stride under the sample size";
+        int64 row_bytes = (int64)(samples - 1) * plane.pixel_stride + tail;
+        if ((int64)plane.row_stride < row_bytes) return "yuv: a row stride under the row's bytes";
+        if (plane.size < (int64)(rows - 1) * plane.row_stride + row_bytes) return "yuv: a plane shorter than its rows";
+    }
+    return null;
+}
+
+// The texture format that reads a plane of `stride`-byte texels directly, or
+// Undefined.
+WGPUTextureFormat _gpu_yuv_direct(int stride) {
+    if (stride == 1) return WGPUTextureFormat_R8Unorm;
+    if (stride == 2) return WGPUTextureFormat_RG8Unorm;
+    if (stride == 4) return WGPUTextureFormat_RGBA8Unorm;
+    return WGPUTextureFormat_Undefined;
+}
+
+// Makes plane texture `slot` width x height in format unless it is already.
+Result<int, string> _gpu_yuv_slot(*GpuYuv self, int slot, uint32 width, uint32 height, WGPUTextureFormat format) {
+    *GpuTexture t = &self.planes[slot];
+    if (t.handle != null && t.width == width && t.height == height && t.format == format) return Ok<int, string>(0);
+    GpuTexture_release(t);
+    *t = Gpu_texture(&self.gpu, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    GpuPipeline_bind_texture(&self.pipe, (uint32)slot, t);
+    if (self.rgba_pipe.handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)slot, t);
+    return Ok<int, string>(0);
+}
+
+// Room for `bytes` bytes of repacked plane.
+*uint8 _gpu_yuv_scratch(*GpuYuv self, int64 bytes) {
+    if (self.scratch_size < bytes) {
+        if (self.scratch != null) free(self.scratch);
+        self.scratch = alloc<uint8>(bytes);
+        self.scratch_size = self.scratch != null ? bytes : (int64)0;
+    }
+    return self.scratch;
+}
+
+// Uploads one plane of samples x rows samples of `texel` bytes (1 for a
+// sample, 2 for an interleaved chroma pair, 4 for RGBA) into texture slot:
+// as it is when its pixel stride is a texel format's size and its bytes cover
+// the texture's rows, else repacked into texel-sized samples first.
+Result<int, string> _gpu_yuv_plane(*GpuYuv self, int slot, *GpuYuvPlane plane, int samples, int rows, int texel) {
+    WGPUTextureFormat direct = _gpu_yuv_direct(plane.pixel_stride);
+    if (plane.pixel_stride < texel) direct = WGPUTextureFormat_Undefined;
+    int64 need = (int64)(rows - 1) * plane.row_stride + (int64)samples * plane.pixel_stride;
+    *uint8 src = plane.data;
+    uint32 row = (uint32)plane.row_stride;
+    WGPUTextureFormat format = direct;
+    if (direct == WGPUTextureFormat_Undefined || plane.size < need) {
+        format = _gpu_yuv_direct(texel);
+        *uint8 dst = _gpu_yuv_scratch(self, (int64)samples * rows * texel);
+        if (dst == null) return Err<int, string>("yuv: out of memory");
+        for (y in 0..rows) {
+            *uint8 from = plane.data + (int64)y * plane.row_stride;
+            *uint8 to = dst + (int64)y * samples * texel;
+            for (x in 0..samples) {
+                for (b in 0..texel) to[x * texel + b] = from[(int64)x * plane.pixel_stride + b];
+            }
+        }
+        src = dst;
+        row = (uint32)(samples * texel);
+        need = (int64)samples * rows * texel;
+    }
+    _gpu_yuv_slot(self, slot, (uint32)samples, (uint32)rows, format)?;
+    *GpuTexture t = &self.planes[slot];
+    _gpu_push(&self.gpu);
+    WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: t.handle, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, row, (uint32)rows};
+    WGPUExtent3D size = WGPUExtent3D{(uint32)samples, (uint32)rows, 1};
+    wgpuQueueWriteTexture(self.gpu.queue, &dst, src, (uint64)need, &layout, &size);
+    string err = _gpu_pop(&self.gpu, "yuv upload");
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+// Uploads a frame's planes (checked first with gpu_yuv_check), ready for draw
+// and to_rgba. The planes are read during the call only: a borrowed camera or
+// video frame can be given back once it returns.
+Result<int, string> GpuYuv_upload(*GpuYuv self, *GpuYuvImage image) {
+    string bad = gpu_yuv_check(image);
+    if (bad != null) return Err<int, string>(bad);
+    int cw = (image.width + 1) / 2;
+    int ch = (image.height + 1) / 2;
+    if (image.format == GPU_YUV_RGBA) {
+        _gpu_yuv_plane(self, 0, &image.planes[0], image.width, image.height, 4)?;
+    } else {
+        _gpu_yuv_plane(self, 0, &image.planes[0], image.width, image.height, 1)?;
+        if (image.format == GPU_YUV_NV12 || image.format == GPU_YUV_NV21) {
+            _gpu_yuv_plane(self, 1, &image.planes[1], cw, ch, 2)?;
+        } else {
+            _gpu_yuv_plane(self, 1, &image.planes[1], cw, ch, 1)?;
+            _gpu_yuv_plane(self, 2, &image.planes[2], cw, ch, 1)?;
+        }
+    }
+    // Slots the layout does not use are bound to the blank texture.
+    int used = image.format == GPU_YUV_RGBA ? 1 : (image.format == GPU_YUV_NV12 || image.format == GPU_YUV_NV21 ? 2 : 3);
+    for (int i = used; i < 3; i++) {
+        GpuTexture_release(&self.planes[i]);
+        GpuPipeline_bind_texture(&self.pipe, (uint32)i, &self.blank);
+        if (self.rgba_pipe.handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)i, &self.blank);
+    }
+    self.width = image.width;
+    self.height = image.height;
+    self.format = image.format;
+    self.rotation = image.rotation;
+    self.matrix = image.matrix;
+    self.full_range = image.full_range;
+    self.chroma_swap = image.format == GPU_YUV_NV21;
+    self.loaded = true;
+    return Ok<int, string>(0);
+}
+
+// The uploaded frame's width once turned upright (its height when the
+// rotation is 90 or 270), or as it is.
+int GpuYuv_out_width(*GpuYuv self, bool upright) {
+    if (upright && (self.rotation == 90 || self.rotation == 270)) return self.height;
+    return self.width;
+}
+
+// The uploaded frame's height once turned upright, or as it is.
+int GpuYuv_out_height(*GpuYuv self, bool upright) {
+    if (upright && (self.rotation == 90 || self.rotation == 270)) return self.width;
+    return self.height;
+}
+
+// A 2x3 affine map of texture coordinates: (a u + b v + tx, c u + d v + ty).
+struct _GpuYuvAffine {
+    float a;
+    float b;
+    float c;
+    float d;
+    float tx;
+    float ty;
+}
+
+// m applied after n.
+_GpuYuvAffine _gpu_yuv_then(_GpuYuvAffine n, _GpuYuvAffine m) {
+    return _GpuYuvAffine{m.a * n.a + m.b * n.c, m.a * n.b + m.b * n.d, m.c * n.a + m.d * n.c, m.c * n.b + m.d * n.d,
+        m.a * n.tx + m.b * n.ty + m.tx, m.c * n.tx + m.d * n.ty + m.ty};
+}
+
+// Fills the uniforms for drawing the frame: the output's coordinates are
+// cropped by (kx, ky) about the center, mirrored, then turned back by the
+// rotation into the frame's coordinates.
+void _gpu_yuv_uniforms(*GpuYuv self, *_GpuYuvUniforms u, int rotation, bool mirror, float kx, float ky, bool nearest, WGPUTextureFormat target) {
+    double kr = 0.299;
+    double kb = 0.114;
+    if (self.matrix == GPU_YUV_BT709) { kr = 0.2126; kb = 0.0722; }
+    double kg = 1.0 - kr - kb;
+    double ys = 1.0;
+    double cs = 1.0;
+    double offset = 0.0;
+    if (!self.full_range) { ys = 255.0 / 219.0; cs = 255.0 / 224.0; offset = 16.0; }
+    double mode = self.format == GPU_YUV_RGBA ? 2.0 : (self.format == GPU_YUV_NV12 || self.format == GPU_YUV_NV21 ? 0.0 : 1.0);
+    u.coeff0[0] = (float)offset;
+    u.coeff0[1] = (float)ys;
+    u.coeff0[2] = (float)(2.0 * (1.0 - kr) * cs);
+    u.coeff0[3] = (float)(2.0 * kb * (1.0 - kb) / kg * cs);
+    u.coeff1[0] = (float)(2.0 * kr * (1.0 - kr) / kg * cs);
+    u.coeff1[1] = (float)(2.0 * (1.0 - kb) * cs);
+    u.coeff1[2] = (float)mode;
+    u.coeff1[3] = self.chroma_swap ? 1.0 : 0.0;
+    _GpuYuvAffine m = _GpuYuvAffine{kx, 0.0, 0.0, ky, 0.5 - 0.5 * kx, 0.5 - 0.5 * ky};
+    if (mirror) m = _gpu_yuv_then(m, _GpuYuvAffine{-1.0, 0.0, 0.0, 1.0, 1.0, 0.0});
+    if (rotation == 90) m = _gpu_yuv_then(m, _GpuYuvAffine{0.0, 1.0, -1.0, 0.0, 0.0, 1.0});
+    else if (rotation == 180) m = _gpu_yuv_then(m, _GpuYuvAffine{-1.0, 0.0, 0.0, -1.0, 1.0, 1.0});
+    else if (rotation == 270) m = _gpu_yuv_then(m, _GpuYuvAffine{0.0, -1.0, 1.0, 0.0, 1.0, 0.0});
+    u.xform0[0] = m.a;
+    u.xform0[1] = m.c;
+    u.xform0[2] = m.b;
+    u.xform0[3] = m.d;
+    u.xform1[0] = m.tx;
+    u.xform1[1] = m.ty;
+    u.xform1[2] = nearest ? 1.0 : 0.0;
+    u.xform1[3] = gpu_srgb_format(target) == target ? 1.0 : 0.0;
+    u.size[0] = (float)self.width;
+    u.size[1] = (float)self.height;
+    u.size[2] = (float)((self.width + 1) / 2);
+    u.size[3] = (float)((self.height + 1) / 2);
+}
+
+// Draws the uploaded frame into pass (whose target has the GpuYuv's
+// target_format) in d's rectangle, fitted, turned and mirrored as d says. It
+// sets the pass's viewport to the rectangle it covers, which stays for the
+// draws that follow. The uniforms are written to the queue, so one GpuYuv
+// draws once per submission (a second draw in the same one overrides the
+// first's placement); use a GpuYuv per picture for several.
+void GpuYuv_draw(*GpuYuv self, *GpuPass pass, *GpuYuvDraw d) {
+    if (!self.loaded || d.width <= 0.0 || d.height <= 0.0) return;
+    int rotation = d.upright ? self.rotation : 0;
+    float pw = (float)GpuYuv_out_width(self, d.upright);
+    float ph = (float)GpuYuv_out_height(self, d.upright);
+    float x = d.x;
+    float y = d.y;
+    float w = d.width;
+    float h = d.height;
+    float kx = 1.0;
+    float ky = 1.0;
+    float picture = pw / ph;
+    float box = w / h;
+    if (d.fit == GPU_YUV_CONTAIN) {
+        if (picture > box) {
+            h = w / picture;
+            y = y + (d.height - h) * 0.5;
+        } else {
+            w = h * picture;
+            x = x + (d.width - w) * 0.5;
+        }
+    } else if (d.fit == GPU_YUV_COVER) {
+        if (picture > box) kx = box / picture;
+        else ky = picture / box;
+    }
+    _GpuYuvUniforms u;
+    _gpu_yuv_uniforms(self, &u, rotation, d.mirror, kx, ky, d.nearest, self.target_format);
+    GpuBuffer_write(&self.uniforms, 0, &u, sizeof(_GpuYuvUniforms));
+    GpuPass_set_viewport(pass, x, y, w, h);
+    GpuPass_draw(pass, &self.pipe, null, 3, 1);
+}
+
+// Renders the uploaded frame into the GpuYuv's own RGBA8Unorm texture
+// (self.rgba, made again when the size changes) and returns it: turned upright
+// when upright, one texel per pixel (no filtering, chroma from the sample that
+// covers each pixel), ready to sample, read back (GpuTexture_read) or hand to
+// a model. The texture stays the GpuYuv's: release the GpuYuv, not it.
+Result<*GpuTexture, string> GpuYuv_to_rgba(*GpuYuv self, bool upright) {
+    if (!self.loaded) return Err<*GpuTexture, string>("yuv: no frame uploaded");
+    uint32 w = (uint32)GpuYuv_out_width(self, upright);
+    uint32 h = (uint32)GpuYuv_out_height(self, upright);
+    if (self.rgba_pipe.handle == null) {
+        if (self.rgba_uniforms.handle == null) self.rgba_uniforms = Gpu_uniform(&self.gpu, null, sizeof(_GpuYuvUniforms))?;
+        self.rgba_pipe = _gpu_yuv_pipeline(self, WGPUTextureFormat_RGBA8Unorm, &self.rgba_uniforms)?;
+        for (i in 0..3) {
+            if (self.planes[i].handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)i, &self.planes[i]);
+        }
+    }
+    if (self.rgba.handle == null || self.rgba.width != w || self.rgba.height != h) {
+        GpuTexture_release(&self.rgba);
+        self.rgba = Gpu_target(&self.gpu, w, h)?;
+    }
+    _GpuYuvUniforms u;
+    _gpu_yuv_uniforms(self, &u, upright ? self.rotation : 0, false, 1.0, 1.0, true, WGPUTextureFormat_RGBA8Unorm);
+    GpuBuffer_write(&self.rgba_uniforms, 0, &u, sizeof(_GpuYuvUniforms));
+    GpuPass pass = Gpu_pass(&self.gpu, self.rgba.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    GpuPass_draw(&pass, &self.rgba_pipe, null, 3, 1);
+    GpuPass_end(&pass)?;
+    return Ok<*GpuTexture, string>(&self.rgba);
+}
+
+// Releases the textures, pipelines, buffers and scratch memory; a second call
+// does nothing.
+void GpuYuv_release(*GpuYuv self) {
+    for (i in 0..3) GpuTexture_release(&self.planes[i]);
+    GpuTexture_release(&self.blank);
+    GpuTexture_release(&self.rgba);
+    GpuSampler_release(&self.sampler);
+    GpuPipeline_release(&self.pipe);
+    GpuPipeline_release(&self.rgba_pipe);
+    GpuBuffer_release(&self.uniforms);
+    GpuBuffer_release(&self.rgba_uniforms);
+    if (self.scratch != null) free(self.scratch);
+    self.scratch = null;
+    self.scratch_size = 0;
+    self.loaded = false;
+}
