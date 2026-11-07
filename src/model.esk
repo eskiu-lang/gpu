@@ -14,7 +14,12 @@
 // The shading is glTF's metallic-roughness model with base color, metallic-
 // roughness, normal, occlusion and emissive textures, vertex colors, alpha
 // mask and blend, double-sided materials, KHR_materials_unlit and skinning,
-// lit by one directional light (GpuModel.light) and a hemisphere ambient term.
+// lit by one directional light (GpuModel.light) and a hemisphere ambient term,
+// or by an environment (GpuModel_set_ibl, <gpu/ibl>) instead of that term.
+// Morph targets are applied on the GPU with the node weights update() reads
+// (or GpuModel_set_weights), before skinning. Shadows from the light are
+// opt-in: GpuModel_enable_shadows, then render_shadows each frame before the
+// pass that draws the model.
 // The Gltf must outlive the model: update() reads its node poses. A model is
 // drawn once per pass (its uniforms hold one pose and one camera). OBJ files
 // load into the same Gltf (obj_load, or model_load for either kind).
@@ -32,6 +37,7 @@ import <gpu/math>;
 import <gpu/gltf>;
 import <gpu/obj>;
 import <gpu/image>;
+import <gpu/ibl>;
 
 struct GpuCamera {
     Mat4 view;
@@ -58,6 +64,8 @@ struct _GpuDraw {
     GpuBuffer joints;
     bool skinned;
     float depth;
+    GpuBuffer weights;
+    int targets;
 }
 
 struct _GpuPrim {
@@ -65,6 +73,9 @@ struct _GpuPrim {
     GpuBuffer indices;
     uint32 index_count;
     bool drawable;
+    GpuBuffer morph;
+    int targets;
+    uint32 vertex_count;
 }
 
 struct _GpuMat {
@@ -97,12 +108,44 @@ struct GpuModel {
     *Mat4 world;
     Mat4 transform;
     bool encode_srgb;
+    *GpuIbl ibl;
+    bool shadows;
+    GpuShadowOptions shadow;
+    GpuTexture shadow_map;
+    GpuPipeline shadow_pipeline;
+    GpuSampler shadow_sampler;
+    Mat4 light_view_proj;
+    GpuBuffer _no_morph;
+    float[4] _shadow_params;
+    GpuTexture _no_cube;
+    GpuTexture _no_shadow;
+}
+
+// Shadows from GpuModel.light (GpuModel_enable_shadows). Each 0 picks the
+// default:
+// - size: the shadow map's width and height in texels (2048).
+// - bias: subtracted from a point's depth from the light before the test, in
+//   the light box's depth units (0 to 1 from its near to its far side): 0.002.
+// - normal_bias: how far each point moves along its normal before the test,
+//   in shadow map texels (1.5).
+// - slope_bias: the shadow pipeline's depth bias slope scale (1.0).
+// - radius and center: the box the light sees, a cube of half-size radius
+//   around center; radius 0 fits the model's bounds (with its transform) at
+//   each render_shadows.
+struct GpuShadowOptions {
+    uint32 size;
+    float bias;
+    float normal_bias;
+    float slope_bias;
+    float radius;
+    Vec3 center;
 }
 
 const int _GM_VERTEX_FLOATS = 26;
 
 string _gpu_model_shader =
-    "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, light_dir: vec4<f32>, light_color: vec4<f32>, ambient: vec4<f32> };\n"
+    "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, light_dir: vec4<f32>, light_color: vec4<f32>, ambient: vec4<f32>,\n"
+    "    light_vp: mat4x4<f32>, shadow: vec4<f32>, ibl: vec4<f32> };\n"
     "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, flags: vec4<f32> };\n"
     "struct Material { base: vec4<f32>, emissive: vec4<f32>, params: vec4<f32>, tc: vec4<f32>, misc: vec4<f32> };\n"
     "@group(0) @binding(0) var<uniform> frame: Frame;\n"
@@ -119,27 +162,60 @@ string _gpu_model_shader =
     "@group(0) @binding(11) var occ_samp: sampler;\n"
     "@group(0) @binding(12) var em_tex: texture_2d<f32>;\n"
     "@group(0) @binding(13) var em_samp: sampler;\n"
+    "@group(0) @binding(14) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(0) @binding(15) var<storage, read> morph_w: array<f32>;\n"
+    "@group(0) @binding(16) var irr_tex: texture_cube<f32>;\n"
+    "@group(0) @binding(17) var spec_tex: texture_cube<f32>;\n"
+    "@group(0) @binding(18) var brdf_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(19) var ibl_samp: sampler;\n"
+    "@group(0) @binding(20) var shadow_map: texture_depth_2d;\n"
+    "@group(0) @binding(21) var shadow_samp: sampler_comparison;\n"
     "struct In { @location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @location(2) uv0: vec2<f32>,\n"
     "    @location(3) uv1: vec2<f32>, @location(4) tangent: vec4<f32>, @location(5) color: vec4<f32>,\n"
-    "    @location(6) joint: vec4<f32>, @location(7) weight: vec4<f32> };\n"
+    "    @location(6) joint: vec4<f32>, @location(7) weight: vec4<f32>, @builtin(vertex_index) vi: u32 };\n"
     "struct V { @builtin(position) clip: vec4<f32>, @location(0) world: vec3<f32>, @location(1) normal: vec3<f32>,\n"
     "    @location(2) uv0: vec2<f32>, @location(3) uv1: vec2<f32>, @location(4) tangent: vec4<f32>, @location(5) color: vec4<f32> };\n"
-    "@vertex fn vs(v: In) -> V {\n"
-    "    var skin = mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));\n"
+    "struct Shape { pos: vec3<f32>, normal: vec3<f32>, tangent: vec3<f32>, skin: mat4x4<f32> };\n"
+    "fn shape(v: In) -> Shape {\n"
+    "    var s: Shape;\n"
+    "    s.pos = v.pos;\n"
+    "    s.normal = v.normal;\n"
+    "    s.tangent = v.tangent.xyz;\n"
+    "    let nt = u32(draw.flags.y);\n"
+    "    let vc = u32(draw.flags.z);\n"
+    "    for (var t = 0u; t < nt; t++) {\n"
+    "        let w = morph_w[t];\n"
+    "        if (w != 0.0) {\n"
+    "            let at = (t * vc + v.vi) * 3u;\n"
+    "            s.pos += morph[at].xyz * w;\n"
+    "            s.normal += morph[at + 1u].xyz * w;\n"
+    "            s.tangent += morph[at + 2u].xyz * w;\n"
+    "        }\n"
+    "    }\n"
+    "    s.skin = mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));\n"
     "    if (draw.flags.x > 0.5) {\n"
-    "        skin = joints[u32(v.joint.x)] * v.weight.x + joints[u32(v.joint.y)] * v.weight.y\n"
+    "        s.skin = joints[u32(v.joint.x)] * v.weight.x + joints[u32(v.joint.y)] * v.weight.y\n"
     "             + joints[u32(v.joint.z)] * v.weight.z + joints[u32(v.joint.w)] * v.weight.w;\n"
     "    }\n"
-    "    let local = skin * vec4(v.pos, 1.0);\n"
+    "    return s;\n"
+    "}\n"
+    "@vertex fn vs_shadow(v: In) -> @builtin(position) vec4<f32> {\n"
+    "    let s = shape(v);\n"
+    "    return frame.light_vp * (draw.model * (s.skin * vec4(s.pos, 1.0)));\n"
+    "}\n"
+    "@vertex fn vs(v: In) -> V {\n"
+    "    let s = shape(v);\n"
+    "    let skin = s.skin;\n"
+    "    let local = skin * vec4(s.pos, 1.0);\n"
     "    let world = draw.model * local;\n"
     "    var out: V;\n"
     "    out.clip = frame.view_proj * world;\n"
     "    out.world = world.xyz;\n"
     "    let nm = mat3x3<f32>(draw.normal[0].xyz, draw.normal[1].xyz, draw.normal[2].xyz);\n"
     "    let sm = mat3x3<f32>(skin[0].xyz, skin[1].xyz, skin[2].xyz);\n"
-    "    out.normal = nm * (sm * v.normal);\n"
+    "    out.normal = nm * (sm * s.normal);\n"
     "    let mm = mat3x3<f32>(draw.model[0].xyz, draw.model[1].xyz, draw.model[2].xyz);\n"
-    "    out.tangent = vec4(mm * (sm * v.tangent.xyz), v.tangent.w);\n"
+    "    out.tangent = vec4(mm * (sm * s.tangent), v.tangent.w);\n"
     "    out.uv0 = v.uv0;\n"
     "    out.uv1 = v.uv1;\n"
     "    out.color = v.color;\n"
@@ -151,6 +227,21 @@ string _gpu_model_shader =
     "    let lo = c * 12.92;\n"
     "    let hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
     "    return select(hi, lo, c <= vec3(0.0031308));\n"
+    "}\n"
+    "fn shadow_at(world: vec3<f32>, n: vec3<f32>) -> f32 {\n"
+    "    if (frame.shadow.x < 0.5) { return 1.0; }\n"
+    "    let p = frame.light_vp * vec4(world + n * frame.shadow.z, 1.0);\n"
+    "    let c = p.xyz / p.w;\n"
+    "    let uv = vec2(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);\n"
+    "    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || c.z > 1.0) { return 1.0; }\n"
+    "    let d = c.z - frame.shadow.y;\n"
+    "    var lit = 0.0;\n"
+    "    for (var y = -1; y <= 1; y++) {\n"
+    "        for (var x = -1; x <= 1; x++) {\n"
+    "            lit += textureSampleCompareLevel(shadow_map, shadow_samp, uv + vec2(f32(x), f32(y)) * frame.shadow.w, d);\n"
+    "        }\n"
+    "    }\n"
+    "    return lit / 9.0;\n"
     "}\n"
     "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
     "    let base_s = textureSample(base_tex, base_samp, pick(v, mat.tc.x));\n"
@@ -165,6 +256,7 @@ string _gpu_model_shader =
     "    let duv2 = dpdy(uv);\n"
     "    var n = normalize(v.normal);\n"
     "    if (!front) { n = -n; }\n"
+    "    let geo_n = n;\n"
     "    let dp2perp = cross(dp2, n);\n"
     "    let dp1perp = cross(n, dp1);\n"
     "    var t = dp2perp * duv1.x + dp1perp * duv2.x;\n"
@@ -208,10 +300,18 @@ string _gpu_model_shader =
     "    let diffuse = (1.0 - f) * (1.0 - metallic) * base.rgb / PI;\n"
     "    let radiance = frame.light_color.rgb * frame.light_dir.w;\n"
     "    var color = (diffuse + spec) * radiance * nl;\n"
+    "    if (frame.shadow.x > 0.5) { color = color * shadow_at(v.world, geo_n); }\n"
     "    let sky = mix(frame.ambient.rgb / 3.0, frame.ambient.rgb, n.y * 0.5 + 0.5);\n"
     "    let fa = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - nv, 5.0);\n"
     "    let occ = 1.0 + mat.params.w * (occ_s - 1.0);\n"
-    "    color = color + (base.rgb * (1.0 - metallic) * (1.0 - fa) + fa * 0.5) * sky * occ;\n"
+    "    if (frame.ibl.x > 0.5) {\n"
+    "        let irr = textureSampleLevel(irr_tex, ibl_samp, n, 0.0).rgb;\n"
+    "        let pre = textureSampleLevel(spec_tex, ibl_samp, reflect(-view, n), rough * frame.ibl.z).rgb;\n"
+    "        let ab = textureSampleLevel(brdf_tex, ibl_samp, vec2(nv, rough), 0.0).rg;\n"
+    "        color = color + (irr * base.rgb * (1.0 - metallic) * (1.0 - fa) + pre * (f0 * ab.x + ab.y)) * occ * frame.ibl.y;\n"
+    "    } else {\n"
+    "        color = color + (base.rgb * (1.0 - metallic) * (1.0 - fa) + fa * 0.5) * sky * occ;\n"
+    "    }\n"
     "    color = color + em_s * mat.emissive.rgb;\n"
     "    color = color / (1.0 + max(max(color.r, color.g), color.b) * 0.0) ;\n"
     "    color = clamp(color, vec3(0.0), vec3(1.0));\n"
@@ -331,9 +431,7 @@ int _gpu_model_texture(*GpuModel self, int image, bool srgb, int fallback) {
     return v;
 }
 
-Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat format) {
-    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
-    defer layout.release();
+void _gpu_model_layout(*GpuVertexLayout layout) {
     layout.add(WGPUVertexFormat_Float32x3, 0);
     layout.add(WGPUVertexFormat_Float32x3, 12);
     layout.add(WGPUVertexFormat_Float32x2, 24);
@@ -342,6 +440,27 @@ Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat forma
     layout.add(WGPUVertexFormat_Float32x4, 56);
     layout.add(WGPUVertexFormat_Float32x4, 72);
     layout.add(WGPUVertexFormat_Float32x4, 88);
+}
+
+// A primitive's morph target deltas for the shader: three vec4 (position,
+// normal, tangent) for each target and vertex, target-major.
+*float _gpu_model_morph(*GltfPrimitive p) {
+    int64 n = (int64)p.target_count * p.vertex_count;
+    *float out = alloc<float>(n * 12 + 4);
+    *float[3] src = {p.target_positions, p.target_normals, p.target_tangents};
+    for (i in 0..n) {
+        for (k in 0..3) {
+            if (src[k] == null) continue;
+            for (c in 0..3) out[i * 12 + k * 4 + c] = src[k][i * 3 + c];
+        }
+    }
+    return out;
+}
+
+Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat format) {
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _gpu_model_layout(&layout);
     for (i in 0..4) {
         bool blend = i >= 2;
         bool two_sided = i % 2 == 1;
@@ -366,12 +485,17 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
         GpuModel_release(&m);
         return Err<GpuModel, string>(pr.error);
     }
-    Result<GpuBuffer, string> fb = Gpu_uniform(self, null, 128);
+    Result<GpuBuffer, string> fb = Gpu_uniform(self, null, 224);
     if (!fb.ok) {
         GpuModel_release(&m);
         return Err<GpuModel, string>(fb.error);
     }
     m.frame = fb.value;
+    Result<int, string> nr = _gpu_model_fallbacks(&m);
+    if (!nr.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(nr.error);
+    }
 
     uint8[4] white = {255, 255, 255, 255};
     uint8[4] flat = {128, 128, 255, 255};
@@ -446,6 +570,22 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
                 prim.vertices = vb.value;
                 prim.indices = ib.value;
                 prim.index_count = gp.index_count;
+                prim.vertex_count = gp.vertex_count;
+                if (gp.target_count > 0) {
+                    *float deltas = _gpu_model_morph(gp);
+                    Result<GpuBuffer, string> mb = Gpu_buffer(self, (uint64)gp.target_count * gp.vertex_count * 48,
+                        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+                    if (mb.ok) mb.value.write(0, deltas, (uint64)gp.target_count * gp.vertex_count * 48);
+                    free(deltas);
+                    if (!mb.ok) {
+                        prim.vertices.release();
+                        prim.indices.release();
+                        GpuModel_release(&m);
+                        return Err<GpuModel, string>(mb.error);
+                    }
+                    prim.morph = mb.value;
+                    prim.targets = gp.target_count;
+                }
             }
             List_push(&m.prims, prim);
         }
@@ -479,6 +619,18 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
             d.uniforms = ub.value;
             d.joints = jb.value;
             if (!d.skinned) d.joints.write(0, &ident, 64);
+            d.targets = m.prims.data[pi].targets;
+            if (d.targets > 0) {
+                Result<GpuBuffer, string> wb = Gpu_buffer(self, (uint64)((d.targets + 3) / 4 * 16),
+                    WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+                if (!wb.ok) {
+                    d.uniforms.release();
+                    d.joints.release();
+                    GpuModel_release(&m);
+                    return Err<GpuModel, string>(wb.error);
+                }
+                d.weights = wb.value;
+            }
             List_push(&m.draws, d);
         }
     }
@@ -519,9 +671,166 @@ void GpuModel_update(*GpuModel self, Mat4 transform) {
             u[16 + k] = normal.m[k];
         }
         u[32] = skinned;
+        if (d.targets > 0) {
+            u[33] = (float)d.targets;
+            u[34] = (float)self.prims.data[d.prim].vertex_count;
+            _gpu_model_upload_weights(self, d);
+        }
         d.uniforms.write(0, &u, 144);
     }
     if (jm != null) free(jm);
+}
+
+void _gpu_model_upload_weights(*GpuModel self, _GpuDraw* d) {
+    List<float>* w = &self.data.nodes.data[d.node].weights;
+    float[64] small;
+    *float buf = d.targets <= 64 ? &small[0] : alloc<float>(d.targets);
+    for (k in 0..d.targets) buf[k] = k < w.size ? w.data[k] : 0.0;
+    d.weights.write(0, buf, (uint64)d.targets * 4);
+    if (d.targets > 64) free(buf);
+}
+
+// Sets node's morph target weights (as Gltf_set_weights) and sends them to
+// the GPU at once, without a full update().
+void GpuModel_set_weights(*GpuModel self, int node, *float weights, int count) {
+    Gltf_set_weights(self.data, node, weights, count);
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (d.node == node && d.targets > 0) _gpu_model_upload_weights(self, d);
+    }
+}
+
+// Lights the model with ibl (diffuse and specular ambient, scaled by
+// ibl.intensity) instead of the hemisphere ambient of GpuModel.light; null
+// goes back to it. ibl must outlive its use by the model.
+void GpuModel_set_ibl(*GpuModel self, *GpuIbl ibl) {
+    self.ibl = ibl;
+}
+
+// The textures bound when a feature is off: a zero storage buffer, a 1x1
+// cube and a 1x1 depth texture.
+Result<int, string> _gpu_model_fallbacks(*GpuModel self) {
+    self._no_morph = Gpu_buffer(&self.gpu, 48, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    GpuTextureDesc cd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float, cube: true};
+    self._no_cube = Gpu_texture_with(&self.gpu, &cd)?;
+    self._no_shadow = Gpu_depth_texture(&self.gpu, 1, 1, 0, 1)?;
+    GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+        compare: WGPUCompareFunction_LessEqual};
+    self.shadow_sampler = Gpu_sampler_with(&self.gpu, &so)?;
+    return Ok<int, string>(0);
+}
+
+// Turns on shadows from GpuModel.light (see GpuShadowOptions; null for the
+// defaults). Each frame, after update() and before the pass that draws the
+// model, render the shadow map with render_shadows (or render_shadows_in).
+Result<int, string> GpuModel_enable_shadows(*GpuModel self, *GpuShadowOptions o) {
+    GpuShadowOptions so;
+    if (o != null) so = *o;
+    if (so.size == 0) so.size = 2048;
+    if (so.bias == 0.0) so.bias = 0.002;
+    if (so.normal_bias == 0.0) so.normal_bias = 1.5;
+    if (so.slope_bias == 0.0) so.slope_bias = 1.0;
+    GpuModel_disable_shadows(self);
+    GpuTexture map = Gpu_depth_texture(&self.gpu, so.size, so.size, WGPUTextureFormat_Depth32Float, 1)?;
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _gpu_model_layout(&layout);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_shader, vertex: "vs_shadow", fragment: null, layout: &layout,
+        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_bias_slope: so.slope_bias};
+    Result<GpuPipeline, string> p = Gpu_pipeline(&self.gpu, &d);
+    if (!p.ok) {
+        map.release();
+        return Err<int, string>(p.error);
+    }
+    self.shadow = so;
+    self.shadow_map = map;
+    self.shadow_pipeline = p.value;
+    self.shadows = true;
+    return Ok<int, string>(0);
+}
+
+void GpuModel_disable_shadows(*GpuModel self) {
+    if (!self.shadows) return;
+    self.shadow_map.release();
+    self.shadow_pipeline.release();
+    self.shadows = false;
+}
+
+// The light's view and orthographic projection around the model (or around
+// GpuShadowOptions.center), and the shader's shadow settings, into the frame
+// uniforms.
+void _gpu_model_light(*GpuModel self) {
+    Vec3 dir = self.light.direction.normalize();
+    Vec3 c = self.shadow.center;
+    float r = self.shadow.radius;
+    if (r <= 0.0) {
+        Vec3 lo;
+        Vec3 hi;
+        Gltf_bounds(self.data, &lo, &hi);
+        Vec3 a;
+        Vec3 b;
+        for (k in 0..8) {
+            Vec3 p = self.transform.point(Vec3{(k & 1) != 0 ? hi.x : lo.x, (k & 2) != 0 ? hi.y : lo.y, (k & 4) != 0 ? hi.z : lo.z});
+            if (k == 0) {
+                a = p;
+                b = p;
+            }
+            a = Vec3{p.x < a.x ? p.x : a.x, p.y < a.y ? p.y : a.y, p.z < a.z ? p.z : a.z};
+            b = Vec3{p.x > b.x ? p.x : b.x, p.y > b.y ? p.y : b.y, p.z > b.z ? p.z : b.z};
+        }
+        c = (a + b) * 0.5;
+        r = (b - a).length() * 0.5;
+        if (r <= 0.0) r = 1.0;
+    }
+    Vec3 up = dir.y > 0.99 || dir.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+    Mat4 view = mat4_look_at(c - dir * (r * 2.0), c, up);
+    self.light_view_proj = mat4_ortho(-r, r, -r, r, 0.0, r * 4.0) * view;
+    self._shadow_params[0] = 1.0;
+    self._shadow_params[1] = self.shadow.bias;
+    self._shadow_params[2] = self.shadow.normal_bias * 2.0 * r / (float)self.shadow.size;
+    self._shadow_params[3] = 1.0 / (float)self.shadow.size;
+    float[20] f;
+    for (k in 0..16) f[k] = self.light_view_proj.m[k];
+    for (k in 0..4) f[16 + k] = self._shadow_params[k];
+    self.frame.write(128, &f, sizeof(f));
+}
+
+void _gpu_model_shadow_draws(*GpuModel self, *GpuPass pass) {
+    GpuPipeline* pipe = &self.shadow_pipeline;
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (self.materials.data[d.material].blend) continue;
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pipe.bind(0, &self.frame);
+        pipe.bind(1, &d.uniforms);
+        pipe.bind(3, &d.joints);
+        pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
+        pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+}
+
+// Renders the shadow map from the light, in a submission of its own. The
+// opaque and masked parts cast shadows (masks as if opaque), blended ones do
+// not. Does nothing when shadows are off.
+Result<int, string> GpuModel_render_shadows(*GpuModel self) {
+    if (!self.shadows) return Ok<int, string>(0);
+    _gpu_model_light(self);
+    GpuPassOptions o = GpuPassOptions{depth: &self.shadow_map};
+    GpuPass pass = Gpu_pass_with(&self.gpu, null, &o);
+    _gpu_model_shadow_draws(self, &pass);
+    return pass.end();
+}
+
+// GpuModel_render_shadows as a pass of enc, before the pass that draws the
+// model in the same submission.
+Result<int, string> GpuModel_render_shadows_in(*GpuModel self, *GpuEncoder enc) {
+    if (!self.shadows) return Ok<int, string>(0);
+    _gpu_model_light(self);
+    GpuPassOptions o = GpuPassOptions{depth: &self.shadow_map};
+    GpuPass pass = GpuEncoder_pass_with(enc, null, &o);
+    _gpu_model_shadow_draws(self, &pass);
+    return pass.end();
 }
 
 void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
@@ -534,6 +843,15 @@ void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
         pipe.bind_texture((uint32)(4 + k * 2), &self.textures.data[mat.tex[k]]);
         pipe.bind_sampler((uint32)(5 + k * 2), &self.samplers.data[mat.samp[k]]);
     }
+    _GpuPrim* pr = &self.prims.data[d.prim];
+    pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
+    pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+    pipe.bind_texture(16, self.ibl != null ? &self.ibl.irradiance : &self._no_cube);
+    pipe.bind_texture(17, self.ibl != null ? &self.ibl.specular : &self._no_cube);
+    pipe.bind_texture(18, self.ibl != null ? &self.ibl.brdf : &self.textures.data[1]);
+    pipe.bind_sampler(19, self.ibl != null ? &self.ibl.sampler : &self.samplers.data[0]);
+    pipe.bind_texture(20, self.shadows ? &self.shadow_map : &self._no_shadow);
+    pipe.bind_sampler(21, &self.shadow_sampler);
 }
 
 // Draws the model into pass (which needs a depth texture) as seen by camera:
@@ -541,7 +859,7 @@ void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
 void GpuModel_draw(*GpuModel self, *GpuPass pass, *GpuCamera camera) {
     Mat4 vp = camera.proj * camera.view;
     Vec3 dir = self.light.direction.normalize();
-    float[32] f;
+    float[56] f;
     for (k in 0..16) f[k] = vp.m[k];
     f[16] = camera.eye.x;
     f[17] = camera.eye.y;
@@ -559,6 +877,15 @@ void GpuModel_draw(*GpuModel self, *GpuPass pass, *GpuCamera camera) {
     f[29] = self.light.ambient.y;
     f[30] = self.light.ambient.z;
     f[31] = self.encode_srgb ? 1.0 : 0.0;
+    if (self.shadows) {
+        for (k in 0..16) f[32 + k] = self.light_view_proj.m[k];
+        for (k in 0..4) f[48 + k] = self._shadow_params[k];
+    }
+    if (self.ibl != null) {
+        f[52] = 1.0;
+        f[53] = self.ibl.intensity;
+        f[54] = GpuIbl_max_lod(self.ibl);
+    }
     self.frame.write(0, &f, sizeof(f));
     List<int> blended;
     defer List_free(&blended);
@@ -621,10 +948,19 @@ void GpuModel_release(*GpuModel self) {
             self.prims.data[i].indices.release();
         }
     }
+    for (i in 0..self.prims.size) {
+        if (self.prims.data[i].targets > 0) self.prims.data[i].morph.release();
+    }
     for (i in 0..self.draws.size) {
         self.draws.data[i].uniforms.release();
         self.draws.data[i].joints.release();
+        if (self.draws.data[i].targets > 0) self.draws.data[i].weights.release();
     }
+    GpuModel_disable_shadows(self);
+    self._no_morph.release();
+    self._no_cube.release();
+    self._no_shadow.release();
+    self.shadow_sampler.release();
     self.frame.release();
     List_free(&self.pipelines);
     List_free(&self.textures);

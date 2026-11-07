@@ -9,8 +9,12 @@
 // Every vertex attribute is read into floats whatever its stored type
 // (normalized integers included, as KHR_mesh_quantization stores them), and
 // indices into uint32; triangle strips and fans become lists. Images are kept
-// encoded (PNG or JPEG bytes); <gpu/image> decodes them. Morph targets are not
-// read. Files that require Draco or meshopt compression are rejected.
+// encoded (PNG or JPEG bytes); <gpu/image> decodes them. Morph targets are
+// read into each primitive (target_positions, target_normals and
+// target_tangents: the deltas of target t for vertex v at (t * vertex_count +
+// v) * 3); a node's weights start from its own "weights" or its mesh's, and
+// Gltf_animate moves them. Files that require Draco or meshopt compression are
+// rejected.
 
 import <io>;
 import <mem>;
@@ -44,6 +48,10 @@ const int GLTF_POINTS = 0;
 const int GLTF_LINES = 1;
 const int GLTF_TRIANGLES = 4;
 
+// target_count morph targets: target_positions, target_normals and
+// target_tangents hold target_count * vertex_count * 3 floats each (the delta
+// of target t for vertex v at (t * vertex_count + v) * 3), or are null when no
+// target moves that attribute (a target without it has zero deltas).
 struct GltfPrimitive {
     int mode;
     uint32 vertex_count;
@@ -60,11 +68,18 @@ struct GltfPrimitive {
     int material;
     Vec3 min;
     Vec3 max;
+    int target_count;
+    *float target_positions;
+    *float target_normals;
+    *float target_tangents;
 }
 
+// weights are the default morph target weights (one per target; zero when
+// the file gives none).
 struct GltfMesh {
     String name;
     List<GltfPrimitive> primitives;
+    List<float> weights;
 }
 
 // A material's use of a texture: texture is an index into Gltf.textures, or -1.
@@ -126,6 +141,7 @@ struct GltfNode {
     Vec3 scale;
     bool has_matrix;
     Mat4 matrix;
+    List<float> weights;
 }
 
 struct GltfSkin {
@@ -141,14 +157,17 @@ struct GltfAnimChannel {
     int sampler;
 }
 
-// Key times and values; width is the floats per value (3 or 4). A cubic
-// spline stores in-tangent, value and out-tangent for each key.
+// Key times and values; width is the floats per value (3 or 4, 1 for morph
+// weights, which hold one value per target for each key). A cubic spline
+// stores in-tangent, value and out-tangent for each key. value_count is the
+// number of values (of width floats) in values.
 struct GltfAnimSampler {
     uint32 count;
     *float times;
     *float values;
     int width;
     int interpolation;
+    uint32 value_count;
 }
 
 struct GltfAnimation {
@@ -720,9 +739,57 @@ string _gltf_read_meshes(*Gltf g, *JsonValue root) {
                 p.indices = alloc<uint32>((int64)p.vertex_count + 1);
                 for (i in 0..p.vertex_count) p.indices[i] = i;
             }
+            string terr = _gltf_read_targets(g, pj, &p);
+            if (terr != null) {
+                List_push(&gm.primitives, p);
+                return terr;
+            }
+            if (p.target_count > gm.weights.size) List_resize(&gm.weights, p.target_count);
             if (p.mode == 5 || p.mode == 6) _gltf_to_list(&p, p.mode);
             List_push(&gm.primitives, p);
         }
+        *JsonValue wj = _gj_arr(m, "weights");
+        if (wj != null) {
+            int k = 0;
+            for (*JsonValue c = wj.child; c != null; c = c.next) {
+                if (k >= gm.weights.size) List_resize(&gm.weights, k + 1);
+                if (c.kind == JNumber) gm.weights.data[k] = (float)c.num;
+                k++;
+            }
+        }
+    }
+    return null;
+}
+
+// Reads a primitive's morph targets: each one's POSITION, NORMAL and TANGENT
+// deltas (three floats per vertex).
+string _gltf_read_targets(*Gltf g, *JsonValue pj, *GltfPrimitive p) {
+    *JsonValue targets = _gj_arr(pj, "targets");
+    if (targets == null) return null;
+    int n = 0;
+    for (*JsonValue t = targets.child; t != null; t = t.next) n++;
+    if (n == 0) return null;
+    string[3] names = {"POSITION", "NORMAL", "TANGENT"};
+    int64 per = (int64)p.vertex_count * 3;
+    p.target_count = n;
+    int ti = 0;
+    for (*JsonValue t = targets.child; t != null; t = t.next) {
+        for (k in 0..3) {
+            int ai = _gj_int(t, names[k], -1);
+            if (ai < 0) continue;
+            if (ai >= g._accessors.size || _gltf_count(g, ai) != p.vertex_count) {
+                return _gltf_fail("a morph target's count differs from POSITION's: ", names[k]);
+            }
+            *float* dst = &p.target_positions;
+            if (k == 1) dst = &p.target_normals;
+            if (k == 2) dst = &p.target_tangents;
+            if (*dst == null) *dst = alloc<float>(per * n + 1);
+            *float src = _gltf_floats(g, ai, 3);
+            if (src == null) continue;
+            memcpy(*dst + per * ti, src, per * 4);
+            free(src);
+        }
+        ti++;
     }
     return null;
 }
@@ -844,6 +911,19 @@ string _gltf_read_nodes(*Gltf g, *JsonValue root) {
         node.rotation = Quat{r[0], r[1], r[2], r[3]};
         node.scale = Vec3{s[0], s[1], s[2]};
         if (_gj_floats(n, "matrix", &node.matrix.m[0], 16) == 16) node.has_matrix = true;
+        if (node.mesh >= 0) {
+            List<float>* mw = &g.meshes.data[node.mesh].weights;
+            List_resize(&node.weights, mw.size);
+            for (k in 0..mw.size) node.weights.data[k] = mw.data[k];
+            *JsonValue wj = _gj_arr(n, "weights");
+            if (wj != null) {
+                int k = 0;
+                for (*JsonValue c = wj.child; c != null && k < node.weights.size; c = c.next) {
+                    if (c.kind == JNumber) node.weights.data[k] = (float)c.num;
+                    k++;
+                }
+            }
+        }
         *JsonValue ch = _gj_arr(n, "children");
         if (ch != null) {
             for (*JsonValue c = ch.child; c != null; c = c.next) {
@@ -953,6 +1033,7 @@ string _gltf_read_animations(*Gltf g, *JsonValue root) {
                     if (smp.width >= 1 && smp.width <= 4 && _gltf_count(g, out) >= per) {
                         smp.times = _gltf_floats(g, input, 1);
                         smp.values = _gltf_floats(g, out, smp.width);
+                        smp.value_count = _gltf_count(g, out);
                         for (k in 0..smp.count) {
                             if (smp.times[k] > anim.duration) anim.duration = smp.times[k];
                         }
@@ -1050,7 +1131,12 @@ uint32 _gltf_key(*GltfAnimSampler s, float t) {
 }
 
 void _gltf_sample(*GltfAnimSampler s, float t, *float out) {
-    int w = s.width;
+    _gltf_sample_n(s, t, out, s.width, s.width == 4);
+}
+
+// Samples w floats per key (morph weights: one per target); quat marks a
+// rotation, interpolated on the sphere.
+void _gltf_sample_n(*GltfAnimSampler s, float t, *float out, int w, bool quat) {
     if (s.count == 0) return;
     int stride = s.interpolation == GLTF_CUBIC ? w * 3 : w;
     int voff = s.interpolation == GLTF_CUBIC ? w : 0;
@@ -1079,7 +1165,7 @@ void _gltf_sample(*GltfAnimSampler s, float t, *float out) {
             out[c] = (2.0 * u3 - 3.0 * u2 + 1.0) * a[c] + (u3 - 2.0 * u2 + u) * dt * aout[c]
                 + (-2.0 * u3 + 3.0 * u2) * b[c] + (u3 - u2) * dt * bin[c];
         }
-        if (w == 4) {
+        if (quat) {
             Quat q = Quat{out[0], out[1], out[2], out[3]}.normalize();
             out[0] = q.x;
             out[1] = q.y;
@@ -1088,7 +1174,7 @@ void _gltf_sample(*GltfAnimSampler s, float t, *float out) {
         }
         return;
     }
-    if (w == 4) {
+    if (quat) {
         Quat q = quat_slerp(Quat{a[0], a[1], a[2], a[3]}, Quat{b[0], b[1], b[2], b[3]}, u);
         out[0] = q.x;
         out[1] = q.y;
@@ -1110,8 +1196,18 @@ void Gltf_animate(*Gltf self, int anim, float t) {
     for (i in 0..a.channels.size) {
         GltfAnimChannel* ch = &a.channels.data[i];
         GltfAnimSampler* s = &a.samplers.data[ch.sampler];
-        if (s.count == 0 || ch.path == GLTF_WEIGHTS) continue;
+        if (s.count == 0) continue;
         GltfNode* n = &self.nodes.data[ch.node];
+        if (ch.path == GLTF_WEIGHTS) {
+            // Scalar outputs, one per target for each key (three for a cubic
+            // spline: in-tangents, values and out-tangents).
+            int w = n.weights.size;
+            uint32 per = s.interpolation == GLTF_CUBIC ? s.count * 3 : s.count;
+            if (w > 0 && s.width == 1 && s.values != null && s.value_count >= per * (uint32)w) {
+                _gltf_sample_n(s, t, n.weights.data, w, false);
+            }
+            continue;
+        }
         if (ch.path == GLTF_ROTATION && s.width == 4) {
             _gltf_sample(s, t, &v[0]);
             n.rotation = Quat{v[0], v[1], v[2], v[3]};
@@ -1122,6 +1218,15 @@ void Gltf_animate(*Gltf self, int anim, float t) {
         }
         n.has_matrix = false;
     }
+}
+
+// Sets node's morph target weights (count of them; the node keeps one per
+// target of its mesh and ignores the rest). <gpu/model> applies them at its
+// next update(), or at once with GpuModel_set_weights.
+void Gltf_set_weights(*Gltf self, int node, *float weights, int count) {
+    if (node < 0 || node >= self.nodes.size || weights == null) return;
+    GltfNode* n = &self.nodes.data[node];
+    for (k in 0..(count < n.weights.size ? count : n.weights.size)) n.weights.data[k] = weights[k];
 }
 
 // The model's bounds over its scene, in world space.
@@ -1178,8 +1283,12 @@ void Gltf_free(*Gltf self) {
             free(pr.joints);
             free(pr.weights);
             free(pr.indices);
+            free(pr.target_positions);
+            free(pr.target_normals);
+            free(pr.target_tangents);
         }
         List_free(&m.primitives);
+        List_free(&m.weights);
         String_free(&m.name);
     }
     for (i in 0..self.materials.size) String_free(&self.materials.data[i].name);
@@ -1192,6 +1301,7 @@ void Gltf_free(*Gltf self) {
     for (i in 0..self.nodes.size) {
         String_free(&self.nodes.data[i].name);
         List_free(&self.nodes.data[i].children);
+        List_free(&self.nodes.data[i].weights);
     }
     for (i in 0..self.skins.size) GltfSkin_free(&self.skins.data[i]);
     for (i in 0..self.animations.size) {
