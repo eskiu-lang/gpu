@@ -1,0 +1,709 @@
+// Render targets in <gpu/render>: several color targets in one pass (formats,
+// blending and clears per target, multisampled targets resolved per
+// attachment, and the errors of a pass and a pipeline that disagree), 2D-array
+// and cube textures rendered per layer and face and sampled back as a whole,
+// rendering into each mip level, mip levels generated on the GPU (2D, 2D
+// array, cube; RGBA8, sRGB, RGBA16Float) against a CPU box filter, depth-only
+// passes into a depth texture array sampled with a comparison sampler (PCF),
+// and sRGB and linear views of one texture.
+//
+// The MRT image is compared with tests/data/render_mrt.rgba within one unit
+// per channel (GPU_UPDATE=1 rewrites it); everything else is checked against
+// computed values.
+import <io>;
+import <mem>;
+import <fs>;
+import <env>;
+import <list>;
+import <libc>;
+import <math>;
+import <string>;
+import <gpu>;
+import <gpu/image>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(int a, int b) {
+    return a - b <= 1 && b - a <= 1;
+}
+
+// The pixel at x of a row of RGBA8 pixels is (r, g, b, a) within one unit.
+void expect(string name, *uint8 px, int x, int r, int g, int b, int a) {
+    *uint8 p = px + x * 4;
+    if (!near(p[0], r) || !near(p[1], g) || !near(p[2], b) || !near(p[3], a)) {
+        printf("FAIL %s: pixel %d is %d %d %d %d, want %d %d %d %d\n", name, x, (int)p[0], (int)p[1], (int)p[2], (int)p[3], r, g, b, a);
+        fails++;
+    }
+}
+
+int unit(float v) {
+    return (int)(v * 255.0 + 0.5);
+}
+
+float half_value(uint16 h) {
+    int e = (int)((h >> 10) & 31);
+    float m = (float)(h & 1023);
+    float v = e == 0 ? m * (float)pow(2.0, -24.0) : (1.0 + m / 1024.0) * (float)pow(2.0, (double)(e - 15));
+    return (h & 0x8000) != 0 ? -v : v;
+}
+
+// Compares a 32x32 image with tests/data/render_NAME.rgba.
+void golden(string name, *uint8 px) {
+    let path: char[128];
+    snprintf(&path[0], 128, "tests/data/render_%s.rgba", name);
+    int64 n = 32 * 32 * 4;
+    if (env_get("GPU_UPDATE") != null) {
+        fs_write_all((string)&path[0], px, n);
+        return;
+    }
+    int64 got = 0;
+    *uint8 want = fs_read_all((string)&path[0], &got);
+    if (want == null || got != n) {
+        printf("FAIL %s: cannot read %s\n", name, (string)&path[0]);
+        fails++;
+        if (want != null) free((*void)want);
+        return;
+    }
+    defer free((*void)want);
+    for (i in 0..n) {
+        int d = (int)px[i] - (int)want[i];
+        if (d > 1 || d < -1) {
+            printf("FAIL %s: byte %d of pixel (%d, %d) is %d, golden %d\n", name, (int)(i % 4),
+                (int)(i / 4 % 32), (int)(i / 4 / 32), (int)px[i], (int)want[i]);
+            fails++;
+            return;
+        }
+    }
+}
+
+// A full-screen triangle whose color comes from its instance index k:
+// (k / 8, 1 - k / 8, 0.5, 1).
+string fill =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) k: u32 };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) k: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return V(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), k);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let k = f32(v.k) * 0.125;\n"
+    "    return vec4<f32>(k, 1.0 - k, 0.5, 1.0);\n"
+    "}\n";
+
+void fill_color(int k, *int rgb) {
+    float f = (float)k * 0.125;
+    rgb[0] = unit(f);
+    rgb[1] = unit(1.0 - f);
+    rgb[2] = unit(0.5);
+}
+
+// Draws the fill color of k over the whole of view.
+Result<int, string> fill_view(*Gpu gpu, *GpuPipeline pipe, WGPUTextureView view, int k) {
+    GpuPass pass = gpu.pass(view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    pass.draw_range(pipe, null, 0, 3, (uint32)k, 1);
+    return pass.end();
+}
+
+string full_vs =
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+
+// Runs a full-screen fragment shader (full_vs + fs) into an n x 1 RGBA8
+// target with group 0 set to g, and reads the row into px.
+Result<int, string> probe(*Gpu gpu, string fs, *GpuBindLayout bl, *GpuBindGroup g, uint32 n, *uint8 px) {
+    String src;
+    defer String_free(&src);
+    String_append(&src, full_vs);
+    String_append(&src, fs);
+    *GpuBindLayout[1] groups = {bl};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: src.data, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8Unorm,
+        groups: &groups[0], group_count: 1};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    GpuTexture t = gpu.target(n, 1)?;
+    defer t.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 0.0}, null);
+    pass.set_group(0, g);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    return t.read(px);
+}
+
+// Rectangles in pixels of a 32x32 target, each vertex x and y.
+void rect(List<float>* out, float x0, float y0, float x1, float y1) {
+    float[12] c = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    for (i in 0..12) List_push(out, c[i]);
+}
+
+// Three targets: RGBA8 (a color per rectangle, kept as a golden image),
+// RGBA16Float blended additively over its clear value, and R32Float.
+string mrt_shader =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) k: u32 };\n"
+    "@vertex fn vs(@location(0) p: vec2<f32>, @builtin(vertex_index) i: u32) -> V {\n"
+    "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, 0.0, 1.0), i / 6u);\n"
+    "}\n"
+    "struct O { @location(0) a: vec4<f32>, @location(1) b: vec4<f32>, @location(2) c: f32 };\n"
+    "@fragment fn fs(v: V) -> O {\n"
+    "    let k = f32(v.k);\n"
+    "    return O(vec4<f32>(0.2, 0.4 + 0.2 * k, 0.6, 1.0), vec4<f32>(0.25, 0.5, 2.0 + k, 1.0), 7.5 + k);\n"
+    "}\n";
+
+Result<int, string> mrt(*Gpu gpu, *uint8 px) {
+    GpuTexture a = gpu.target(32, 32)?;
+    defer a.release();
+    GpuTexture b = gpu.target_with(32, 32, WGPUTextureFormat_RGBA16Float)?;
+    defer b.release();
+    GpuTexture c = gpu.target_with(32, 32, WGPUTextureFormat_R32Float)?;
+    defer c.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 8};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x2, 0);
+    GpuColorTarget[3] targets = {GpuColorTarget{format: a.format}, GpuColorTarget{format: b.format, blend_mode: GPU_BLEND_ADDITIVE},
+        GpuColorTarget{format: c.format}};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: mrt_shader, vertex: "vs", fragment: "fs", layout: &l, targets: &targets[0], target_count: 3};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 4.0, 4.0, 20.0, 20.0);
+    rect(&v, 16.0, 12.0, 28.0, 28.0);
+    GpuBuffer vb = gpu.vertices(v.data, (uint64)v.size * 4)?;
+    defer vb.release();
+    GpuColorAttachment[3] colors = {GpuColorAttachment{view: a.view, clear: GpuColor{0.0, 0.0, 0.0, 1.0}},
+        GpuColorAttachment{view: b.view, clear: GpuColor{0.5, 0.0, 0.0, 1.0}},
+        GpuColorAttachment{view: c.view, clear: GpuColor{-1.0, 0.0, 0.0, 0.0}}};
+    GpuPassOptions o = GpuPassOptions{colors: &colors[0], color_count: 3};
+    GpuPass pass = gpu.pass_with(null, &o);
+    pass.draw(&pipe, &vb, 12, 1);
+    pass.end()?;
+    a.read(px)?;
+    golden("mrt", px);
+    expect("mrt target 0, first rectangle", px + 6 * 32 * 4, 6, 51, 102, 153, 255);
+    expect("mrt target 0, second rectangle", px + 24 * 32 * 4, 24, 51, 153, 153, 255);
+    expect("mrt target 0, cleared", px, 0, 0, 0, 0, 255);
+    uint16[4096] h;
+    b.read(&h[0])?;
+    int at = (6 * 32 + 6) * 4;
+    check("mrt target 1: additive blend over the clear value",
+        half_value(h[at]) == 0.75 && half_value(h[at + 1]) == 0.5 && half_value(h[at + 2]) == 2.0 && half_value(h[at + 3]) == 1.0);
+    check("mrt target 1: cleared", half_value(h[0]) == 0.5 && half_value(h[1]) == 0.0);
+    float[1024] f;
+    c.read(&f[0])?;
+    check("mrt target 2", f[6 * 32 + 6] == 7.5 && f[24 * 32 + 24] == 8.5 && f[0] == -1.0);
+
+    // Two multisampled targets resolved per attachment.
+    GpuTexture ma = gpu.target_msaa(32, 32, a.format, 4)?;
+    defer ma.release();
+    GpuTexture mb = gpu.target_msaa(32, 32, b.format, 4)?;
+    defer mb.release();
+    GpuColorTarget[2] two = {GpuColorTarget{format: a.format}, GpuColorTarget{format: b.format}};
+    string two_shader =
+        "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+        "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+        "    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n"
+        "struct O { @location(0) a: vec4<f32>, @location(1) b: vec4<f32> };\n"
+        "@fragment fn fs() -> O { return O(vec4<f32>(1.0, 0.0, 1.0, 1.0), vec4<f32>(0.0, 3.0, 0.0, 1.0)); }\n";
+    GpuPipelineDesc md = GpuPipelineDesc{wgsl: two_shader, vertex: "vs", fragment: "fs", targets: &two[0], target_count: 2, samples: 4};
+    GpuPipeline mp = gpu.pipeline(&md)?;
+    defer mp.release();
+    GpuColorAttachment[2] mc = {GpuColorAttachment{view: ma.view, resolve: a.view, discard: true},
+        GpuColorAttachment{view: mb.view, resolve: b.view, discard: true}};
+    GpuPassOptions mo = GpuPassOptions{colors: &mc[0], color_count: 2};
+    GpuPass mpass = gpu.pass_with(null, &mo);
+    mpass.draw(&mp, null, 3, 1);
+    mpass.end()?;
+    a.read(px)?;
+    expect("mrt msaa resolve 0", px, 31, 255, 0, 255, 255);
+    b.read(&h[0])?;
+    check("mrt msaa resolve 1", half_value(h[0]) == 0.0 && half_value(h[1]) == 3.0);
+
+    // A pipeline with 2 targets in a pass with 3 attachments, 9 targets, 9
+    // attachments, and a target given with colors: errors, not aborts.
+    GpuPipelineDesc d2 = d;
+    d2.target_count = 2;
+    GpuPipeline p2 = gpu.pipeline(&d2)?;
+    defer p2.release();
+    GpuPass bad = gpu.pass_with(null, &o);
+    bad.draw(&p2, &vb, 12, 1);
+    Result<int, string> r = bad.end();
+    check("a 2-target pipeline in a 3-attachment pass fails at end()", !r.ok);
+    if (env_get("GPU_VERBOSE") != null && !r.ok) printf("2 in 3: %s\n", r.error);
+    GpuEncoder enc = gpu.encoder();
+    GpuPass ep = enc.pass_with(null, &o);
+    ep.draw(&p2, &vb, 12, 1);
+    ep.end()?;
+    r = enc.submit();
+    check("the same in an encoder fails at submit()", !r.ok);
+    GpuColorTarget[9] nine;
+    for (i in 0..9) nine[i] = GpuColorTarget{format: WGPUTextureFormat_R8Unorm};
+    GpuPipelineDesc d9 = GpuPipelineDesc{wgsl: two_shader, vertex: "vs", fragment: "fs", targets: &nine[0], target_count: 9};
+    Result<GpuPipeline, string> p9 = gpu.pipeline(&d9);
+    check("9 color targets fail", !p9.ok);
+    if (p9.ok) p9.value.release();
+    GpuColorAttachment[9] many;
+    for (i in 0..9) many[i] = GpuColorAttachment{view: a.view};
+    GpuPassOptions o9 = GpuPassOptions{colors: &many[0], color_count: 9};
+    GpuPass p9pass = gpu.pass_with(null, &o9);
+    r = p9pass.end();
+    check("9 color attachments fail at end()", !r.ok);
+    GpuPass both = gpu.pass_with(a.view, &o);
+    r = both.end();
+    check("a target and colors fail at end()", !r.ok);
+    return Ok<int, string>(0);
+}
+
+// A 2D array of 3 layers and a cube, each layer and face drawn with its own
+// color through a view of it, then sampled whole (texture_2d_array,
+// texture_cube) and read back per layer.
+Result<int, string> layers(*Gpu gpu, *GpuPipeline pipe, *GpuSampler samp) {
+    uint8[64] px;
+    int[3] want;
+    GpuTextureDesc ad = GpuTextureDesc{width: 4, height: 4, layers: 3};
+    GpuTexture arr = gpu.texture_with(&ad)?;
+    defer arr.release();
+    check("array view", arr.dimension == WGPUTextureViewDimension_2DArray && arr.layers == 3);
+    for (i in 0..3) {
+        GpuTextureView v = arr.view_level((uint32)i, 0)?;
+        fill_view(gpu, pipe, v.view, i + 1)?;
+        v.release();
+    }
+    for (i in 0..3) {
+        arr.read_level((uint32)i, 0, &px[0])?;
+        fill_color(i + 1, &want[0]);
+        expect("array layer read back", &px[0], 15, want[0], want[1], want[2], 255);
+    }
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_2DArray);
+    bl.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &arr);
+    g.sampler(1, samp);
+    probe(gpu, "@group(0) @binding(0) var t: texture_2d_array<f32>;\n"
+        "@group(0) @binding(1) var s: sampler;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    return textureSampleLevel(t, s, vec2<f32>(0.5, 0.5), i32(p.x), 0.0);\n"
+        "}\n", &bl, &g, 3, &px[0])?;
+    for (i in 0..3) {
+        fill_color(i + 1, &want[0]);
+        expect("array layer sampled", &px[0], i, want[0], want[1], want[2], 255);
+    }
+
+    GpuTextureDesc cd = GpuTextureDesc{width: 4, height: 4, cube: true};
+    GpuTexture cube = gpu.texture_with(&cd)?;
+    defer cube.release();
+    check("cube view", cube.dimension == WGPUTextureViewDimension_Cube && cube.layers == 6);
+    for (i in 0..6) {
+        GpuTextureView v = cube.view_level((uint32)i, 0)?;
+        fill_view(gpu, pipe, v.view, i + 1)?;
+        v.release();
+    }
+    for (i in 0..6) {
+        cube.read_level((uint32)i, 0, &px[0])?;
+        fill_color(i + 1, &want[0]);
+        expect("cube face read back", &px[0], 5, want[0], want[1], want[2], 255);
+    }
+    GpuBindLayout cl = gpu.bind_layout();
+    defer cl.release();
+    cl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+    cl.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Filtering);
+    GpuBindGroup cg = cl.group()?;
+    defer cg.release();
+    cg.texture(0, &cube);
+    cg.sampler(1, samp);
+    probe(gpu, "@group(0) @binding(0) var t: texture_cube<f32>;\n"
+        "@group(0) @binding(1) var s: sampler;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    var d = array<vec3<f32>, 6>(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),\n"
+        "        vec3<f32>(0.0, -1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));\n"
+        "    return textureSampleLevel(t, s, d[u32(p.x)], 0.0);\n"
+        "}\n", &cl, &cg, 6, &px[0])?;
+    for (i in 0..6) {
+        fill_color(i + 1, &want[0]);
+        expect("cube face sampled by direction", &px[0], i, want[0], want[1], want[2], 255);
+    }
+
+    GpuTextureDesc bad = GpuTextureDesc{width: 4, height: 2, cube: true};
+    Result<GpuTexture, string> r = gpu.texture_with(&bad);
+    check("a cube with faces that are not square fails", !r.ok);
+    if (r.ok) r.value.release();
+    return Ok<int, string>(0);
+}
+
+// A 16x16 texture with every mip level drawn through its own view, read back
+// level by level and sampled with textureLoad per level.
+Result<int, string> mip_targets(*Gpu gpu, *GpuPipeline pipe) {
+    uint8[1024] px;
+    int[3] want;
+    GpuTextureDesc d = GpuTextureDesc{width: 16, height: 16, mipmaps: true};
+    GpuTexture t = gpu.texture_with(&d)?;
+    defer t.release();
+    check("16x16 has 5 levels", t.mips == 5);
+    for (m in 0..5) {
+        GpuTextureView v = t.view_level(0, (uint32)m)?;
+        check("level view size", v.width == (uint32)(16 >> m) && v.height == (uint32)(16 >> m));
+        fill_view(gpu, pipe, v.view, m)?;
+        v.release();
+    }
+    for (m in 0..5) {
+        t.read_level(0, (uint32)m, &px[0])?;
+        int last = (16 >> m) * (16 >> m) - 1;
+        fill_color(m, &want[0]);
+        expect("mip level read back", &px[0], last, want[0], want[1], want[2], 255);
+    }
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &t);
+    probe(gpu, "@group(0) @binding(0) var t: texture_2d<f32>;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    return textureLoad(t, vec2<i32>(0, 0), i32(p.x));\n"
+        "}\n", &bl, &g, 5, &px[0])?;
+    for (m in 0..5) {
+        fill_color(m, &want[0]);
+        expect("mip level sampled", &px[0], m, want[0], want[1], want[2], 255);
+    }
+    return Ok<int, string>(0);
+}
+
+// The CPU reference for a level: the 2x2 box average of the level above it,
+// the last row or column repeating for odd sizes (in linear light for sRGB).
+double srgb_to_linear(int v) {
+    double c = (double)v / 255.0;
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+int linear_to_srgb(double l) {
+    double c = l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+    return (int)(c * 255.0 + 0.5);
+}
+
+void box_halve(*uint8 src, int w, int h, *uint8 dst, bool srgb) {
+    int dw = w > 1 ? w / 2 : 1;
+    int dh = h > 1 ? h / 2 : 1;
+    for (y in 0..dh) {
+        for (x in 0..dw) {
+            int x0 = x * 2 < w ? x * 2 : w - 1;
+            int x1 = x * 2 + 1 < w ? x * 2 + 1 : w - 1;
+            int y0 = y * 2 < h ? y * 2 : h - 1;
+            int y1 = y * 2 + 1 < h ? y * 2 + 1 : h - 1;
+            for (k in 0..4) {
+                int a = src[(y0 * w + x0) * 4 + k];
+                int b = src[(y0 * w + x1) * 4 + k];
+                int c = src[(y1 * w + x0) * 4 + k];
+                int e = src[(y1 * w + x1) * 4 + k];
+                if (srgb && k < 3) dst[(y * dw + x) * 4 + k] = (uint8)linear_to_srgb((srgb_to_linear(a) + srgb_to_linear(b) + srgb_to_linear(c) + srgb_to_linear(e)) * 0.25);
+                else dst[(y * dw + x) * 4 + k] = (uint8)(((double)(a + b + c + e)) * 0.25 + 0.5);
+            }
+        }
+    }
+}
+
+// A pattern that changes from texel to texel, different per layer.
+void pattern(*uint8 out, int w, int h, int layer) {
+    uint32 s = (uint32)(layer * 7919 + 17);
+    for (i in 0..w * h * 4) {
+        s = s * 1103515245 + 12345;
+        out[i] = (uint8)((s >> 16) & 255);
+    }
+}
+
+// Generated mips of an RGBA8 (or sRGB) texture of w x h with layers layers
+// (a cube when cube), each level compared with the CPU box filter.
+Result<int, string> gen_mips_rgba8(*Gpu gpu, string name, int w, int h, uint32 nlayers, bool cube, WGPUTextureFormat format) {
+    GpuTextureDesc d = GpuTextureDesc{width: (uint32)w, height: (uint32)h, format: format, layers: nlayers, cube: cube, mipmaps: true};
+    GpuTexture t = gpu.texture_with(&d)?;
+    defer t.release();
+    *uint8 cpu = alloc<uint8>(w * h * 4);
+    defer free(cpu);
+    *uint8 next = alloc<uint8>(w * h * 4);
+    defer free(next);
+    *uint8 got = alloc<uint8>(w * h * 4);
+    defer free(got);
+    for (layer in 0..t.layers) {
+        pattern(cpu, w, h, (int)layer);
+        t.write_level(layer, 0, cpu)?;
+    }
+    t.generate_mips()?;
+    bool srgb = format == WGPUTextureFormat_RGBA8UnormSrgb;
+    for (layer in 0..t.layers) {
+        pattern(cpu, w, h, (int)layer);
+        int lw = w;
+        int lh = h;
+        for (m in 1..t.mips) {
+            box_halve(cpu, lw, lh, next, srgb);
+            lw = lw > 1 ? lw / 2 : 1;
+            lh = lh > 1 ? lh / 2 : 1;
+            memcpy((*void)cpu, (*void)next, (int64)(lw * lh * 4));
+            t.read_level(layer, m, got)?;
+            for (i in 0..lw * lh * 4) {
+                if (!near(got[i], cpu[i])) {
+                    printf("FAIL %s: layer %d level %d byte %d is %d, box filter %d\n", name, (int)layer, (int)m, (int)i, (int)got[i], (int)cpu[i]);
+                    fails++;
+                    return Ok<int, string>(0);
+                }
+            }
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+// Generated mips of an RGBA16Float texture, against the box filter in floats.
+Result<int, string> gen_mips_half(*Gpu gpu) {
+    GpuTextureDesc d = GpuTextureDesc{width: 8, height: 8, format: WGPUTextureFormat_RGBA16Float, mipmaps: true};
+    GpuTexture t = gpu.texture_with(&d)?;
+    defer t.release();
+    float[256] f;
+    uint16[256] h;
+    for (i in 0..256) {
+        f[i] = (float)((i * 37) % 101) * 0.125;
+        h[i] = image_f16(f[i]);
+        f[i] = half_value(h[i]);
+    }
+    t.write_level(0, 0, &h[0])?;
+    t.generate_mips()?;
+    float[256] next;
+    int w = 8;
+    for (m in 1..t.mips) {
+        int dw = w / 2;
+        for (y in 0..dw) {
+            for (x in 0..dw) {
+                for (k in 0..4) {
+                    next[(y * dw + x) * 4 + k] = (f[((y * 2) * w + x * 2) * 4 + k] + f[((y * 2) * w + x * 2 + 1) * 4 + k]
+                        + f[((y * 2 + 1) * w + x * 2) * 4 + k] + f[((y * 2 + 1) * w + x * 2 + 1) * 4 + k]) * 0.25;
+                }
+            }
+        }
+        w = dw;
+        for (i in 0..w * w * 4) f[i] = next[i];
+        t.read_level(0, (uint32)m, &h[0])?;
+        for (i in 0..w * w * 4) {
+            float g = half_value(h[i]);
+            float tol = f[i] * 0.002 + 0.002;
+            if (g - f[i] > tol || f[i] - g > tol) {
+                printf("FAIL mips RGBA16Float: level %d value %d is %f, box filter %f\n", (int)m, (int)i, (double)g, (double)f[i]);
+                fails++;
+                return Ok<int, string>(0);
+            }
+        }
+    }
+    GpuTextureDesc id = GpuTextureDesc{width: 4, height: 4, format: WGPUTextureFormat_RGBA8Uint, mipmaps: true};
+    GpuTexture it = gpu.texture_with(&id)?;
+    defer it.release();
+    Result<int, string> r = it.generate_mips();
+    check("generate_mips on an integer format fails", !r.ok);
+    GpuTextureDesc nd = GpuTextureDesc{width: 4, height: 4, mipmaps: true, usage: WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst};
+    GpuTexture nt = gpu.texture_with(&nd)?;
+    defer nt.release();
+    r = nt.generate_mips();
+    check("generate_mips without RenderAttachment usage fails", !r.ok);
+    return Ok<int, string>(0);
+}
+
+// A 4x4 depth texture array of 2 layers drawn by a depth-only pipeline (no
+// fragment stage, no color attachment): layer 0 is 0.5 on its left half and
+// 1.0 on the right, layer 1 is 0.25. Then textureSampleCompare with
+// LessEqual (pass when the reference is at most the stored depth): exact
+// results with a nearest comparison sampler, and the fraction of passing
+// texels (PCF) with a linear one on the edge between 0.5 and 1.0.
+Result<int, string> shadow(*Gpu gpu) {
+    uint8[64] px;
+    GpuTexture depth = gpu.depth_texture(4, 4, 0, 2)?;
+    defer depth.release();
+    check("depth array", depth.format == WGPUTextureFormat_Depth32Float && depth.dimension == WGPUTextureViewDimension_2DArray);
+    GpuVertexLayout l = GpuVertexLayout{stride: 12};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    string depth_only =
+        "@vertex fn vs(@location(0) p: vec3<f32>) -> @builtin(position) vec4<f32> {\n"
+        "    return vec4<f32>(p.x / 2.0 - 1.0, 1.0 - p.y / 2.0, p.z, 1.0);\n"
+        "}\n";
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: depth_only, vertex: "vs", fragment: null, layout: &l,
+        depth: true, depth_format: WGPUTextureFormat_Depth32Float};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    float[36] v = {0.0, 0.0, 0.5, 2.0, 0.0, 0.5, 2.0, 4.0, 0.5, 0.0, 0.0, 0.5, 2.0, 4.0, 0.5, 0.0, 4.0, 0.5,
+        0.0, 0.0, 0.25, 4.0, 0.0, 0.25, 4.0, 4.0, 0.25, 0.0, 0.0, 0.25, 4.0, 4.0, 0.25, 0.0, 4.0, 0.25};
+    GpuBuffer vb = gpu.vertices(&v[0], sizeof(v))?;
+    defer vb.release();
+    for (layer in 0..2) {
+        GpuTextureView dv = depth.view_level((uint32)layer, 0)?;
+        defer dv.release();
+        GpuPassOptions o = GpuPassOptions{depth_view: &dv};
+        GpuPass pass = gpu.pass_with(null, &o);
+        pass.draw_range(&pipe, &vb, (uint32)(layer * 6), 6, 0, 1);
+        pass.end()?;
+    }
+    GpuSamplerOptions no = GpuSamplerOptions{nearest: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+        compare: WGPUCompareFunction_LessEqual};
+    GpuSampler nearest = gpu.sampler_with(&no)?;
+    defer nearest.release();
+    GpuSamplerOptions lo = no;
+    lo.nearest = false;
+    GpuSampler linear = gpu.sampler_with(&lo)?;
+    defer linear.release();
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth, WGPUTextureViewDimension_2DArray);
+    bl.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+    bl.sampler(2, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &depth);
+    g.sampler(1, &nearest);
+    g.sampler(2, &linear);
+    probe(gpu, "@group(0) @binding(0) var sm: texture_depth_2d_array;\n"
+        "@group(0) @binding(1) var near: sampler_comparison;\n"
+        "@group(0) @binding(2) var pcf: sampler_comparison;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    if (p.x < 1.0) {\n"
+        "        return vec4<f32>(textureSampleCompareLevel(sm, near, vec2<f32>(0.125, 0.5), 0, 0.3),\n"
+        "            textureSampleCompareLevel(sm, near, vec2<f32>(0.125, 0.5), 0, 0.7),\n"
+        "            textureSampleCompareLevel(sm, near, vec2<f32>(0.875, 0.5), 0, 0.7),\n"
+        "            textureSampleCompareLevel(sm, near, vec2<f32>(0.5, 0.5), 1, 0.3));\n"
+        "    }\n"
+        "    return vec4<f32>(textureSampleCompareLevel(sm, pcf, vec2<f32>(0.5, 0.5), 0, 0.7),\n"
+        "        textureSampleCompareLevel(sm, pcf, vec2<f32>(0.125, 0.5), 0, 0.7),\n"
+        "        textureSampleCompareLevel(sm, pcf, vec2<f32>(0.5, 0.5), 1, 0.2), 1.0);\n"
+        "}\n", &bl, &g, 2, &px[0])?;
+    expect("shadow compare, nearest", &px[0], 0, 255, 0, 255, 0);
+    int edge = px[4];
+    check("shadow compare, linear (PCF) on the edge is half lit", edge >= 120 && edge <= 135);
+    if (edge < 120 || edge > 135) printf("  PCF edge value %d\n", edge);
+    expect("shadow compare, linear inside", &px[0], 1, (int)px[4], 0, 255, 255);
+
+    // A single-layer depth texture as texture_depth_2d, drawn by its own view.
+    GpuTexture single = gpu.depth_texture(4, 4, WGPUTextureFormat_Depth32Float, 1)?;
+    defer single.release();
+    check("depth 2D", single.dimension == WGPUTextureViewDimension_2D);
+    GpuPassOptions so = GpuPassOptions{depth: &single};
+    GpuPass sp = gpu.pass_with(null, &so);
+    sp.draw_range(&pipe, &vb, 0, 6, 0, 1);
+    sp.end()?;
+    GpuBindLayout sl = gpu.bind_layout();
+    defer sl.release();
+    sl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth);
+    sl.sampler(1, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+    GpuBindGroup sg = sl.group()?;
+    defer sg.release();
+    sg.texture(0, &single);
+    sg.sampler(1, &nearest);
+    probe(gpu, "@group(0) @binding(0) var sm: texture_depth_2d;\n"
+        "@group(0) @binding(1) var near: sampler_comparison;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    let u = (p.x + 0.5) / 4.0;\n"
+        "    return vec4<f32>(textureSampleCompareLevel(sm, near, vec2<f32>(u, 0.5), 0.6), 0.0, 0.0, 1.0);\n"
+        "}\n", &sl, &sg, 4, &px[0])?;
+    expect("texture_depth_2d left", &px[0], 0, 0, 0, 0, 255);
+    expect("texture_depth_2d right", &px[0], 3, 255, 0, 0, 255);
+    return Ok<int, string>(0);
+}
+
+// An RGBA8Unorm texture with an RGBA8UnormSrgb view format: the same bytes
+// read as they are through the linear view and converted to linear light
+// through the sRGB view; drawing 0.5 through the sRGB view stores 188.
+Result<int, string> srgb_views(*Gpu gpu) {
+    uint8[64] px;
+    WGPUTextureFormat[1] vf = {WGPUTextureFormat_RGBA8UnormSrgb};
+    check("srgb twin", gpu_srgb_format(WGPUTextureFormat_RGBA8Unorm) == WGPUTextureFormat_RGBA8UnormSrgb
+        && gpu_linear_format(WGPUTextureFormat_BGRA8UnormSrgb) == WGPUTextureFormat_BGRA8Unorm
+        && gpu_srgb_format(WGPUTextureFormat_ASTC6x6Unorm) == WGPUTextureFormat_ASTC6x6UnormSrgb
+        && gpu_linear_format(WGPUTextureFormat_BC7RGBAUnormSrgb) == WGPUTextureFormat_BC7RGBAUnorm
+        && gpu_srgb_format(WGPUTextureFormat_RGBA16Float) == WGPUTextureFormat_Undefined);
+    GpuTextureDesc d = GpuTextureDesc{width: 2, height: 2, view_formats: &vf[0], view_format_count: 1};
+    GpuTexture t = gpu.texture_with(&d)?;
+    defer t.release();
+    for (i in 0..16) px[i] = (uint8)128;
+    t.write_level(0, 0, &px[0])?;
+    GpuTextureView sv = t.view_as(WGPUTextureFormat_RGBA8UnormSrgb)?;
+    defer sv.release();
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    bl.texture(1, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, &t);
+    g.view(1, &sv);
+    probe(gpu, "@group(0) @binding(0) var lin: texture_2d<f32>;\n"
+        "@group(0) @binding(1) var srgb: texture_2d<f32>;\n"
+        "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+        "    if (p.x < 1.0) { return textureLoad(lin, vec2<i32>(0, 0), 0); }\n"
+        "    return textureLoad(srgb, vec2<i32>(0, 0), 0);\n"
+        "}\n", &bl, &g, 2, &px[0])?;
+    expect("linear view of 128", &px[0], 0, 128, 128, 128, 128);
+    expect("sRGB view of 128", &px[0], 1, 55, 55, 55, 128);
+    string gray =
+        "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(0.5, 0.5, 0.5, 0.5); }\n";
+    String src;
+    defer String_free(&src);
+    String_append(&src, full_vs);
+    String_append(&src, gray);
+    GpuPipelineDesc pd = GpuPipelineDesc{wgsl: src.data, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8UnormSrgb};
+    GpuPipeline pipe = gpu.pipeline(&pd)?;
+    defer pipe.release();
+    GpuPass pass = gpu.pass(sv.view, GpuColor{0.0, 0.0, 0.0, 0.0}, null);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    t.read(&px[0])?;
+    expect("0.5 drawn through the sRGB view", &px[0], 3, 188, 188, 188, 128);
+    Result<GpuTextureView, string> r = t.view_as(WGPUTextureFormat_BGRA8Unorm);
+    check("a view format the texture was not made with fails", !r.ok);
+    if (r.ok) r.value.release();
+    return Ok<int, string>(0);
+}
+
+void run_case(string name, Result<int, string> r) {
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+    }
+}
+
+int main() {
+    Result<Gpu, string> opened = gpu_open();
+    if (!opened.ok) {
+        printf("error: %s\n", opened.error);
+        return 1;
+    }
+    Gpu gpu = opened.value;
+    defer gpu.release();
+    *uint8 px = alloc<uint8>(32 * 32 * 4);
+    defer free(px);
+    GpuPipelineDesc fd = GpuPipelineDesc{wgsl: fill, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8Unorm};
+    Result<GpuPipeline, string> fp = gpu.pipeline(&fd);
+    if (!fp.ok) {
+        printf("error: %s\n", fp.error);
+        return 1;
+    }
+    GpuPipeline pipe = fp.value;
+    defer pipe.release();
+    GpuSamplerOptions so = GpuSamplerOptions{nearest: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    GpuSampler samp = gpu.sampler_with(&so).value;
+    defer samp.release();
+    run_case("mrt", mrt(&gpu, px));
+    run_case("layers", layers(&gpu, &pipe, &samp));
+    run_case("mip_targets", mip_targets(&gpu, &pipe));
+    run_case("mips RGBA8 16x16", gen_mips_rgba8(&gpu, "mips RGBA8 16x16", 16, 16, 1, false, WGPUTextureFormat_RGBA8Unorm));
+    run_case("mips RGBA8 12x10", gen_mips_rgba8(&gpu, "mips RGBA8 12x10", 12, 10, 1, false, WGPUTextureFormat_RGBA8Unorm));
+    run_case("mips sRGB", gen_mips_rgba8(&gpu, "mips sRGB", 16, 8, 1, false, WGPUTextureFormat_RGBA8UnormSrgb));
+    run_case("mips 2D array", gen_mips_rgba8(&gpu, "mips 2D array", 8, 8, 3, false, WGPUTextureFormat_RGBA8Unorm));
+    run_case("mips cube", gen_mips_rgba8(&gpu, "mips cube", 8, 8, 0, true, WGPUTextureFormat_RGBA8Unorm));
+    run_case("mips RGBA16Float", gen_mips_half(&gpu));
+    run_case("shadow", shadow(&gpu));
+    run_case("srgb_views", srgb_views(&gpu));
+    printf("render targets: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

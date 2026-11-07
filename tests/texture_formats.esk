@@ -1,0 +1,518 @@
+// Texture data in other formats: KTX2 files (<gpu/ktx2>) uploaded with
+// Gpu_ktx2 (RGBA8 with mip levels, a cube, an sRGB array, RGBA16Float, mip
+// levels the file asks for, the errors of files this reader does not take),
+// block-compressed BC1, ETC2 and ASTC textures where the device has them
+// (sampled back through textureLoad, including BC1 mip levels smaller than a
+// block), and Radiance .hdr decoding (flat, run-length and old-style runs,
+// bottom-up rows, errors) uploaded as RGBA16Float and RGBA32Float.
+//
+// The fixtures are built by this test from known bytes: K2_build writes a
+// KTX2 file (header, level index, levels), the .hdr files are written out
+// byte by byte, and the compressed blocks are solid colors whose decoded
+// values follow from the format definitions. A format the device lacks
+// prints a "skip" line (and must give an Err from Gpu_ktx2).
+import <io>;
+import <mem>;
+import <list>;
+import <libc>;
+import <math>;
+import <gpu>;
+import <gpu/image>;
+import <gpu/ktx2>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(int a, int b) {
+    return a - b <= 1 && b - a <= 1;
+}
+
+void expect(string name, *uint8 px, int x, int r, int g, int b, int a) {
+    *uint8 p = px + x * 4;
+    if (!near(p[0], r) || !near(p[1], g) || !near(p[2], b) || !near(p[3], a)) {
+        printf("FAIL %s: pixel %d is %d %d %d %d, want %d %d %d %d\n", name, x, (int)p[0], (int)p[1], (int)p[2], (int)p[3], r, g, b, a);
+        fails++;
+    }
+}
+
+// A KTX2 file under construction: the header's fields and the level data,
+// one level at a time from level 0.
+struct K2 {
+    uint32 vk;
+    uint32 w;
+    uint32 h;
+    uint32 layers;
+    uint32 faces;
+    uint32 levels;
+    uint32 scheme;
+    List<uint8> data;
+    List<uint64> lens;
+}
+
+void put32(List<uint8>* o, uint32 v) {
+    for (i in 0..4) List_push(o, (uint8)((v >> (i * 8)) & 255));
+}
+
+void put64(List<uint8>* o, uint64 v) {
+    put32(o, (uint32)(v & 0xFFFFFFFF));
+    put32(o, (uint32)(v >> 32));
+}
+
+void K2_level(*K2 k, *uint8 bytes, uint64 n) {
+    for (i in 0..n) List_push(&k.data, bytes[i]);
+    List_push(&k.lens, n);
+}
+
+void K2_build(*K2 k, List<uint8>* out) {
+    uint8[12] magic = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    for (i in 0..12) List_push(out, magic[i]);
+    put32(out, k.vk);
+    put32(out, 1);
+    put32(out, k.w);
+    put32(out, k.h);
+    put32(out, 0);
+    put32(out, k.layers);
+    put32(out, k.faces);
+    put32(out, k.levels);
+    put32(out, k.scheme);
+    for (i in 0..4) put32(out, 0);
+    put64(out, 0);
+    put64(out, 0);
+    uint64 offset = 80 + (uint64)k.lens.size * 24;
+    for (i in 0..k.lens.size) {
+        put64(out, offset);
+        put64(out, k.lens.data[i]);
+        put64(out, k.lens.data[i]);
+        offset += k.lens.data[i];
+    }
+    for (i in 0..k.data.size) List_push(out, k.data.data[i]);
+}
+
+void K2_free(*K2 k) {
+    List_free(&k.data);
+    List_free(&k.lens);
+}
+
+Result<Ktx2, string> parse(*K2 k) {
+    List<uint8> file;
+    defer List_free(&file);
+    K2_build(k, &file);
+    return ktx2_decode(file.data, (uint64)file.size);
+}
+
+// Bytes v, v + 1, ... for a level.
+void ramp(*uint8 out, int n, int v) {
+    for (i in 0..n) out[i] = (uint8)((v + i * 7) & 255);
+}
+
+Result<int, string> ktx2_rgba8(*Gpu gpu) {
+    uint8[64] img;
+    uint8[64] got;
+    K2 k = K2{vk: 37, w: 4, h: 4, faces: 1, levels: 3};
+    defer K2_free(&k);
+    for (m in 0..3) {
+        int n = (4 >> m) * (4 >> m) * 4;
+        ramp(&img[0], n, m * 50);
+        K2_level(&k, &img[0], (uint64)n);
+    }
+    Ktx2 file = parse(&k)?;
+    defer file.free();
+    check("ktx2 header", file.width == 4 && file.height == 4 && file.levels == 3 && file.layers == 1 && file.faces == 1 && !file.want_mips);
+    GpuTexture t = gpu.ktx2(&file)?;
+    defer t.release();
+    check("ktx2 RGBA8 texture", t.format == WGPUTextureFormat_RGBA8Unorm && t.mips == 3 && t.dimension == WGPUTextureViewDimension_2D);
+    for (m in 0..3) {
+        int n = (4 >> m) * (4 >> m) * 4;
+        ramp(&img[0], n, (int)m * 50);
+        t.read_level(0, m, &got[0])?;
+        check("ktx2 RGBA8 level", memcmp((*void)&img[0], (*void)&got[0], n) == 0);
+    }
+
+    K2 c = K2{vk: 37, w: 2, h: 2, faces: 6, levels: 1};
+    defer K2_free(&c);
+    for (f in 0..6) {
+        for (p in 0..4) {
+            img[f * 16 + p * 4] = (uint8)(f * 40);
+            img[f * 16 + p * 4 + 1] = (uint8)(255 - f * 40);
+            img[f * 16 + p * 4 + 2] = 7;
+            img[f * 16 + p * 4 + 3] = 255;
+        }
+    }
+    K2_level(&c, &img[0], 96);
+    Ktx2 cf = parse(&c)?;
+    defer cf.free();
+    GpuTexture cube = gpu.ktx2(&cf)?;
+    defer cube.release();
+    check("ktx2 cube", cube.dimension == WGPUTextureViewDimension_Cube && cube.layers == 6);
+    for (f in 0..6) {
+        cube.read_level((uint32)f, 0, &got[0])?;
+        expect("ktx2 cube face", &got[0], 3, f * 40, 255 - f * 40, 7, 255);
+    }
+
+    K2 a = K2{vk: 43, w: 2, h: 2, layers: 2, faces: 1, levels: 1};
+    defer K2_free(&a);
+    ramp(&img[0], 32, 3);
+    K2_level(&a, &img[0], 32);
+    Ktx2 af = parse(&a)?;
+    defer af.free();
+    GpuTexture arr = gpu.ktx2(&af)?;
+    defer arr.release();
+    check("ktx2 sRGB array", arr.format == WGPUTextureFormat_RGBA8UnormSrgb && arr.dimension == WGPUTextureViewDimension_2DArray);
+    for (l in 0..2) {
+        arr.read_level((uint32)l, 0, &got[0])?;
+        check("ktx2 array layer", memcmp((*void)&img[l * 16], (*void)&got[0], 16) == 0);
+    }
+
+    // Level count 0: the reader makes the mip levels.
+    K2 g = K2{vk: 37, w: 4, h: 4, faces: 1, levels: 0};
+    defer K2_free(&g);
+    for (p in 0..16) {
+        img[p * 4] = 200;
+        img[p * 4 + 1] = 100;
+        img[p * 4 + 2] = 50;
+        img[p * 4 + 3] = 255;
+    }
+    K2_level(&g, &img[0], 64);
+    Ktx2 gf = parse(&g)?;
+    defer gf.free();
+    check("ktx2 asks for mips", gf.want_mips && gf.levels == 1);
+    GpuTexture gt = gpu.ktx2(&gf)?;
+    defer gt.release();
+    check("ktx2 generated levels", gt.mips == 3);
+    gt.read_level(0, 2, &got[0])?;
+    expect("ktx2 generated level 2", &got[0], 0, 200, 100, 50, 255);
+
+    // RGBA16Float.
+    K2 hf = K2{vk: 97, w: 2, h: 2, faces: 1, levels: 1};
+    defer K2_free(&hf);
+    uint16[16] halves;
+    for (i in 0..16) halves[i] = image_f16((float)i * 0.5);
+    K2_level(&hf, (*uint8)&halves[0], 32);
+    Ktx2 hff = parse(&hf)?;
+    defer hff.free();
+    GpuTexture ht = gpu.ktx2(&hff)?;
+    defer ht.release();
+    uint16[16] hb;
+    ht.read_level(0, 0, &hb[0])?;
+    check("ktx2 RGBA16Float", ht.format == WGPUTextureFormat_RGBA16Float && memcmp((*void)&halves[0], (*void)&hb[0], 32) == 0);
+    return Ok<int, string>(0);
+}
+
+void ktx2_errors() {
+    uint8[64] img;
+    K2 k = K2{vk: 37, w: 4, h: 4, faces: 1, levels: 1};
+    defer K2_free(&k);
+    K2_level(&k, &img[0], 64);
+    List<uint8> file;
+    defer List_free(&file);
+    K2_build(&k, &file);
+    Result<Ktx2, string> r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 good file", r.ok);
+    if (r.ok) r.value.free();
+    file.data[1] = 0;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 bad magic", !r.ok);
+    file.data[1] = 0x4B;
+    r = ktx2_decode(file.data, (uint64)file.size - 1);
+    check("ktx2 truncated level", !r.ok);
+    file.data[44] = 1;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 supercompression is rejected", !r.ok && strstr(r.error, "supercompressed") != null);
+    file.data[44] = 0;
+    file.data[12] = 0;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 Basis data (vkFormat 0) is rejected", !r.ok && strstr(r.error, "Basis") != null);
+    file.data[12] = 200;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 unsupported vkFormat", !r.ok);
+    file.data[12] = 37;
+    file.data[28] = 4;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 3D is rejected", !r.ok);
+    file.data[28] = 0;
+    file.data[36] = 2;
+    r = ktx2_decode(file.data, (uint64)file.size);
+    check("ktx2 bad face count", !r.ok);
+}
+
+// Loads level l of a 2D texture at texel (0, 0) into pixel l of an n x 1
+// RGBA8 target.
+string load_levels =
+    "@group(0) @binding(0) var t: texture_2d<f32>;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {\n"
+    "    return textureLoad(t, vec2<i32>(0, 0), i32(p.x));\n"
+    "}\n";
+
+Result<int, string> load(*Gpu gpu, *GpuTexture tex, uint32 n, *uint8 px) {
+    GpuBindLayout bl = gpu.bind_layout();
+    defer bl.release();
+    bl.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float);
+    *GpuBindLayout[1] groups = {&bl};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: load_levels, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8Unorm,
+        groups: &groups[0], group_count: 1};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    GpuBindGroup g = bl.group()?;
+    defer g.release();
+    g.texture(0, tex);
+    GpuTexture t = gpu.target(n, 1)?;
+    defer t.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 0.0}, null);
+    pass.set_group(0, &g);
+    pass.draw(&pipe, null, 3, 1);
+    pass.end()?;
+    return t.read(px);
+}
+
+// A compressed KTX2 texture: on a device with the format, its texels decoded
+// by the GPU; without it, an Err from Gpu_ktx2.
+Result<int, string> compressed(*Gpu gpu, string name, bool has, *K2 k, uint32 levels, *int want) {
+    Ktx2 f = parse(k)?;
+    defer f.free();
+    Result<GpuTexture, string> r = gpu.ktx2(&f);
+    if (!has) {
+        check("a compressed format the device lacks fails", !r.ok);
+        if (r.ok) r.value.release();
+        printf("skip %s: not on this device\n", name);
+        return Ok<int, string>(0);
+    }
+    if (!r.ok) return Err<int, string>(r.error);
+    GpuTexture t = r.value;
+    defer t.release();
+    uint8[32] px;
+    load(gpu, &t, levels, &px[0])?;
+    for (l in 0..levels) expect(name, &px[0], (int)l, want[l * 4], want[l * 4 + 1], want[l * 4 + 2], want[l * 4 + 3]);
+    return Ok<int, string>(0);
+}
+
+Result<int, string> compressed_formats(*Gpu gpu) {
+    // BC1, 8x8 with 4 levels (8x8 is 2x2 blocks, then one block for 4x4, 2x2
+    // and 1x1): each level a solid RGB565 color (both endpoints equal, every
+    // index 0).
+    K2 bc = K2{vk: 133, w: 8, h: 8, faces: 1, levels: 4};
+    defer K2_free(&bc);
+    uint16[4] c565 = {0xF800, 0x07E0, 0x001F, 0xFFFF};
+    for (m in 0..4) {
+        int blocks = m == 0 ? 4 : 1;
+        uint8[32] b;
+        for (i in 0..blocks) {
+            b[i * 8] = (uint8)(c565[m] & 255);
+            b[i * 8 + 1] = (uint8)(c565[m] >> 8);
+            b[i * 8 + 2] = (uint8)(c565[m] & 255);
+            b[i * 8 + 3] = (uint8)(c565[m] >> 8);
+            for (j in 4..8) b[i * 8 + j] = 0;
+        }
+        K2_level(&bc, &b[0], (uint64)(blocks * 8));
+    }
+    int[16] bc_want = {255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255};
+    compressed(gpu, "BC1", gpu.bc, &bc, 4, &bc_want[0])?;
+
+    // ETC2 RGB8, one 4x4 block in individual mode: base colors (15, 0, 0) in
+    // 4 bits, codeword 0 and pixel index 0, which adds 2 to each channel.
+    K2 etc = K2{vk: 147, w: 4, h: 4, faces: 1, levels: 1};
+    defer K2_free(&etc);
+    uint8[8] eb = {0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    K2_level(&etc, &eb[0], 8);
+    int[4] etc_want = {255, 2, 2, 255};
+    compressed(gpu, "ETC2", gpu.etc2, &etc, 1, &etc_want[0])?;
+
+    // ASTC 4x4, a void-extent block: one RGBA color in UNORM16.
+    K2 astc = K2{vk: 157, w: 4, h: 4, faces: 1, levels: 1};
+    defer K2_free(&astc);
+    uint8[16] ab = {0xFC, 0xFD, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x80, 0x00, 0x00, 0xFF, 0xFF};
+    K2_level(&astc, &ab[0], 16);
+    int[4] astc_want = {255, 128, 0, 255};
+    compressed(gpu, "ASTC", gpu.astc, &astc, 1, &astc_want[0])?;
+
+    // A compressed texture made directly, one block written with write_level.
+    if (gpu.bc) {
+        GpuTextureDesc d = GpuTextureDesc{width: 4, height: 4, format: WGPUTextureFormat_BC1RGBAUnormSrgb};
+        GpuTexture t = gpu.texture_with(&d)?;
+        defer t.release();
+        uint8[8] b = {0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0};
+        t.write_level(0, 0, &b[0])?;
+        uint8[4] px;
+        load(gpu, &t, 1, &px[0])?;
+        expect("BC1 sRGB decoded to linear", &px[0], 0, 255, 0, 0, 255);
+    } else {
+        GpuTextureDesc d = GpuTextureDesc{width: 4, height: 4, format: WGPUTextureFormat_BC1RGBAUnorm};
+        Result<GpuTexture, string> r = gpu.texture_with(&d);
+        check("a BC texture without the feature fails", !r.ok);
+        if (r.ok) r.value.release();
+    }
+    printf("compressed formats: bc %d, etc2 %d, astc %d\n", (int)gpu.bc, (int)gpu.etc2, (int)gpu.astc);
+    return Ok<int, string>(0);
+}
+
+// .hdr files written byte by byte.
+void text(List<uint8>* o, string s) {
+    for (i in 0..strlen(s)) List_push(o, (uint8)s[i]);
+}
+
+void rgbe(List<uint8>* o, int r, int g, int b, int e) {
+    List_push(o, (uint8)r);
+    List_push(o, (uint8)g);
+    List_push(o, (uint8)b);
+    List_push(o, (uint8)e);
+}
+
+float rgbe_value(int m, int e) {
+    if (e == 0) return 0.0;
+    return (float)((double)m * pow(2.0, (double)(e - 136)));
+}
+
+bool pixel_is(*HdrBitmap img, int x, int y, float r, float g, float b) {
+    *float p = img.rgba + (y * (int)img.width + x) * 4;
+    return p[0] == r && p[1] == g && p[2] == b && p[3] == 1.0;
+}
+
+Result<int, string> hdr(*Gpu gpu) {
+    check("f16 of 1.0", image_f16(1.0) == 0x3C00);
+    check("f16 of -2.5", image_f16(-2.5) == 0xC100);
+    check("f16 of 65504", image_f16(65504.0) == 0x7BFF);
+    check("f16 overflow", image_f16(70000.0) == 0x7C00);
+    check("f16 subnormal", image_f16(0.000001) == 0x0011);
+    check("f16 rounds to even", image_f16(1.0 + 1.0 / 2048.0) == 0x3C00 && image_f16(1.0 + 3.0 / 2048.0) == 0x3C02);
+
+    // Flat pixels, a zero exponent among them.
+    List<uint8> f;
+    defer List_free(&f);
+    text(&f, "#?RADIANCE\n# made by tests/texture_formats.esk\nFORMAT=32-bit_rle_rgbe\nEXPOSURE=1.0\n\n-Y 2 +X 2\n");
+    rgbe(&f, 128, 64, 32, 129);
+    rgbe(&f, 255, 0, 1, 140);
+    rgbe(&f, 10, 20, 30, 0);
+    rgbe(&f, 200, 100, 50, 120);
+    HdrBitmap a = hdr_decode(f.data, (uint64)f.size)?;
+    defer a.free();
+    check("hdr flat size", a.width == 2 && a.height == 2);
+    check("hdr flat pixel 0", pixel_is(&a, 0, 0, 1.0, 0.5, 0.25));
+    check("hdr flat pixel 1", pixel_is(&a, 1, 0, rgbe_value(255, 140), 0.0, rgbe_value(1, 140)));
+    check("hdr zero exponent", pixel_is(&a, 0, 1, 0.0, 0.0, 0.0));
+    check("hdr flat pixel 3", pixel_is(&a, 1, 1, rgbe_value(200, 120), rgbe_value(100, 120), rgbe_value(50, 120)));
+
+    // Run-length rows of 10: red is a run of 6 then 4 literals, green one
+    // run, blue and the exponent literals; the second row all literals.
+    List<uint8> r;
+    defer List_free(&r);
+    text(&r, "#?RGBE\n\n-Y 2 +X 10\n");
+    for (y in 0..2) {
+        List_push(&r, 2);
+        List_push(&r, 2);
+        List_push(&r, 0);
+        List_push(&r, 10);
+        if (y == 0) {
+            List_push(&r, 128 + 6);
+            List_push(&r, 100);
+            List_push(&r, 4);
+            for (x in 6..10) List_push(&r, (uint8)(10 + x));
+            List_push(&r, 128 + 10);
+            List_push(&r, 50);
+        } else {
+            List_push(&r, 10);
+            for (x in 0..10) List_push(&r, (uint8)(x < 6 ? 100 : 10 + x));
+            List_push(&r, 10);
+            for (x in 0..10) List_push(&r, 50);
+        }
+        List_push(&r, 10);
+        for (x in 0..10) List_push(&r, (uint8)x);
+        List_push(&r, 10);
+        for (x in 0..10) List_push(&r, (uint8)(128 + x % 3));
+    }
+    HdrBitmap b = hdr_decode(r.data, (uint64)r.size)?;
+    defer b.free();
+    bool rle_ok = b.width == 10 && b.height == 2;
+    for (y in 0..2) {
+        for (x in 0..10) {
+            int e = 128 + x % 3;
+            int red = x < 6 ? 100 : 10 + x;
+            if (rle_ok && !pixel_is(&b, x, y, rgbe_value(red, e), rgbe_value(50, e), rgbe_value(x, e))) rle_ok = false;
+        }
+    }
+    check("hdr run-length rows", rle_ok);
+
+    // Bottom-up rows, and an old-style run repeating the first pixel twice.
+    List<uint8> u;
+    defer List_free(&u);
+    text(&u, "#?RADIANCE\n\n+Y 2 +X 1\n");
+    rgbe(&u, 128, 0, 0, 129);
+    rgbe(&u, 0, 128, 0, 129);
+    HdrBitmap c = hdr_decode(u.data, (uint64)u.size)?;
+    defer c.free();
+    check("hdr +Y stores the last row first", pixel_is(&c, 0, 0, 0.0, 1.0, 0.0) && pixel_is(&c, 0, 1, 1.0, 0.0, 0.0));
+    List<uint8> o;
+    defer List_free(&o);
+    text(&o, "#?RADIANCE\n\n-Y 1 +X 3\n");
+    rgbe(&o, 128, 128, 0, 130);
+    rgbe(&o, 1, 1, 1, 2);
+    HdrBitmap d = hdr_decode(o.data, (uint64)o.size)?;
+    defer d.free();
+    check("hdr old-style run", pixel_is(&d, 0, 0, 2.0, 2.0, 0.0) && pixel_is(&d, 2, 0, 2.0, 2.0, 0.0));
+
+    List<uint8> bad;
+    defer List_free(&bad);
+    text(&bad, "#?RADIANCE\nFORMAT=32-bit_rle_xyze\n\n-Y 1 +X 1\n");
+    rgbe(&bad, 1, 1, 1, 128);
+    check("hdr XYZE is rejected", !hdr_decode(bad.data, (uint64)bad.size).ok);
+    check("hdr truncated pixels", !hdr_decode(f.data, (uint64)f.size - 1).ok);
+    check("hdr not a Radiance file", !hdr_decode(f.data + 1, (uint64)f.size - 1).ok);
+    List<uint8> side;
+    defer List_free(&side);
+    text(&side, "#?RADIANCE\n\n+X 1 -Y 1\n");
+    rgbe(&side, 1, 1, 1, 128);
+    check("hdr column-major is rejected", !hdr_decode(side.data, (uint64)side.size).ok);
+
+    // Uploaded as RGBA16Float (to_half) and RGBA32Float, read back unchanged.
+    uint16[80] halves;
+    b.to_half(&halves[0]);
+    check("to_half", halves[4] == image_f16(b.rgba[4]) && halves[3] == 0x3C00);
+    GpuTextureDesc hd = GpuTextureDesc{width: 10, height: 2, format: WGPUTextureFormat_RGBA16Float};
+    GpuTexture ht = gpu.texture_with(&hd)?;
+    defer ht.release();
+    ht.write_level(0, 0, &halves[0])?;
+    uint16[80] hb;
+    ht.read(&hb[0])?;
+    check("hdr as RGBA16Float", memcmp((*void)&halves[0], (*void)&hb[0], 160) == 0);
+    hd.format = WGPUTextureFormat_RGBA32Float;
+    GpuTexture ft = gpu.texture_with(&hd)?;
+    defer ft.release();
+    ft.write_level(0, 0, b.rgba)?;
+    float[80] fb;
+    ft.read(&fb[0])?;
+    check("hdr as RGBA32Float", memcmp((*void)b.rgba, (*void)&fb[0], 320) == 0);
+    if (gpu.float32_filterable) printf("float32-filterable: on\n");
+    else printf("skip float32-filterable: not on this device\n");
+    return Ok<int, string>(0);
+}
+
+void run_case(string name, Result<int, string> r) {
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+    }
+}
+
+int main() {
+    ktx2_errors();
+    Result<Gpu, string> opened = gpu_open();
+    if (!opened.ok) {
+        printf("error: %s\n", opened.error);
+        return 1;
+    }
+    Gpu gpu = opened.value;
+    defer gpu.release();
+    run_case("ktx2", ktx2_rgba8(&gpu));
+    run_case("compressed", compressed_formats(&gpu));
+    run_case("hdr", hdr(&gpu));
+    printf("texture formats: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}
