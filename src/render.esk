@@ -52,6 +52,7 @@ struct GpuTexture {
     uint32 width;
     uint32 height;
     uint32 mips;
+    uint32 samples;
 }
 
 // How Gpu_image_with stores the pixels: srgb for color data (photos, base
@@ -103,6 +104,19 @@ enum GpuBlend {
     GPU_BLEND_CONSTANT
 }
 
+// One face's stencil test (GpuPipelineDesc.stencil_front and stencil_back):
+// the fragment passes when (reference & read mask) compare (stencil & read
+// mask) holds, and the stencil value then takes fail when the test fails,
+// depth_fail when the stencil test passes and the depth test fails, pass when
+// both pass (WGPUStencilOperation: Keep, Zero, Replace with the reference,
+// Invert, IncrementClamp...). The zero value is Always with Keep for each op.
+struct GpuStencilFace {
+    WGPUCompareFunction compare;
+    WGPUStencilOperation fail;
+    WGPUStencilOperation depth_fail;
+    WGPUStencilOperation pass;
+}
+
 // A render pipeline's description. The zero value of each field is the
 // common case:
 // - layout is the one vertex buffer; layouts and layout_count list several
@@ -117,6 +131,16 @@ enum GpuBlend {
 //   Depth24Plus, also Depth32Float) with depth_compare (default Less);
 //   depth_read_only turns depth writes off. depth_bias and depth_bias_slope
 //   offset the depth written.
+// - stencil_front and stencil_back test and update the stencil of a
+//   depth_format with one (Depth24PlusStencil8, Depth32FloatStencil8 when
+//   Gpu.depth32_stencil8, Stencil8) against the pass's reference
+//   (GpuPass_set_stencil_reference); stencil_back left zero is stencil_front.
+//   stencil_read_mask and stencil_write_mask are 0xFF when 0 (a mask of 0 is
+//   the same as an Always or Never compare, or Keep ops). The stencil, like
+//   the depth, needs depth: a stencil-only draw sets depth_compare Always and
+//   depth_read_only.
+// - samples is the multisample count, 1 or 4 (0 is 1); the pass's attachments
+//   must have the same count (Gpu_target_msaa).
 struct GpuPipelineDesc {
     string wgsl;
     string vertex;
@@ -139,6 +163,11 @@ struct GpuPipelineDesc {
     WGPUCompareFunction depth_compare;
     int32 depth_bias;
     float depth_bias_slope;
+    GpuStencilFace stencil_front;
+    GpuStencilFace stencil_back;
+    uint32 stencil_read_mask;
+    uint32 stencil_write_mask;
+    uint32 samples;
 }
 
 struct GpuPipeline {
@@ -182,12 +211,22 @@ struct GpuEncoder {
 
 // A pass's attachments: the color target is cleared to clear, or keeps its
 // pixels with load; the depth texture, when given, is cleared to 1.0, or keeps
-// its values with depth_load.
+// its values with depth_load. When the depth texture's format has a stencil,
+// the stencil is cleared to stencil_clear, or kept with stencil_load.
+// A multisampled target (Gpu_target_msaa) is resolved at the end of the pass
+// into resolve, a single-sample view of the same format and size (a surface
+// frame's view or a target's); discard then drops the multisampled pixels
+// instead of storing them, which saves memory traffic on tile GPUs (phones)
+// when no later pass loads them.
 struct GpuPassOptions {
     GpuColor clear;
     bool load;
     *GpuTexture depth;
     bool depth_load;
+    uint32 stencil_clear;
+    bool stencil_load;
+    WGPUTextureView resolve;
+    bool discard;
 }
 
 struct GpuPass {
@@ -243,18 +282,18 @@ Result<GpuBuffer, string> Gpu_uniform(*Gpu self, *void data, uint64 bytes) {
 }
 
 Result<GpuTexture, string> Gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage) {
-    return _gpu_texture(self, width, height, format, usage, 1);
+    return _gpu_texture(self, width, height, format, usage, 1, 1);
 }
 
-Result<GpuTexture, string> _gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage, uint32 mips) {
+Result<GpuTexture, string> _gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage, uint32 mips, uint32 samples) {
     _gpu_push(self);
     WGPUTextureDescriptor d = WGPUTextureDescriptor{usage: usage, dimension: WGPUTextureDimension_2D,
-        size: WGPUExtent3D{width, height, 1}, format: format, mipLevelCount: mips, sampleCount: 1};
+        size: WGPUExtent3D{width, height, 1}, format: format, mipLevelCount: mips, sampleCount: samples};
     WGPUTexture t = wgpuDeviceCreateTexture(self.device, &d);
     WGPUTextureView v = null;
     if (t != null) v = wgpuTextureCreateView(t, null);
     string err = _gpu_pop(self, "texture");
-    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, mips};
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, mips, samples};
     if (err != null || t == null) {
         GpuTexture_release(&tex);
         return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture", null));
@@ -271,6 +310,15 @@ Result<GpuTexture, string> Gpu_target(*Gpu self, uint32 width, uint32 height) {
 Result<GpuTexture, string> Gpu_target_with(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format) {
     return Gpu_texture(self, width, height, format,
         WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding);
+}
+
+// A multisampled render attachment of samples samples per pixel (4, the
+// count every WebGPU device supports for the common formats): a color target
+// resolved into a single-sample view at the end of a pass
+// (GpuPassOptions.resolve), or a depth (and stencil) texture for the same
+// pass. It is only drawn into: it cannot be read back or sampled.
+Result<GpuTexture, string> Gpu_target_msaa(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, uint32 samples) {
+    return _gpu_texture(self, width, height, format, WGPUTextureUsage_RenderAttachment, 1, samples);
 }
 
 // Bytes per texel of the color formats the texture calls copy (4 for the
@@ -302,7 +350,7 @@ Result<GpuTexture, string> Gpu_image_with(*Gpu self, uint32 width, uint32 height
         }
     }
     WGPUTextureFormat format = srgb ? WGPUTextureFormat_RGBA8UnormSrgb : WGPUTextureFormat_RGBA8Unorm;
-    GpuTexture t = _gpu_texture(self, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst, mips)?;
+    GpuTexture t = _gpu_texture(self, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst, mips, 1)?;
     GpuTexture_write(&t, rgba);
     if (mips > 1) _gpu_write_mips(&t, (*uint8)rgba, srgb);
     return Ok<GpuTexture, string>(t);
@@ -380,6 +428,16 @@ Result<GpuTexture, string> Gpu_depth(*Gpu self, uint32 width, uint32 height) {
     return Gpu_texture(self, width, height, WGPUTextureFormat_Depth24Plus, WGPUTextureUsage_RenderAttachment);
 }
 
+// A depth texture with an 8-bit stencil (Depth24PlusStencil8, available on
+// every device), for pipelines with that depth_format.
+Result<GpuTexture, string> Gpu_depth_stencil(*Gpu self, uint32 width, uint32 height) {
+    return Gpu_texture(self, width, height, WGPUTextureFormat_Depth24PlusStencil8, WGPUTextureUsage_RenderAttachment);
+}
+
+bool _gpu_has_stencil(WGPUTextureFormat f) {
+    return f == WGPUTextureFormat_Depth24PlusStencil8 || f == WGPUTextureFormat_Depth32FloatStencil8 || f == WGPUTextureFormat_Stencil8;
+}
+
 // Replaces the texture's pixels (4 bytes each, rows packed).
 void GpuTexture_write(*GpuTexture self, *void rgba) {
     WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: self.handle, aspect: WGPUTextureAspect_All};
@@ -403,6 +461,7 @@ void GpuTexture_write_region(*GpuTexture self, uint32 x, uint32 y, uint32 width,
 // to 256 bytes, and submits it.
 Result<GpuReadback, string> _gpu_read_start(*GpuTexture self) {
     *Gpu g = &self.gpu;
+    if (self.samples > 1) return Err<GpuReadback, string>(_gpu_fail("read: a multisampled texture cannot be read back (read the target it resolves into)", null));
     GpuReadback rb;
     rb.gpu = *g;
     rb.width = self.width;
@@ -417,11 +476,7 @@ Result<GpuReadback, string> _gpu_read_start(*GpuTexture self) {
     WGPUTexelCopyBufferInfo dst = WGPUTexelCopyBufferInfo{WGPUTexelCopyBufferLayout{0, rb.padded, self.height}, rb.staging};
     WGPUExtent3D size = WGPUExtent3D{self.width, self.height, 1};
     wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
-    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
-    wgpuQueueSubmit(g.queue, 1, &cmd);
-    wgpuCommandBufferRelease(cmd);
-    wgpuCommandEncoderRelease(enc);
-    string err = _gpu_pop(g, "read");
+    string err = _gpu_finish(g, enc, "read");
     if (err != null) {
         wgpuBufferRelease(rb.staging);
         return Err<GpuReadback, string>(err);
@@ -546,6 +601,13 @@ WGPUBlendState _gpu_blend_state(GpuBlend mode) {
     return WGPUBlendState{WGPUBlendComponent{WGPUBlendOperation_Add, WGPUBlendFactor_SrcAlpha, WGPUBlendFactor_OneMinusSrcAlpha}, over};
 }
 
+WGPUStencilFaceState _gpu_stencil_face(GpuStencilFace f) {
+    return WGPUStencilFaceState{f.compare != 0 ? f.compare : WGPUCompareFunction_Always,
+        f.fail != 0 ? f.fail : WGPUStencilOperation_Keep,
+        f.depth_fail != 0 ? f.depth_fail : WGPUStencilOperation_Keep,
+        f.pass != 0 ? f.pass : WGPUStencilOperation_Keep};
+}
+
 Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
     GpuPipeline p;
     p.gpu = *self;
@@ -597,17 +659,25 @@ Result<GpuPipeline, string> Gpu_pipeline(*Gpu self, *GpuPipelineDesc d) {
     if (d.blend_state != null) target.blend = d.blend_state;
     else if (mode != GPU_BLEND_NONE) target.blend = &blend;
     WGPUFragmentState frag = WGPUFragmentState{module: p.module, entryPoint: gpu_str(d.fragment), targetCount: 1, targets: &target};
-    WGPUDepthStencilState ds = WGPUDepthStencilState{format: d.depth_format != 0 ? d.depth_format : WGPUTextureFormat_Depth24Plus,
+    WGPUTextureFormat dfmt = d.depth_format != 0 ? d.depth_format : WGPUTextureFormat_Depth24Plus;
+    GpuStencilFace back = d.stencil_back;
+    if (back.compare == 0 && back.fail == 0 && back.depth_fail == 0 && back.pass == 0) back = d.stencil_front;
+    WGPUDepthStencilState ds = WGPUDepthStencilState{format: dfmt,
         depthWriteEnabled: d.depth_read_only ? WGPUOptionalBool_False : WGPUOptionalBool_True,
         depthCompare: d.depth_compare != 0 ? d.depth_compare : WGPUCompareFunction_Less,
-        stencilFront: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
-        stencilBack: WGPUStencilFaceState{WGPUCompareFunction_Always, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep, WGPUStencilOperation_Keep},
-        stencilReadMask: 0xFFFFFFFF, stencilWriteMask: 0xFFFFFFFF, depthBias: d.depth_bias, depthBiasSlopeScale: d.depth_bias_slope};
+        stencilFront: _gpu_stencil_face(d.stencil_front), stencilBack: _gpu_stencil_face(back),
+        stencilReadMask: d.stencil_read_mask != 0 ? d.stencil_read_mask : (uint32)0xFF,
+        stencilWriteMask: d.stencil_write_mask != 0 ? d.stencil_write_mask : (uint32)0xFF,
+        depthBias: d.depth_bias, depthBiasSlopeScale: d.depth_bias_slope};
+    if (dfmt == WGPUTextureFormat_Stencil8) {
+        ds.depthWriteEnabled = WGPUOptionalBool_False;
+        ds.depthCompare = WGPUCompareFunction_Always;
+    }
     WGPURenderPipelineDescriptor rd = WGPURenderPipelineDescriptor{layout: p.pipeline_layout,
         vertex: WGPUVertexState{module: p.module, entryPoint: gpu_str(d.vertex), bufferCount: (uint64)nbuf, buffers: &vb[0]},
         primitive: WGPUPrimitiveState{topology: d.topology != 0 ? d.topology : WGPUPrimitiveTopology_TriangleList,
             frontFace: WGPUFrontFace_CCW, cullMode: d.cull != 0 ? d.cull : WGPUCullMode_None},
-        multisample: WGPUMultisampleState{count: 1, mask: 0xFFFFFFFF},
+        multisample: WGPUMultisampleState{count: d.samples != 0 ? d.samples : (uint32)1, mask: 0xFFFFFFFF},
         fragment: &frag};
     if (d.depth) rd.depthStencil = &ds;
     _gpu_push(self);
@@ -781,12 +851,24 @@ GpuEncoder Gpu_encoder(*Gpu self) {
 
 void _gpu_begin(*GpuPass p, WGPUTextureView target, *GpuPassOptions o) {
     WGPURenderPassColorAttachment color = WGPURenderPassColorAttachment{view: target, depthSlice: WGPU_DEPTH_SLICE_UNDEFINED,
-        loadOp: o.load ? WGPULoadOp_Load : WGPULoadOp_Clear, storeOp: WGPUStoreOp_Store, clearValue: o.clear};
+        resolveTarget: o.resolve, loadOp: o.load ? WGPULoadOp_Load : WGPULoadOp_Clear,
+        storeOp: o.discard ? WGPUStoreOp_Discard : WGPUStoreOp_Store, clearValue: o.clear};
     WGPURenderPassDepthStencilAttachment da;
     WGPURenderPassDescriptor rd = WGPURenderPassDescriptor{colorAttachmentCount: 1, colorAttachments: &color};
     if (o.depth != null) {
-        da = WGPURenderPassDepthStencilAttachment{view: o.depth.view, depthLoadOp: o.depth_load ? WGPULoadOp_Load : WGPULoadOp_Clear,
-            depthStoreOp: WGPUStoreOp_Store, depthClearValue: 1.0};
+        // Each aspect's ops are given only when the format has it: ops for a
+        // missing aspect are a validation error.
+        da = WGPURenderPassDepthStencilAttachment{view: o.depth.view};
+        if (o.depth.format != WGPUTextureFormat_Stencil8) {
+            da.depthLoadOp = o.depth_load ? WGPULoadOp_Load : WGPULoadOp_Clear;
+            da.depthStoreOp = WGPUStoreOp_Store;
+            da.depthClearValue = 1.0;
+        }
+        if (_gpu_has_stencil(o.depth.format)) {
+            da.stencilLoadOp = o.stencil_load ? WGPULoadOp_Load : WGPULoadOp_Clear;
+            da.stencilStoreOp = WGPUStoreOp_Store;
+            da.stencilClearValue = o.stencil_clear;
+        }
         rd.depthStencilAttachment = &da;
     }
     p.pass = wgpuCommandEncoderBeginRenderPass(p.enc, &rd);
@@ -880,6 +962,12 @@ void GpuPass_set_scissor(*GpuPass self, uint32 x, uint32 y, uint32 width, uint32
 // and depth to min_depth..max_depth.
 void GpuPass_set_viewport(*GpuPass self, float x, float y, float width, float height, float min_depth = 0.0, float max_depth = 1.0) {
     wgpuRenderPassEncoderSetViewport(self.pass, x, y, width, height, min_depth, max_depth);
+}
+
+// The reference value of the stencil tests (and of the Replace op) for the
+// draws that follow; 0 when the pass starts.
+void GpuPass_set_stencil_reference(*GpuPass self, uint32 reference) {
+    wgpuRenderPassEncoderSetStencilReference(self.pass, reference);
 }
 
 // The constant of the GPU_BLEND_CONSTANT preset and of WGPUBlendFactor_Constant.

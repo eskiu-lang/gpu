@@ -36,7 +36,8 @@ struct _GpuState {
 // operations; subgroup_min and subgroup_max bound the subgroup size (they
 // vary by GPU: 32 on Apple and NVIDIA, 64 on some AMD, 4 to 64 elsewhere;
 // Metal does not report them and Apple GPUs use 32);
-// max_buffer is the largest buffer the device allows.
+// max_buffer is the largest buffer the device allows; depth32_stencil8 says
+// whether textures may be Depth32FloatStencil8 (Depth24PlusStencil8 always can).
 struct Gpu {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -48,6 +49,7 @@ struct Gpu {
     uint64 max_buffer;
     uint32 subgroup_min;
     uint32 subgroup_max;
+    bool depth32_stencil8;
 }
 
 struct GpuBuffer {
@@ -148,7 +150,7 @@ Result<Gpu, string> gpu_open() {
     // storage buffer at 128 MB, too little for model weights.
     WGPULimits limits;
     wgpuAdapterGetLimits(g.adapter, &limits);
-    WGPUFeatureName[2] features;
+    WGPUFeatureName[3] features;
     uint64 nfeatures = 0;
     if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_ShaderF16) != 0) {
         features[nfeatures] = WGPUFeatureName_ShaderF16;
@@ -163,6 +165,11 @@ Result<Gpu, string> gpu_open() {
         features[nfeatures] = (WGPUFeatureName)WGPUNativeFeature_Subgroup;
         nfeatures++;
         g.subgroups = true;
+    }
+    if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_Depth32FloatStencil8) != 0) {
+        features[nfeatures] = WGPUFeatureName_Depth32FloatStencil8;
+        nfeatures++;
+        g.depth32_stencil8 = true;
     }
     g.max_buffer = limits.maxBufferSize;
     WGPUAdapterInfo info;
