@@ -1,0 +1,162 @@
+// ktx2.esk: KTX2 texture containers (<gpu/ktx2>).
+//
+// Reads the header, the level index and the image data of a KTX 2.0 file:
+// 2D textures, arrays and cube maps (with their mip levels) in the
+// uncompressed formats WebGPU samples and in the BC, ETC2/EAC and ASTC
+// block-compressed formats. Supercompressed files (Basis Universal ETC1S,
+// zstd, zlib) and Basis UASTC data (vkFormat 0) are rejected: transcoding
+// them is out of scope. 3D textures are rejected too. The parser is pure
+// Eskiu and needs no GPU; Gpu_ktx2 in <gpu/render> uploads the result.
+//
+//     Ktx2 k = ktx2_load("albedo.ktx2")?;
+//     defer k.free();
+//     GpuTexture tex = gpu.ktx2(&k)?;
+
+import <mem>;
+import <fs>;
+import <list>;
+import <result>;
+
+// Where one mip level's images are in the file.
+struct Ktx2Level {
+    uint64 offset;
+    uint64 length;
+}
+
+// A parsed KTX2 file. vk_format is the Vulkan format the file names;
+// block_width, block_height and block_bytes describe its texel blocks (1, 1
+// and the texel size for uncompressed formats). layers is 1 for a plain
+// texture, faces 6 for a cube map; want_mips says the file asks the reader to
+// make the mip levels (its level count is 0; levels is then 1).
+struct Ktx2 {
+    uint32 vk_format;
+    uint32 width;
+    uint32 height;
+    uint32 layers;
+    uint32 faces;
+    uint32 levels;
+    bool want_mips;
+    uint32 block_width;
+    uint32 block_height;
+    uint32 block_bytes;
+    *uint8 data;
+    uint64 size;
+    List<Ktx2Level> level_index;
+}
+
+uint32 _ktx2_u32(*uint8 p) {
+    return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
+}
+
+uint64 _ktx2_u64(*uint8 p) {
+    return (uint64)_ktx2_u32(p) | ((uint64)_ktx2_u32(p + 4) << 32);
+}
+
+// The texel block of a Vulkan format: false for a format this reader does not
+// take (it then has no WebGPU equivalent here).
+bool ktx2_block(uint32 vk, *uint32 bw, *uint32 bh, *uint32 bytes) {
+    *bw = 1;
+    *bh = 1;
+    if (vk == 9 || vk == 10) *bytes = 1;
+    else if (vk == 16 || vk == 17 || vk == 76) *bytes = 2;
+    else if (vk == 37 || vk == 38 || vk == 43 || vk == 44 || vk == 50 || vk == 64 || vk == 83 || vk == 100 || vk == 122 || vk == 123) *bytes = 4;
+    else if (vk == 97 || vk == 103) *bytes = 8;
+    else if (vk == 109) *bytes = 16;
+    else if (vk >= 131 && vk <= 156) {
+        // BC1 (RGB and RGBA), BC4, ETC2 RGB8, RGB8A1 and EAC R11 are 8 bytes
+        // per 4x4 block, the others 16.
+        *bw = 4;
+        *bh = 4;
+        bool half = vk <= 134 || vk == 139 || vk == 140 || (vk >= 147 && vk <= 150) || vk == 153 || vk == 154;
+        *bytes = half ? (uint32)8 : (uint32)16;
+    } else if (vk >= 157 && vk <= 184) {
+        uint32[28] dims = {4, 4, 5, 4, 5, 5, 6, 5, 6, 6, 8, 5, 8, 6, 8, 8, 10, 5, 10, 6, 10, 8, 10, 10, 12, 10, 12, 12};
+        int k = (int)((vk - 157) / 2);
+        *bw = dims[k * 2];
+        *bh = dims[k * 2 + 1];
+        *bytes = 16;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// The size of one image (one layer and face) of a level, in bytes.
+uint64 Ktx2_image_bytes(*Ktx2 self, uint32 level) {
+    uint32 w = self.width >> level;
+    uint32 h = self.height >> level;
+    if (w == 0) w = 1;
+    if (h == 0) h = 1;
+    uint64 bx = (uint64)((w + self.block_width - 1) / self.block_width);
+    uint64 by = (uint64)((h + self.block_height - 1) / self.block_height);
+    return bx * by * self.block_bytes;
+}
+
+// The image of a level, layer and face: rows of texel blocks, packed.
+*uint8 Ktx2_image(*Ktx2 self, uint32 level, uint32 layer, uint32 face) {
+    uint64 n = Ktx2_image_bytes(self, level);
+    return self.data + self.level_index.data[level].offset + ((uint64)layer * self.faces + face) * n;
+}
+
+// Parses a KTX2 file held in memory; the Ktx2 keeps its own copy of the bytes.
+Result<Ktx2, string> ktx2_decode(*uint8 data, uint64 len) {
+    uint8[12] magic = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    if (data == null || len < 80 || memcmp((*void)data, (*void)&magic[0], 12) != 0) return Err<Ktx2, string>("ktx2: not a KTX 2.0 file");
+    Ktx2 k;
+    k.vk_format = _ktx2_u32(data + 12);
+    k.width = _ktx2_u32(data + 20);
+    k.height = _ktx2_u32(data + 24);
+    uint32 depth = _ktx2_u32(data + 28);
+    k.layers = _ktx2_u32(data + 32);
+    k.faces = _ktx2_u32(data + 36);
+    k.levels = _ktx2_u32(data + 40);
+    uint32 scheme = _ktx2_u32(data + 44);
+    if (scheme != 0) return Err<Ktx2, string>("ktx2: supercompressed data (Basis Universal, zstd or zlib) is not supported");
+    if (k.vk_format == 0) return Err<Ktx2, string>("ktx2: no vkFormat (Basis Universal data needs transcoding, which is not supported)");
+    if (depth > 1) return Err<Ktx2, string>("ktx2: 3D textures are not supported");
+    if (k.width == 0 || k.height == 0) return Err<Ktx2, string>("ktx2: 1D textures are not supported");
+    if (k.faces != 1 && k.faces != 6) return Err<Ktx2, string>("ktx2: bad face count");
+    if (k.faces == 6 && k.width != k.height) return Err<Ktx2, string>("ktx2: cube faces are not square");
+    if (!ktx2_block(k.vk_format, &k.block_width, &k.block_height, &k.block_bytes)) return Err<Ktx2, string>("ktx2: unsupported vkFormat");
+    if (k.layers == 0) k.layers = 1;
+    k.want_mips = k.levels == 0;
+    if (k.levels == 0) k.levels = 1;
+    uint32 most = 1;
+    uint32 m = k.width > k.height ? k.width : k.height;
+    while (m > 1) {
+        m = m / 2;
+        most++;
+    }
+    if (k.levels > most) return Err<Ktx2, string>("ktx2: more levels than the size allows");
+    if (80 + (uint64)k.levels * 24 > len) return Err<Ktx2, string>("ktx2: truncated level index");
+    for (i in 0..k.levels) {
+        *uint8 e = data + 80 + (uint64)i * 24;
+        Ktx2Level l = Ktx2Level{_ktx2_u64(e), _ktx2_u64(e + 8)};
+        uint64 need = Ktx2_image_bytes(&k, i) * k.layers * k.faces;
+        if (l.length < need || l.offset > len || l.length > len - l.offset) {
+            List_free(&k.level_index);
+            return Err<Ktx2, string>("ktx2: level data out of the file or too short");
+        }
+        List_push(&k.level_index, l);
+    }
+    k.data = alloc<uint8>((int)len);
+    memcpy((*void)k.data, (*void)data, (int64)len);
+    k.size = len;
+    return Ok<Ktx2, string>(k);
+}
+
+// Reads a file and parses it.
+Result<Ktx2, string> ktx2_load(string path) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<Ktx2, string>("ktx2: cannot read file");
+    defer free((*void)data);
+    return ktx2_decode(data, (uint64)n);
+}
+
+void Ktx2_free(*Ktx2 self) {
+    if (self.data != null) free((*void)self.data);
+    List_free(&self.level_index);
+    self.data = null;
+    self.size = 0;
+}
