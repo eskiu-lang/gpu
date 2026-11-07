@@ -1,8 +1,10 @@
 // <gpu/ui> on Android: a SurfaceView for NativeView("gpu") whose ANativeWindow*
-// is handed to wgpuInstanceCreateSurface through gpu_ui_native_handle (gpu.c).
+// is handed to wgpuInstanceCreateSurface through gpu_ui_native_handle (gpu.c). Its touches
+// go on the "gpu" channel as "touch TIME_MS COUNT (ID PHASE X Y)..." (<gpu/touch>).
 package org.eskiu.gpu;
 
 import android.content.Context;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -27,6 +29,41 @@ public final class GpuView extends SurfaceView implements SurfaceHolder.Callback
         super(context);
         this.events = events;
         getHolder().addCallback(this);
+    }
+
+    // One payload per MotionEvent: Android already batches moves to one per frame, and a move
+    // carries every pointer. Positions are the view's pixels, as the surface's size.
+    @Override public boolean onTouchEvent(MotionEvent e) {
+        int action = e.getActionMasked();
+        int phase;
+        boolean all;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN: phase = 0; all = false; break;
+            case MotionEvent.ACTION_MOVE: phase = 1; all = true; break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP: phase = 2; all = false; break;
+            case MotionEvent.ACTION_CANCEL: phase = 3; all = true; break;
+            default: return true;
+        }
+        // The view keeps its fingers: a scroll or pan around it does not take them over.
+        if (action == MotionEvent.ACTION_DOWN && getParent() != null) getParent().requestDisallowInterceptTouchEvent(true);
+        StringBuilder out = new StringBuilder("touch ").append(e.getEventTime());
+        if (all) {
+            int count = e.getPointerCount();
+            out.append(' ').append(count);
+            for (int i = 0; i < count; i++) appendPointer(out, e, i, phase);
+        } else {
+            out.append(" 1");
+            appendPointer(out, e, e.getActionIndex(), phase);
+        }
+        UiActivity.emit("gpu", out.toString());
+        return true;
+    }
+
+    private static void appendPointer(StringBuilder out, MotionEvent e, int index, int phase) {
+        out.append(' ').append(e.getPointerId(index)).append(' ').append(phase)
+            .append(' ').append(Math.round(e.getX(index))).append(' ').append(Math.round(e.getY(index)));
     }
 
     @Override public void surfaceCreated(SurfaceHolder holder) {

@@ -1,4 +1,5 @@
-// <gpu/ui> on iOS: a UIView backed by CAMetalLayer for NativeView("gpu").
+// <gpu/ui> on iOS: a UIView backed by CAMetalLayer for NativeView("gpu"). Its touches go on
+// the "gpu" channel as "touch TIME_MS COUNT (ID PHASE X Y)..." (<gpu/touch>).
 #import <QuartzCore/CAMetalLayer.h>
 #import "ui_native.h"
 
@@ -6,6 +7,8 @@
 @property(nonatomic, copy) UiViewEmit emit;
 @property(nonatomic, assign) int pixelWidth;
 @property(nonatomic, assign) int pixelHeight;
+// Each touch that is down (by address: UIKit keeps one UITouch per finger) to its id.
+@property(nonatomic, strong) NSMutableDictionary<NSValue *, NSNumber *> *touchIds;
 @end
 
 static __weak EskiuGpuView *liveView;
@@ -20,9 +23,60 @@ static __weak EskiuGpuView *liveView;
     if (self.window) {
         liveView = self;
         [self updateDrawableSize];
-    } else if (liveView == self) {
-        liveView = nil;
+    } else {
+        [self.touchIds removeAllObjects];
+        if (liveView == self) liveView = nil;
     }
+}
+
+// The id of a touch: the smallest one not in use when it goes down (as Android's pointer
+// ids), -1 for a touch this view never saw go down.
+- (int)idForTouch:(UITouch *)touch phase:(int)phase {
+    NSValue *key = [NSValue valueWithNonretainedObject:touch];
+    NSNumber *known = self.touchIds[key];
+    if (phase != 0) return known ? known.intValue : -1;
+    if (!self.touchIds) self.touchIds = [NSMutableDictionary dictionary];
+    NSSet<NSNumber *> *used = [NSSet setWithArray:self.touchIds.allValues];
+    int next = 0;
+    while ([used containsObject:@(next)]) next++;
+    self.touchIds[key] = @(next);
+    return next;
+}
+
+// One payload per UIKit call: moves come coalesced to one per frame. Positions are pixels,
+// as the drawable's size.
+- (void)sendTouches:(NSSet<UITouch *> *)touches event:(UIEvent *)event phase:(int)phase {
+    CGFloat scale = self.contentScaleFactor;
+    NSMutableString *items = [NSMutableString string];
+    int count = 0;
+    NSTimeInterval time = event ? event.timestamp : NSProcessInfo.processInfo.systemUptime;
+    for (UITouch *touch in touches) {
+        int ident = [self idForTouch:touch phase:phase];
+        if (ident < 0) continue;
+        CGPoint p = [touch locationInView:self];
+        [items appendFormat:@" %d %d %ld %ld", ident, phase, lround(p.x * scale), lround(p.y * scale)];
+        count++;
+        if (phase >= 2) [self.touchIds removeObjectForKey:[NSValue valueWithNonretainedObject:touch]];
+    }
+    if (count == 0) return;
+    NSString *payload = [NSString stringWithFormat:@"touch %lld %d%@", (long long)llround(time * 1000.0), count, items];
+    ui_native_emit("gpu", payload.UTF8String);
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self sendTouches:touches event:event phase:0];
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self sendTouches:touches event:event phase:1];
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self sendTouches:touches event:event phase:2];
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [self sendTouches:touches event:event phase:3];
 }
 
 - (void)layoutSubviews {
@@ -71,6 +125,7 @@ UI_NATIVE_SETUP(gpu) {
         EskiuGpuView *view = [EskiuGpuView new];
         view.backgroundColor = UIColor.blackColor;
         view.opaque = YES;
+        view.multipleTouchEnabled = YES;
         view.emit = emit;
         return view;
     }, ^(UIView *view, NSString *name, NSString *value) {

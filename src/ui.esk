@@ -14,11 +14,15 @@
 // On the web and the desktop hosts GpuView is an empty box and use_gpu_surface never fires;
 // gpu_ui_surface and the WebGPU modules exist on iOS and Android only, so code that renders
 // sits under `#if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)`.
+//
+// Touches on GpuView come through use_gpu_touch (each GpuTouch) or use_gpu_touches (the
+// fingers that are down, for a use_frame handler to read): see <gpu/touch>.
 
 import <mem>;
 import <result>;
 import <string>;
 import <ui>;
+import <gpu/touch>;
 
 #if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 import <gpu/raw>;
@@ -85,6 +89,64 @@ void use_gpu_surface(escaping fn(uint32, uint32)->void on_resize) {
             held.handler(0, 0);
         }
     });
+}
+
+struct _GpuTouchHandler {
+    fn(GpuTouch)->void handler;
+}
+
+void _gpu_ui_release_touch(escaping fn(GpuTouch)->void handler) {
+    free_closure(handler);
+}
+
+// Calls on_touch with each touch on the mounted GpuView, in the order the platform gave
+// them: every finger has its own id, so several move at once (see GpuTouch).
+void use_gpu_touch(escaping fn(GpuTouch)->void on_touch) {
+    static int tag;
+    *Slot slot = ui_slot(10, &tag);
+    *_GpuTouchHandler held = (*_GpuTouchHandler)slot.data;
+    if (held == null) {
+        held = alloc<_GpuTouchHandler>(1);
+        slot.data = held;
+        slot.dispose = void() {
+            _gpu_ui_release_touch(held.handler);
+            free(held);
+        };
+    } else {
+        _gpu_ui_release_touch(held.handler);
+    }
+    held.handler = on_touch;
+    use_native_event("gpu", void(string payload) {
+        GpuTouch[32] touches;
+        int n = gpu_touch_parse(payload, &touches[0], 32);
+        for (i in 0..n) held.handler(touches[i]);
+    });
+}
+
+// The fingers on the mounted GpuView, kept while the scope is mounted: read it each frame
+// (use_frame) and call end_frame when done. When the surface goes away every finger is
+// released as cancelled.
+*GpuTouches use_gpu_touches() {
+    static int tag;
+    *Slot slot = ui_slot(10, &tag);
+    *GpuTouches touches = (*GpuTouches)slot.data;
+    if (touches == null) {
+        touches = alloc<GpuTouches>(1);
+        slot.data = touches;
+        slot.dispose = void() {
+            touches.free();
+            free(touches);
+        };
+    }
+    use_native_event("gpu", void(string payload) {
+        GpuTouch[32] buf;
+        int n = gpu_touch_parse(payload, &buf[0], 32);
+        for (i in 0..n) touches.apply(buf[i]);
+        if (n < 0 && payload != null && strcmp(payload, "destroy") == 0 && touches.down.size > 0) {
+            touches.cancel_all(touches.down.data[touches.down.size - 1].time);
+        }
+    });
+    return touches;
 }
 
 // Mounts a native GPU surface view (CAMetalLayer on iOS, SurfaceView on
