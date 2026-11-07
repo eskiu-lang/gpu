@@ -47,6 +47,24 @@ All notable changes to this package are documented in this file. The format is b
   (`to_half` for RGBA16Float) and `image_f16`.
 - sRGB and linear views: `gpu_srgb_format`, `gpu_linear_format`, texture `view_formats` with
   `view_as`, and `GpuSurface_configure_with` (a surface view format) with `GpuFrame.alt_view`.
+- Morph targets: `<gpu/gltf>` reads each primitive's `targets` (`GltfPrimitive.target_count`,
+  `target_positions`, `target_normals`, `target_tangents`), the mesh's default weights
+  (`GltfMesh.weights`) and each node's (`GltfNode.weights`); `Gltf_animate` samples `weights`
+  channels (`GltfAnimSampler.value_count`); `Gltf_set_weights`. `<gpu/model>` applies them on
+  the GPU before skinning, and `GpuModel_set_weights` uploads a node's weights at once.
+- `<gpu/ibl>`: `Gpu_ibl` and `Gpu_ibl_texture` turn an equirectangular HDR image into an
+  environment cube, a diffuse irradiance cube, a GGX prefiltered specular cube (a roughness per
+  mip level) and the split-sum BRDF table, all with render passes (`GpuIbl`, `GpuIblOptions`,
+  `GpuIbl_max_lod`); `Gpu_brdf_lut` makes the table alone. `GpuModel_set_ibl` lights a model
+  with it instead of the hemisphere ambient.
+- Shadows in `<gpu/model>` (opt-in): `GpuModel_enable_shadows` with `GpuShadowOptions` (map
+  size, depth, normal and slope bias, light box), `GpuModel_render_shadows` and
+  `render_shadows_in` (an orthographic shadow map from `GpuModel.light`, 3x3 PCF), and
+  `GpuModel_disable_shadows`.
+- Image decoding options in `<gpu/image>`: `ImageOptions` (`max_pixels`, `orient`),
+  `image_decode_with`, `image_load_with`, `jpeg_decode_with`, `png_decode_with` and
+  `IMAGE_MAX_PIXELS`; the JPEG EXIF orientation (`image_orientation`, `jpeg_orientation`, both
+  TIFF byte orders) and `Bitmap_orient`.
 
 ### Fixed
 
