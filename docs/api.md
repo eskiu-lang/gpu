@@ -2280,6 +2280,33 @@ void NnProgram_release(*NnProgram self)
 Releases every recorded dispatch, pipeline and parameter buffer and the step buffer; not
 the tensors the operations use.
 
+### NnProgram_embed
+
+```eskiu
+void NnProgram_embed(*NnProgram self, *NnTensor out, *NnTensor table, uint32 n)
+```
+
+out[i] = table[step.a * n + i] for i < n (a token's embedding row).
+
+### NnProgram_rmsnorm
+
+```eskiu
+void NnProgram_rmsnorm(*NnProgram self, *NnTensor out, *NnTensor x, *NnTensor weight, uint32 n)
+```
+
+out = weight * x / sqrt(mean(x^2) + eps), over n values (out may be x);
+eps is the program's (1e-5 unless changed).
+
+### NnProgram_matvec_at
+
+```eskiu
+void NnProgram_matvec_at(*NnProgram self, *NnTensor out, uint32 out_offset, uint32 out_pos_stride, *NnTensor w, uint64 w_offset, *NnTensor x, uint32 rows, uint32 cols)
+```
+
+out[out_offset + step.b * out_pos_stride + r] = sum_c w[w_offset + r * cols + c] * x[c]
+for r < rows: a matrix (row-major, rows x cols) times a vector. One
+subgroup (or a 32-thread slice of the workgroup) per row.
+
 ### NnProgram_matvec
 
 ```eskiu
