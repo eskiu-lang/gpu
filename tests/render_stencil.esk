@@ -1,0 +1,558 @@
+// Stencil and multisampling in <gpu/render>: stencil writes from color-mask-off
+// draws, Equal and NotEqual tests by reference, per-face state, read and write
+// masks, the stencil clear value, the increment, decrement and invert ops, the
+// depth-fail op, Depth32FloatStencil8 when the device has it, 4x MSAA resolved
+// to a single-sample target (with depth and stencil), and the errors of
+// mismatched sample counts.
+//
+// The stencil images are compared with tests/data/render_NAME.rgba within one
+// unit per channel (GPU_UPDATE=1 rewrites them). Shapes have edges on pixel
+// boundaries so that every GPU rasterizes them alike; the antialiased edge is
+// checked by properties (exact interior and exterior, partial coverage along
+// the edge, total coverage near the triangle's area), not by an image.
+import <io>;
+import <mem>;
+import <fs>;
+import <env>;
+import <list>;
+import <libc>;
+import <gpu>;
+
+int fails = 0;
+
+// Rectangles in pixels of a 32x32 target (y down), each vertex x, y, z and
+// an RGBA color.
+string flat =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+    "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> V {\n"
+    "    return V(vec4<f32>(p.x / 16.0 - 1.0, 1.0 - p.y / 16.0, p.z, 1.0), c);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+void vertex(List<float>* out, float x, float y, float z, float r, float g, float b) {
+    List_push(out, x);
+    List_push(out, y);
+    List_push(out, z);
+    List_push(out, r);
+    List_push(out, g);
+    List_push(out, b);
+    List_push(out, 1.0);
+}
+
+// Two triangles, clockwise on the screen: back faces for the pipeline's
+// counter-clockwise front face. reversed draws them front-facing.
+void rect_w(List<float>* out, float x0, float y0, float x1, float y1, float z, float r, float g, float b, bool reversed) {
+    float[12] c = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+    for (t in 0..2) {
+        for (k in 0..3) {
+            int i = t * 3 + (reversed ? 2 - k : k);
+            vertex(out, c[i * 2], c[i * 2 + 1], z, r, g, b);
+        }
+    }
+}
+
+void rect(List<float>* out, float x0, float y0, float x1, float y1, float z, float r, float g, float b) {
+    rect_w(out, x0, y0, x1, y1, z, r, g, b, false);
+}
+
+GpuVertexLayout rect_layout() {
+    GpuVertexLayout l = GpuVertexLayout{stride: 28};
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x4, 12);
+    return l;
+}
+
+// A pipeline over a depth_format attachment that leaves the depth alone and
+// tests the stencil with compare, setting it with pass_op where it passes.
+GpuPipelineDesc stencil_desc(*GpuVertexLayout l, WGPUTextureFormat depth_format, WGPUCompareFunction compare, WGPUStencilOperation pass_op) {
+    return GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: WGPUTextureFormat_RGBA8Unorm, layout: l,
+        depth: true, depth_format: depth_format, depth_compare: WGPUCompareFunction_Always, depth_read_only: true,
+        stencil_front: GpuStencilFace{compare: compare, pass: pass_op}};
+}
+
+Result<GpuBuffer, string> upload(*Gpu gpu, List<float>* v) {
+    return gpu.vertices(v.data, (uint64)v.size * 4);
+}
+
+uint8 ch(*uint8 px, int x, int y, int c) {
+    return px[(y * 32 + x) * 4 + c];
+}
+
+bool near(int a, int b) {
+    return a - b <= 1 && b - a <= 1;
+}
+
+// The pixel at (x, y) is (r, g, b) within one unit.
+void expect(string name, *uint8 px, int x, int y, int r, int g, int b) {
+    if (!near(ch(px, x, y, 0), r) || !near(ch(px, x, y, 1), g) || !near(ch(px, x, y, 2), b)) {
+        printf("FAIL %s: pixel (%d, %d) is %d %d %d, want %d %d %d\n", name, x, y,
+            (int)ch(px, x, y, 0), (int)ch(px, x, y, 1), (int)ch(px, x, y, 2), r, g, b);
+        fails++;
+    }
+}
+
+// Compares a 32x32 image with tests/data/render_NAME.rgba.
+void golden(string name, *uint8 px) {
+    let path: char[128];
+    snprintf(&path[0], 128, "tests/data/render_%s.rgba", name);
+    int64 n = 32 * 32 * 4;
+    if (env_get("GPU_UPDATE") != null) {
+        fs_write_all((string)&path[0], px, n);
+        return;
+    }
+    int64 got = 0;
+    *uint8 want = fs_read_all((string)&path[0], &got);
+    if (want == null || got != n) {
+        printf("FAIL %s: cannot read %s\n", name, (string)&path[0]);
+        fails++;
+        if (want != null) free((*void)want);
+        return;
+    }
+    defer free((*void)want);
+    for (i in 0..n) {
+        int d = (int)px[i] - (int)want[i];
+        if (d > 1 || d < -1) {
+            printf("FAIL %s: byte %d of pixel (%d, %d) is %d, golden %d\n", name, (int)(i % 4),
+                (int)(i / 4 % 32), (int)(i / 4 / 32), (int)px[i], (int)want[i]);
+            fails++;
+            return;
+        }
+    }
+}
+
+Result<int, string> read_golden(string name, *GpuTexture t, *uint8 px) {
+    t.read(px)?;
+    golden(name, px);
+    return Ok<int, string>(0);
+}
+
+// Marks a square with a color-mask-off draw (stencil Replace by reference 1),
+// draws red where the stencil equals 1 and blue where it equals 0; then the
+// PICA edge pattern: a draw with no color marks a square with reference 3 and
+// a larger yellow one tested NotEqual 3 leaves only a 2-pixel outline.
+Result<int, string> stencil_mask(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.depth_stencil(32, 32)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    WGPUTextureFormat f = WGPUTextureFormat_Depth24PlusStencil8;
+    GpuPipelineDesc d = stencil_desc(&l, f, WGPUCompareFunction_Always, WGPUStencilOperation_Replace);
+    d.no_color_write = true;
+    GpuPipeline mark = gpu.pipeline(&d)?;
+    defer mark.release();
+    GpuPipelineDesc e = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    GpuPipeline equal = gpu.pipeline(&e)?;
+    defer equal.release();
+    GpuPipelineDesc n = stencil_desc(&l, f, WGPUCompareFunction_NotEqual, WGPUStencilOperation_Keep);
+    GpuPipeline not_equal = gpu.pipeline(&n)?;
+    defer not_equal.release();
+
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 8.0, 8.0, 24.0, 24.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 0.0, 1.0);
+    rect(&v, 6.0, 6.0, 26.0, 26.0, 0.0, 1.0, 1.0, 0.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &z);
+    pass.set_stencil_reference(1);
+    pass.draw_range(&mark, &vb, 0, 6, 0, 1);
+    pass.draw_range(&equal, &vb, 6, 6, 0, 1);
+    pass.set_stencil_reference(0);
+    pass.draw_range(&equal, &vb, 12, 6, 0, 1);
+    pass.end()?;
+    read_golden("stencil_mask", &t, px)?;
+    expect("stencil equal 1 inside the mark", px, 16, 16, 255, 0, 0);
+    expect("stencil equal 0 outside", px, 2, 2, 0, 0, 255);
+    expect("mark edge", px, 8, 8, 255, 0, 0);
+    expect("just outside the mark", px, 7, 7, 0, 0, 255);
+
+    GpuPass edge = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &z);
+    edge.set_stencil_reference(3);
+    edge.draw_range(&mark, &vb, 0, 6, 0, 1);
+    edge.draw_range(&not_equal, &vb, 18, 6, 0, 1);
+    edge.end()?;
+    read_golden("stencil_edge", &t, px)?;
+    expect("outline", px, 6, 6, 255, 255, 0);
+    expect("outline inner pixel", px, 7, 16, 255, 255, 0);
+    expect("no color from the mark", px, 16, 16, 0, 0, 0);
+    expect("outside the outline", px, 26, 26, 0, 0, 0);
+    return Ok<int, string>(0);
+}
+
+// Draws red, green, blue and white where the stencil equals 0xFF, 0, 0xFE
+// and 1, over the whole target.
+void show(*GpuPass pass, *GpuPipeline equal, *GpuBuffer vb, uint32 first) {
+    uint32[4] refs = {0xFF, 0, 0xFE, 1};
+    for (i in 0..4) {
+        pass.set_stencil_reference(refs[i]);
+        pass.draw_range(equal, vb, first + (uint32)i * 6, 6, 0, 1);
+    }
+}
+
+void show_rects(List<float>* v) {
+    rect(v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0);
+    rect(v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 1.0, 0.0);
+    rect(v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 0.0, 1.0);
+    rect(v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 1.0, 1.0);
+}
+
+// A stencil cleared to 0xFF, then one op per quadrant: IncrementClamp stays at
+// 0xFF, IncrementWrap wraps to 0, DecrementClamp makes 0xFE, and Invert then
+// IncrementClamp make 1.
+Result<int, string> stencil_ops(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.depth_stencil(32, 32)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    WGPUTextureFormat f = WGPUTextureFormat_Depth24PlusStencil8;
+    WGPUStencilOperation[5] ops = {WGPUStencilOperation_IncrementClamp, WGPUStencilOperation_IncrementWrap,
+        WGPUStencilOperation_DecrementClamp, WGPUStencilOperation_Invert, WGPUStencilOperation_IncrementClamp};
+    List<GpuPipeline> pipes;
+    defer {
+        for (i in 0..pipes.size) pipes.data[i].release();
+        List_free(&pipes);
+    }
+    for (i in 0..5) {
+        GpuPipelineDesc d = stencil_desc(&l, f, WGPUCompareFunction_Always, ops[i]);
+        d.no_color_write = true;
+        List_push(&pipes, gpu.pipeline(&d)?);
+    }
+    GpuPipelineDesc e = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    GpuPipeline equal = gpu.pipeline(&e)?;
+    defer equal.release();
+
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 16.0, 0.0, 32.0, 16.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 16.0, 16.0, 32.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 16.0, 16.0, 32.0, 32.0, 0.0, 1.0, 1.0, 1.0);
+    show_rects(&v);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, depth: &z, stencil_clear: 0xFF};
+    GpuPass pass = gpu.pass_with(t.view, &o);
+    pass.draw_range(&pipes.data[0], &vb, 0, 6, 0, 1);
+    pass.draw_range(&pipes.data[1], &vb, 6, 6, 0, 1);
+    pass.draw_range(&pipes.data[2], &vb, 12, 6, 0, 1);
+    pass.draw_range(&pipes.data[3], &vb, 18, 6, 0, 1);
+    pass.draw_range(&pipes.data[4], &vb, 18, 6, 0, 1);
+    pass.end()?;
+    // A second pass keeps the stencil (stencil_load) and shows it.
+    GpuPassOptions keep = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, depth: &z, stencil_load: true};
+    GpuPass second = gpu.pass_with(t.view, &keep);
+    show(&second, &equal, &vb, 24);
+    second.end()?;
+    read_golden("stencil_ops", &t, px)?;
+    expect("IncrementClamp at 0xFF", px, 8, 8, 255, 0, 0);
+    expect("IncrementWrap from 0xFF", px, 24, 8, 0, 255, 0);
+    expect("DecrementClamp from 0xFF", px, 8, 24, 0, 0, 255);
+    expect("Invert then IncrementClamp", px, 24, 24, 255, 255, 255);
+    return Ok<int, string>(0);
+}
+
+// A front and a back face state in one pipeline (back-facing triangles Replace
+// with the reference, front-facing ones IncrementClamp), and the masks: a
+// Replace by 0 under write mask 0x0F turns 0xFF into 0xF0, told apart by
+// Equal tests under read masks 0xFF and 0x0F.
+Result<int, string> stencil_faces_masks(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.depth_stencil(32, 32)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    WGPUTextureFormat f = WGPUTextureFormat_Depth24PlusStencil8;
+    GpuPipelineDesc d = stencil_desc(&l, f, WGPUCompareFunction_Always, WGPUStencilOperation_IncrementClamp);
+    d.stencil_back = GpuStencilFace{compare: WGPUCompareFunction_Always, pass: WGPUStencilOperation_Replace};
+    d.no_color_write = true;
+    GpuPipeline faces = gpu.pipeline(&d)?;
+    defer faces.release();
+    GpuPipelineDesc e = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    GpuPipeline equal = gpu.pipeline(&e)?;
+    defer equal.release();
+    GpuPipelineDesc wm = stencil_desc(&l, f, WGPUCompareFunction_Always, WGPUStencilOperation_Replace);
+    wm.stencil_write_mask = 0x0F;
+    wm.no_color_write = true;
+    GpuPipeline masked_write = gpu.pipeline(&wm)?;
+    defer masked_write.release();
+    GpuPipelineDesc rm = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    rm.stencil_read_mask = 0x0F;
+    GpuPipeline masked_read = gpu.pipeline(&rm)?;
+    defer masked_read.release();
+
+    List<float> v;
+    defer List_free(&v);
+    rect_w(&v, 0.0, 0.0, 16.0, 16.0, 0.0, 1.0, 1.0, 1.0, false);
+    rect_w(&v, 16.0, 0.0, 32.0, 16.0, 0.0, 1.0, 1.0, 1.0, true);
+    rect(&v, 0.0, 0.0, 32.0, 16.0, 0.0, 1.0, 0.0, 0.0);
+    rect(&v, 0.0, 0.0, 32.0, 16.0, 0.0, 0.0, 1.0, 0.0);
+    rect(&v, 0.0, 16.0, 16.0, 32.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 16.0, 32.0, 32.0, 0.0, 0.0, 0.0, 1.0);
+    rect(&v, 0.0, 16.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, depth: &z, stencil_clear: 0x0F};
+    GpuPass pass = gpu.pass_with(t.view, &o);
+    pass.set_stencil_reference(5);
+    pass.draw_range(&faces, &vb, 0, 6, 0, 1);
+    pass.draw_range(&faces, &vb, 6, 6, 0, 1);
+    pass.draw_range(&equal, &vb, 12, 6, 0, 1);
+    pass.set_stencil_reference(0x10);
+    pass.draw_range(&equal, &vb, 18, 6, 0, 1);
+    // Bottom half: 0x0F everywhere, Replace by 0xF0 under write mask 0x0F on
+    // the left makes 0x00 there; Equal 0x00 shows blue on the left, and Equal
+    // 0xFF under read mask 0x0F matches only the right (0x0F).
+    pass.set_stencil_reference(0xF0);
+    pass.draw_range(&masked_write, &vb, 24, 6, 0, 1);
+    pass.set_stencil_reference(0);
+    pass.draw_range(&equal, &vb, 30, 6, 0, 1);
+    pass.set_stencil_reference(0xFF);
+    pass.draw_range(&masked_read, &vb, 36, 6, 0, 1);
+    pass.end()?;
+    read_golden("stencil_faces_masks", &t, px)?;
+    expect("back face Replace by 5", px, 8, 8, 255, 0, 0);
+    expect("front face IncrementClamp from 0x0F", px, 24, 8, 0, 255, 0);
+    expect("write mask", px, 8, 24, 0, 0, 255);
+    expect("read mask", px, 24, 24, 255, 0, 0);
+    return Ok<int, string>(0);
+}
+
+// The depth-fail op: a near square writes depth, then a far square with no
+// color sets the stencil to 2 where its depth test fails and increments it
+// (to 1) where it passes. Run with each depth format that has a stencil.
+Result<int, string> stencil_depth(*Gpu gpu, *uint8 px, WGPUTextureFormat f) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture z = gpu.texture(32, 32, f, WGPUTextureUsage_RenderAttachment)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: t.format, layout: &l,
+        depth: true, depth_format: f, no_color_write: true};
+    GpuPipeline near_pipe = gpu.pipeline(&d)?;
+    defer near_pipe.release();
+    d.stencil_front = GpuStencilFace{depth_fail: WGPUStencilOperation_Replace, pass: WGPUStencilOperation_IncrementClamp};
+    GpuPipeline far_pipe = gpu.pipeline(&d)?;
+    defer far_pipe.release();
+    GpuPipelineDesc e = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    GpuPipeline equal = gpu.pipeline(&e)?;
+    defer equal.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 8.0, 8.0, 24.0, 24.0, 0.3, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.7, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 1.0, 0.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &z);
+    pass.set_stencil_reference(2);
+    pass.draw_range(&near_pipe, &vb, 0, 6, 0, 1);
+    pass.draw_range(&far_pipe, &vb, 6, 6, 0, 1);
+    pass.draw_range(&equal, &vb, 12, 6, 0, 1);
+    pass.set_stencil_reference(1);
+    pass.draw_range(&equal, &vb, 18, 6, 0, 1);
+    pass.end()?;
+    read_golden("stencil_depth", &t, px)?;
+    expect("depth fail Replace", px, 16, 16, 255, 0, 0);
+    expect("depth pass IncrementClamp", px, 2, 2, 0, 255, 0);
+    return Ok<int, string>(0);
+}
+
+// A white triangle over black with a slanted edge, drawn 4x and resolved: the
+// pixels away from the edge are exactly white or black, the pixels on it are
+// partly covered, and the total coverage is the triangle's area.
+Result<int, string> msaa(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture ms = gpu.target_msaa(32, 32, WGPUTextureFormat_RGBA8Unorm, 4)?;
+    defer ms.release();
+    check("msaa target sample count", ms.samples == 4 && t.samples == 1);
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: t.format, layout: &l, samples: 4};
+    GpuPipeline pipe = gpu.pipeline(&d)?;
+    defer pipe.release();
+    List<float> v;
+    defer List_free(&v);
+    vertex(&v, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    vertex(&v, 32.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    vertex(&v, 0.0, 20.0, 0.0, 1.0, 1.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, resolve: t.view, discard: true};
+    GpuPass pass = gpu.pass_with(ms.view, &o);
+    pass.draw(&pipe, &vb, 3, 1);
+    pass.end()?;
+    t.read(px)?;
+    // The edge is y = 20 - x * 20 / 32: a pixel is inside when its far corner
+    // (x + 1, y + 1) is below the edge line, outside when its near corner is
+    // on or past it.
+    int partial = 0;
+    int64 total = 0;
+    bool exact = true;
+    for (y in 0..32) {
+        for (x in 0..32) {
+            int c = (int)ch(px, x, y, 0);
+            total += c;
+            if (ch(px, x, y, 1) != c || ch(px, x, y, 2) != c || ch(px, x, y, 3) != 255) exact = false;
+            double far = (double)(y + 1) * 32.0 + (double)(x + 1) * 20.0;
+            double nearc = (double)y * 32.0 + (double)x * 20.0;
+            if (far <= 640.0 && c != 255) exact = false;
+            if (nearc >= 640.0 && c != 0) exact = false;
+            if (c > 0 && c < 255) partial++;
+        }
+    }
+    check("msaa interior and exterior exact, gray and opaque", exact);
+    check("msaa partial coverage along the edge", partial >= 20);
+    double area = (double)total / 255.0;
+    if (env_get("GPU_VERBOSE") != null) printf("msaa: %d partial pixels, coverage %.2f pixels\n", partial, area);
+    if (area < 310.0 || area > 330.0) {
+        printf("FAIL msaa coverage: %.1f pixels, want about 320\n", area);
+        fails++;
+    }
+    return Ok<int, string>(0);
+}
+
+// 4x color and Depth24PlusStencil8 attachments resolved to one target: a near
+// green square, a far red one behind it, and a stencil mark that keeps a blue
+// draw to the bottom strip. Edges are on pixel boundaries, so every sample of
+// a pixel agrees and the image is exact.
+Result<int, string> msaa_depth(*Gpu gpu, *uint8 px) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture ms = gpu.target_msaa(32, 32, WGPUTextureFormat_RGBA8Unorm, 4)?;
+    defer ms.release();
+    GpuTexture z = gpu.target_msaa(32, 32, WGPUTextureFormat_Depth24PlusStencil8, 4)?;
+    defer z.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    WGPUTextureFormat f = WGPUTextureFormat_Depth24PlusStencil8;
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: t.format, layout: &l,
+        depth: true, depth_format: f, samples: 4};
+    GpuPipeline scene = gpu.pipeline(&d)?;
+    defer scene.release();
+    GpuPipelineDesc m = stencil_desc(&l, f, WGPUCompareFunction_Always, WGPUStencilOperation_Replace);
+    m.no_color_write = true;
+    m.samples = 4;
+    GpuPipeline mark = gpu.pipeline(&m)?;
+    defer mark.release();
+    GpuPipelineDesc e = stencil_desc(&l, f, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    e.samples = 4;
+    GpuPipeline equal = gpu.pipeline(&e)?;
+    defer equal.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 4.0, 4.0, 20.0, 20.0, 0.3, 0.0, 1.0, 0.0);
+    rect(&v, 12.0, 12.0, 28.0, 28.0, 0.7, 1.0, 0.0, 0.0);
+    rect(&v, 0.0, 24.0, 32.0, 32.0, 0.0, 1.0, 1.0, 1.0);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 0.0, 0.0, 1.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, depth: &z, resolve: t.view};
+    GpuPass pass = gpu.pass_with(ms.view, &o);
+    pass.draw_range(&scene, &vb, 0, 6, 0, 1);
+    pass.draw_range(&scene, &vb, 6, 6, 0, 1);
+    pass.set_stencil_reference(7);
+    pass.draw_range(&mark, &vb, 12, 6, 0, 1);
+    pass.draw_range(&equal, &vb, 18, 6, 0, 1);
+    pass.end()?;
+    read_golden("msaa_depth", &t, px)?;
+    expect("near square", px, 16, 16, 0, 255, 0);
+    expect("far square behind", px, 22, 22, 255, 0, 0);
+    expect("stencil strip", px, 16, 28, 0, 0, 255);
+    expect("cleared", px, 2, 2, 0, 0, 0);
+    return Ok<int, string>(0);
+}
+
+// Mismatched sample counts and stencil state on a format without a stencil
+// come back as errors, not aborts.
+Result<int, string> errors(*Gpu gpu) {
+    GpuTexture t = gpu.target(32, 32)?;
+    defer t.release();
+    GpuTexture ms = gpu.target_msaa(32, 32, WGPUTextureFormat_RGBA8Unorm, 4)?;
+    defer ms.release();
+    GpuVertexLayout l = rect_layout();
+    defer l.release();
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: flat, vertex: "vs", fragment: "fs", format: t.format, layout: &l, samples: 4};
+    GpuPipeline four = gpu.pipeline(&d)?;
+    defer four.release();
+    d.samples = 0;
+    GpuPipeline one = gpu.pipeline(&d)?;
+    defer one.release();
+    List<float> v;
+    defer List_free(&v);
+    rect(&v, 0.0, 0.0, 32.0, 32.0, 0.0, 1.0, 0.0, 0.0);
+    GpuBuffer vb = upload(gpu, &v)?;
+    defer vb.release();
+
+    GpuPass a = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    a.draw(&four, &vb, 6, 1);
+    Result<int, string> r = a.end();
+    check("a 4x pipeline on a 1x target fails at end()", !r.ok);
+    if (env_get("GPU_VERBOSE") != null && !r.ok) printf("4x on 1x: %s\n", r.error);
+
+    GpuPassOptions o = GpuPassOptions{resolve: t.view};
+    GpuPass b = gpu.pass_with(ms.view, &o);
+    b.draw(&one, &vb, 6, 1);
+    r = b.end();
+    check("a 1x pipeline on a 4x target fails at end()", !r.ok);
+
+    GpuPassOptions bad = GpuPassOptions{resolve: ms.view};
+    GpuPass c = gpu.pass_with(t.view, &bad);
+    r = c.end();
+    check("a resolve from a 1x target fails at end()", !r.ok);
+
+    r = ms.read(null);
+    check("a multisampled target cannot be read back", !r.ok);
+
+    GpuPipelineDesc s = stencil_desc(&l, WGPUTextureFormat_Depth24Plus, WGPUCompareFunction_Equal, WGPUStencilOperation_Keep);
+    Result<GpuPipeline, string> p = gpu.pipeline(&s);
+    check("stencil state without a stencil format fails", !p.ok);
+    if (p.ok) p.value.release();
+    return Ok<int, string>(0);
+}
+
+void run_case(string name, Result<int, string> r) {
+    if (!r.ok) {
+        printf("FAIL %s: %s\n", name, r.error);
+        fails++;
+    }
+}
+
+int main() {
+    Result<Gpu, string> opened = gpu_open();
+    if (!opened.ok) {
+        printf("error: %s\n", opened.error);
+        return 1;
+    }
+    Gpu gpu = opened.value;
+    defer gpu.release();
+    *uint8 px = alloc<uint8>(32 * 32 * 4);
+    defer free(px);
+    run_case("stencil_mask", stencil_mask(&gpu, px));
+    run_case("stencil_ops", stencil_ops(&gpu, px));
+    run_case("stencil_faces_masks", stencil_faces_masks(&gpu, px));
+    run_case("stencil_depth", stencil_depth(&gpu, px, WGPUTextureFormat_Depth24PlusStencil8));
+    if (gpu.depth32_stencil8) run_case("stencil_depth Depth32FloatStencil8", stencil_depth(&gpu, px, WGPUTextureFormat_Depth32FloatStencil8));
+    else printf("skip Depth32FloatStencil8: not on this device\n");
+    run_case("msaa", msaa(&gpu, px));
+    run_case("msaa_depth", msaa_depth(&gpu, px));
+    run_case("errors", errors(&gpu));
+    printf("render stencil: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}
