@@ -2,6 +2,8 @@
 
 The rendering API of `<gpu/render>` (also in `<gpu>`), past the first triangle in the [README](../README.md#rendering). Every call that can fail returns a `Result` with the WebGPU validation message.
 
+API reference: [`<gpu/render>`](api.md#gpurender), [`<gpu/core>`](api.md#gpucore), [`<gpu/async>`](api.md#gpuasync).
+
 ## Textures and samplers
 
 Textures come from pixels or files. `<gpu/image>` decodes PNG and JPEG, and

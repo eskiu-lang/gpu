@@ -7,6 +7,8 @@ exactly as before. The short example is in the [README](../README.md#models); th
 lower-level pieces (depth textures, comparison samplers, depth-only pipelines) are in
 [rendering.md](rendering.md#shadow-maps).
 
+API reference: [`<gpu/model>`](api.md#gpumodel).
+
 ```eskiu
 GpuShadowOptions so = GpuShadowOptions{size: 2048};
 model.enable_shadows(&so)?;            // null for the defaults

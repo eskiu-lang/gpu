@@ -5,6 +5,8 @@ pixels as stored and reject images of more than `IMAGE_MAX_PIXELS` pixels; the `
 variants take `ImageOptions` to change the limit and to turn photos upright by their EXIF
 orientation. Texture uploads are in [rendering.md](rendering.md#textures-and-samplers).
 
+API reference: [`<gpu/image>`](api.md#gpuimage), [`<gpu/hdr>`](api.md#gpuhdr), [`<gpu/ktx2>`](api.md#gpuktx2).
+
 ```eskiu
 ImageOptions o = ImageOptions{orient: true, max_pixels: 64 * 1024 * 1024};
 Bitmap photo = image_load_with("IMG_0042.jpg", &o)?;   // upright, at most 64 Mpixel

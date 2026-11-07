@@ -2,6 +2,8 @@
 
 Rendering into an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app with `<gpu/ui>`, and reading touches. The platform table is in the [README](../README.md#platforms).
 
+API reference: [`<gpu/ui>`](api.md#gpuui), [`<gpu/touch>`](api.md#gputouch).
+
 ## A game loop
 
 A game holds its `Gpu` and `GpuSurface` while the surface lives and draws once per display

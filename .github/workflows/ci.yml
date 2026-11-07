@@ -25,6 +25,8 @@ jobs:
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
       - name: Tests
         run: eskiuc test
+      - name: API reference is current
+        run: python3 -I tools/gen_api.py --check
 
   macos:
     runs-on: macos-15

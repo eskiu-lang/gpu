@@ -272,6 +272,8 @@ Each object has a `release()` to pair with `defer`. The handles inside the `Gpu*
 the `<gpu/raw>` ones, so a program can drop down to the C API for anything the idiomatic
 layer does not cover.
 
+Every public function and type, with its documentation, is in the [API reference](docs/api.md).
+
 ## Contributing
 
 Bug reports are welcome; please include the program, the `eskiuc --version` output and the

@@ -2,6 +2,8 @@
 
 `<gpu/gltf>`, `<gpu/obj>` and `<gpu/model>`: loading glTF 2.0 and OBJ files and drawing them. The short example is in the [README](../README.md#models).
 
+API reference: [`<gpu/gltf>`](api.md#gpugltf), [`<gpu/obj>`](api.md#gpuobj), [`<gpu/model>`](api.md#gpumodel).
+
 The loader reads meshes (every attribute type, sparse accessors, strips and fans), PBR
 materials with their textures and samplers, the node hierarchy, skins and animations
 (linear, step and cubic spline), from `.glb` files or `.gltf` files with external or

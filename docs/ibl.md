@@ -4,6 +4,8 @@
 uses it in place of its hemisphere ambient term. The short example is in the
 [README](../README.md#models).
 
+API reference: [`<gpu/ibl>`](api.md#gpuibl), [`<gpu/hdr>`](api.md#gpuhdr).
+
 ```eskiu
 import <gpu/ibl>;
 

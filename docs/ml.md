@@ -2,6 +2,8 @@
 
 `<gpu/nn>` (inference) and `<gpu/train>` (training). Llama 2 numbers are in the [README](../README.md#machine-learning).
 
+API reference: [`<gpu/nn>`](api.md#gpunn), [`<gpu/train>`](api.md#gputrain), [`<gpu/gguf>`](api.md#gpugguf), [`<gpu/safetensors>`](api.md#gpusafetensors).
+
 ## Training
 
 [`examples/mnist.esk`](examples/mnist.esk) trains a two-layer network on MNIST with

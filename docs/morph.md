@@ -2,6 +2,8 @@
 
 glTF morph targets (blend shapes) in `<gpu/gltf>` and `<gpu/model>`. The short example is in the [README](../README.md#models).
 
+API reference: [`<gpu/gltf>`](api.md#gpugltf), [`<gpu/model>`](api.md#gpumodel).
+
 ```eskiu
 Gltf data = gltf_load("face.glb")?;
 GpuModel model = gpu.model(&data, surface.format)?;
