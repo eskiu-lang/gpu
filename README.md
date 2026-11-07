@@ -29,15 +29,17 @@ WGSL.
 - **Compute.** Storage buffers, kernels and dispatches, with results read back into
   Eskiu memory.
 - **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
-  render pipelines and passes, to an offscreen texture or a window.
+  render pipelines and passes, to an offscreen texture or a window; several render targets,
+  stencil, multisampling, cube and array targets, and shadow maps.
 - **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
   OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
   based shading, normal maps, alpha modes, skinning and animation.
 - **Machine learning.** `<gpu/nn>` runs transformer inference (Llama 2 7B at 45 tokens per
   second on an M4 Pro, from GGUF, safetensors or llama2.c files) and `<gpu/train>` trains
   networks with automatic differentiation and Adam.
-- **Images.** `<gpu/image>` decodes PNG and JPEG (baseline and progressive) in pure Eskiu;
-  textures can be sRGB and mipmapped.
+- **Images.** `<gpu/image>` decodes PNG, JPEG (baseline and progressive) and Radiance `.hdr`
+  in pure Eskiu, and `<gpu/ktx2>` reads KTX2 files; textures can be sRGB, mipmapped (on the
+  GPU too), layered, cube maps and BC, ETC2 or ASTC compressed.
 - **Windows, mobile views and input.** `<gpu/window>` opens a desktop window over SDL3 and
   gives its surface and keyboard/mouse events; `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer`
   on iOS, `SurfaceView` on Android) inside an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app.
@@ -208,6 +210,8 @@ The rest of `GpuPipelineDesc`:
 | `stencil_front`, `stencil_back` | Always, Keep (back is front) | a `GpuStencilFace` |
 | `stencil_read_mask`, `stencil_write_mask` | 0xFF | any 8-bit mask |
 | `samples` | 1 | 4 (with `gpu.target_msaa` attachments) |
+| `targets`, `target_count` | the one `format` | up to 8 `GpuColorTarget{format, blend_mode, blend_state, no_color_write}` (see below) |
+| `fragment` | (required for color) | null for a depth-only pipeline with no color target (a shadow map) |
 
 ### Stencil and multisampling
 
@@ -254,6 +258,141 @@ Every pipeline in the pass needs the attachments' sample count (`end()` returns 
 otherwise). `discard` drops the multisampled pixels once resolved, which saves memory traffic
 on phones. A multisampled texture cannot be sampled or read back: read the resolve target.
 
+### Several render targets
+
+A pipeline with `targets` writes `@location(0)` to `@location(7)` of its fragment shader into
+as many color targets, each with its own format and blending (at most 32 bytes per pixel in
+all, so four RGBA16Float targets fit). The pass lists its attachments in
+`GpuPassOptions.colors`, each with its own clear, `load`, `resolve` and `discard`, and takes a
+null target:
+
+```eskiu
+GpuColorTarget[3] targets = {GpuColorTarget{format: WGPUTextureFormat_RGBA16Float},
+    GpuColorTarget{format: WGPUTextureFormat_RGBA16Float, blend_mode: GPU_BLEND_ADDITIVE},
+    GpuColorTarget{format: WGPUTextureFormat_R32Float}};
+GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", layout: &l,
+    targets: &targets[0], target_count: 3, depth: true};
+GpuPipeline scene = gpu.pipeline(&d)?;
+GpuColorAttachment[3] colors = {GpuColorAttachment{view: color.view}, GpuColorAttachment{view: bloom.view},
+    GpuColorAttachment{view: mask.view, clear: GpuColor{1.0, 0.0, 0.0, 0.0}}};
+GpuPassOptions o = GpuPassOptions{colors: &colors[0], color_count: 3, depth: &depth};
+GpuPass pass = gpu.pass_with(null, &o);
+```
+
+A pipeline whose targets differ from the pass's attachments (in number, order or format) makes
+`end()` (or the encoder's `submit()`) return an `Err` naming both lists; more than 8 targets or
+attachments are an `Err` too.
+
+### Layers, cube maps and mip levels
+
+`gpu.texture_with(&desc)` makes any 2D texture: `GpuTextureDesc` has the size, `format`
+(RGBA8Unorm when 0), `layers` (a 2D array; `array: true` for one with a single layer),
+`cube` (six square faces, +X, -X, +Y, -Y, +Z, -Z; a multiple of six layers is a cube array),
+`mips` or `mipmaps` (the full chain), `usage` (by default sampled, copyable and, for formats
+that can be, a render target), `samples` and `view_formats`. The texture's `view` covers all of
+it, so it binds as a `texture_2d_array` or `texture_cube`, and `GpuBindLayout_texture` takes
+the view dimension after the sample type:
+
+```eskiu
+GpuTextureDesc env_desc = GpuTextureDesc{width: 256, height: 256, format: WGPUTextureFormat_RGBA16Float,
+    cube: true, mipmaps: true};
+GpuTexture env = gpu.texture_with(&env_desc)?;
+for (face in 0..6) {
+    GpuTextureView v = env.view_level(face, 0)?;   // a 2D render target of one face, level 0
+    GpuPass pass = gpu.pass(v.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    // ...draw the sky seen through this face
+    pass.end()?;
+    v.release();
+}
+env.generate_mips()?;
+layout.texture(0, WGPUShaderStage_Fragment, WGPUTextureSampleType_Float, WGPUTextureViewDimension_Cube);
+```
+
+`view_level(layer, mip)` is one layer (or face) and one mip level; `view_with(&GpuViewDesc)`
+picks any range of levels and layers, a dimension, a format and an aspect; a `GpuTextureView`
+binds with `group.view(binding, &v)` (or `pipe.bind_view`) and renders through `v.view`.
+`write_level(layer, mip, data)` uploads one level of one layer and `read_level(layer, mip, out)`
+reads one back.
+
+`generate_mips()` fills levels 1 and up of every layer from level 0 on the GPU (WebGPU has no
+mipmap call: it is a render pass per level with a small built-in shader), each texel the
+average of the 2x2 texels under it, in linear light for sRGB formats. It works on any
+renderable float or normalized format (RGBA8, BGRA8, their sRGB forms, RGBA16Float,
+RGBA32Float...) of a texture with render-target and sampled usage, so it can follow
+rendering, such as an environment cube drawn each frame. `Gpu_image_with`'s `mipmaps` still
+filters on the CPU.
+
+### Shadow maps
+
+A depth texture can be sampled: `gpu.depth_texture(w, h, format, layers)` (Depth32Float when
+`format` is 0) is a render attachment that binds as `texture_depth_2d`, or
+`texture_depth_2d_array` with several layers, with sample type `WGPUTextureSampleType_Depth`.
+A pipeline with a null `fragment` writes only depth, in a pass with a null target and
+`GpuPassOptions.depth` (or `depth_view`, one layer of an array). A sampler with
+`GpuSamplerOptions.compare` set (bound as `WGPUSamplerBindingType_Comparison`) makes
+`textureSampleCompare` return 1 where the comparison passes and 0 elsewhere, and with linear
+filtering the fraction of the 2x2 texels that pass (percentage-closer filtering):
+
+```eskiu
+GpuTexture shadows = gpu.depth_texture(1024, 1024, 0, 4)?;   // four lights
+GpuPipelineDesc sd = GpuPipelineDesc{wgsl: caster, vertex: "vs", fragment: null, layout: &l,
+    depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_bias: 2, depth_bias_slope: 2.0};
+GpuTextureView light0 = shadows.view_level(0, 0)?;
+GpuPassOptions o = GpuPassOptions{depth_view: &light0};
+GpuPass pass = gpu.pass_with(null, &o);
+// ...draw the casters from the light
+GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+    compare: WGPUCompareFunction_LessEqual};
+layout.texture(2, WGPUShaderStage_Fragment, WGPUTextureSampleType_Depth, WGPUTextureViewDimension_2DArray);
+layout.sampler(3, WGPUShaderStage_Fragment, WGPUSamplerBindingType_Comparison);
+```
+
+### Compressed textures, KTX2 and HDR images
+
+`gpu_open` turns on what the adapter offers and says so in `Gpu`: `bc` (BC1 to BC7, on
+desktop GPUs and Apple Silicon Macs), `etc2` and `astc` (ETC2/EAC and ASTC, on phones and Apple
+Silicon), and `float32_filterable` (linear filtering of R32Float, RG32Float and RGBA32Float).
+A texture in a compressed format comes from `texture_with` (its size a multiple of the block
+size) and `write_level`, whose data is rows of blocks; a level smaller than a block still
+takes one whole block. Making one without the device feature is an `Err`.
+
+`<gpu/ktx2>` reads KTX 2.0 files (`ktx2_load`, `ktx2_decode`): 2D textures, arrays and cube
+maps with their mip levels, in the BC, ETC2/EAC and ASTC formats and the uncompressed ones
+WebGPU samples (RGBA8 and sRGB, BGRA8, R8, RG8, the 16- and 32-bit floats, RGB10A2,
+RG11B10 and RGB9E5). `gpu.ktx2(&file)` uploads it; a file that asks for its mip levels to be
+made gets them from `generate_mips`. Basis Universal data (ETC1S or UASTC, which need
+transcoding) and zstd or zlib supercompression are not supported: such files return an `Err`.
+
+```eskiu
+Ktx2 k = ktx2_load("ground.ktx2")?;
+defer k.free();
+GpuTexture ground = gpu.ktx2(&k)?;
+```
+
+`<gpu/image>` also decodes Radiance `.hdr` files (`hdr_load`, `hdr_decode`, flat or
+run-length encoded RGBE) to an `HdrBitmap` of RGBA floats; `to_half` converts it for an
+RGBA16Float texture (`image_f16` converts one value):
+
+```eskiu
+HdrBitmap sky = hdr_load("sky.hdr")?;
+defer sky.free();
+*uint16 half = alloc<uint16>((int)(sky.width * sky.height * 4));
+sky.to_half(half);
+GpuTextureDesc d = GpuTextureDesc{width: sky.width, height: sky.height, format: WGPUTextureFormat_RGBA16Float};
+GpuTexture env = gpu.texture_with(&d)?;
+env.write_level(0, 0, half)?;
+```
+
+### sRGB and linear views
+
+A texture made with `view_formats` (the sRGB or linear twin of its format, from
+`gpu_srgb_format` and `gpu_linear_format`) can be seen through either: `view_as(format)` gives
+the other view. Through an sRGB view, sampling converts to linear light and drawing converts
+back; through the linear one the bytes are taken as they are. A surface does the same with
+`surface.configure_with(w, h, gpu_srgb_format(surface.format))`: each `GpuFrame` then has
+`alt_view` besides `view`, so a frame can draw a scene in sRGB and an interface in linear
+values. (Metal supports surface view formats; Vulkan needs `VK_KHR_swapchain_mutable_format`.)
+
 ### Instances, ranges, viewport and scissor
 
 Per-instance data goes in a second vertex buffer, set with `pass.set_vertices(1, &instances)`;
@@ -282,7 +421,10 @@ buffer of a skin's joint matrices (`array<mat4x4<f32>>`, joint j at byte j * 64)
 `joints.buffer` like any buffer.
 
 [`tests/render_api.esk`](tests/render_api.esk) draws each of these into a small image and
-compares it with `tests/data/render_*.rgba`.
+compares it with `tests/data/render_*.rgba`; [`tests/render_targets.esk`](tests/render_targets.esk)
+covers several targets, layers, cube maps, mip levels and shadow maps, and
+[`tests/texture_formats.esk`](tests/texture_formats.esk) KTX2, compressed formats and `.hdr`
+files, from fixtures it writes itself.
 
 **Upgrading from 0.3.** The bind group that `pipe.bind()`, `bind_texture()` and
 `bind_sampler()` make now belongs to the pipeline: it is made at the first draw after a
@@ -376,7 +518,7 @@ g.adam(0.001);       // and the optimizer step
 | WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | not yet |
 | `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | no |
 | `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
-| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
+| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
 
 On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
 `gpu_ui_surface(&gpu)`) or directly into a `CAMetalLayer` (`gpu.surface_metal(layer)`) or
@@ -481,11 +623,12 @@ window, as in `eskiuc build -L/opt/homebrew/lib`.
 |---|---|
 | `<gpu>` | `<gpu/core>` and `<gpu/render>` together |
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
-| `<gpu/render>` | `GpuTexture`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
+| `<gpu/render>` | `GpuTexture` (`Gpu_texture_with`: layers, cube maps, mip levels, view formats; `generate_mips`), `GpuTextureView`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window and mobile surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`) |
 | `<gpu/window>` | `window_open`, `Window` input events and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
 | `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-lang/ui` apps on iOS and Android |
 | `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
-| `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8 |
+| `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8; `hdr_load`, `hdr_decode`: Radiance `.hdr` to floats (`HdrBitmap`) |
+| `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2` |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
 | `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight`, `GpuJoints` (joint matrices for your own skinning shader) |

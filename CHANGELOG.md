@@ -20,6 +20,33 @@ All notable changes to this package are documented in this file. The format is b
   handler to read. Android sends every pointer of a `MotionEvent`, iOS enables
   `multipleTouchEnabled`. Controls over the view keep their own touches.
 - `<gpu/touch>`: `GpuTouch`, `GpuTouches` and the touch payload parser, without `<ui>`.
+- Several render targets: `GpuColorTarget` and `GpuPipelineDesc.targets`/`target_count` (a
+  format and blending per target, up to 8); `GpuColorAttachment` and
+  `GpuPassOptions.colors`/`color_count` (clear, load, resolve and discard per attachment). A
+  pipeline that disagrees with the pass's attachments is an `Err` from `end()` or `submit()`.
+- Layered textures: `GpuTextureDesc` and `Gpu_texture_with` (2D arrays, cube maps and cube
+  arrays, mip levels, usage, view formats); `GpuTexture.layers`, `dimension` and `usage`;
+  `GpuTextureView` from `GpuTexture_view_level` (one layer or face and mip level, to render
+  into), `view_with` (`GpuViewDesc`) and `view_as`; `GpuBindGroup_view` and
+  `GpuPipeline_bind_view`; `GpuTexture_write_level` and `read_level`; `gpu_mip_count`.
+  `GpuBindLayout_texture` takes an optional view dimension (2D, 2DArray, Cube).
+- `GpuTexture_generate_mips`: mip levels made on the GPU (a render pass per level and layer,
+  box filter, linear light for sRGB) for 2D, array and cube textures in renderable float and
+  normalized formats.
+- Shadow maps: `GpuSamplerOptions.compare` (comparison samplers, PCF with linear filtering),
+  `Gpu_depth_texture` (sampled as `texture_depth_2d` or `texture_depth_2d_array`),
+  depth-only pipelines (a null `GpuPipelineDesc.fragment`), passes with no color attachment
+  (a null target), and `GpuPassOptions.depth_view` for one layer of a depth array.
+- Device features: `gpu_open` turns on `float32-filterable`, `texture-compression-bc`, `-etc2`
+  and `-astc` when the adapter has them (`Gpu.float32_filterable`, `bc`, `etc2`, `astc`);
+  block-compressed textures are made with `Gpu_texture_with` and filled with `write_level`.
+- `<gpu/ktx2>`: `ktx2_load`, `ktx2_decode` and `Ktx2` (2D, array and cube KTX2 files with mip
+  levels, BC, ETC2/EAC, ASTC and uncompressed formats; Basis Universal and supercompressed
+  files are rejected), uploaded by `Gpu_ktx2`; `gpu_vk_format`.
+- Radiance `.hdr` decoding in `<gpu/image>`: `hdr_load`, `hdr_decode`, `HdrBitmap`
+  (`to_half` for RGBA16Float) and `image_f16`.
+- sRGB and linear views: `gpu_srgb_format`, `gpu_linear_format`, texture `view_formats` with
+  `view_as`, and `GpuSurface_configure_with` (a surface view format) with `GpuFrame.alt_view`.
 
 ### Fixed
 
