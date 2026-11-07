@@ -340,6 +340,10 @@ String _nn_src;
 string _nn_wgsl(string head, string body) {
     String_clear(&_nn_src);
     String_append(&_nn_src, head);
+#ifdef __EMSCRIPTEN__
+    // A browser's WGSL wants the extension named; wgpu-native takes subgroup calls without it.
+    if (strstr(body, "subgroup") != null) String_append(&_nn_src, "enable subgroups;\n");
+#endif
     String_append(&_nn_src, _NN_HEAD);
     *char at = strstr(body, "fn main(");
     *char open = at != null ? strstr((string)at, ") {\n") : null;

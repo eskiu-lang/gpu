@@ -12,6 +12,9 @@
 //         }
 //         ...
 //     }
+//
+// In a browser (wasm32-unknown-emscripten) the window is the page's canvas with id
+// "canvas": the same program builds for both, and the events come from the page.
 
 import <mem>;
 import <string>;
@@ -24,6 +27,23 @@ import <gpu/render>;
 #error "gpu/window: SDL3 desktop windows run on macOS, Linux and Windows; on iOS and Android use <gpu/ui> or Gpu_surface_metal / Gpu_surface_android"
 #endif
 
+#ifdef __EMSCRIPTEN__
+extern void emscripten_set_window_title(string title);
+extern double emscripten_get_now();
+extern double emscripten_get_device_pixel_ratio();
+extern int emscripten_set_canvas_element_size(string target, int width, int height);
+extern int emscripten_get_canvas_element_size(string target, *int width, *int height);
+extern int emscripten_set_element_css_size(string target, double width, double height);
+extern int emscripten_get_element_css_size(string target, *double width, *double height);
+extern int emscripten_set_keydown_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_keyup_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_mousedown_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_mouseup_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_mousemove_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_wheel_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern int emscripten_set_resize_callback_on_thread(string target, *void user_data, bool capture, *void callback, *void thread);
+extern void emscripten_html5_remove_all_event_listeners();
+#else
 #pragma link("SDL3")
 
 extern bool SDL_Init(uint32 flags);
@@ -47,6 +67,7 @@ const uint32 _SDL_INIT_VIDEO = 0x20;
 const uint64 _SDL_WINDOW_RESIZABLE = 0x20;
 const uint64 _SDL_WINDOW_HIGH_PIXEL_DENSITY = 0x2000;
 const uint64 _SDL_WINDOW_METAL = 0x20000000;
+#endif
 
 // Event kinds (WindowEvent.kind): none, the user closed the window, the drawable size
 // changed, a key went down or up, the mouse moved, a mouse button went down or up, and the
@@ -70,7 +91,7 @@ const int KEY_DOWN = 1073741905;
 const int KEY_UP = 1073741906;
 
 // A desktop window: sdl is the SDL_Window and metal its Metal view on macOS (null
-// elsewhere).
+// elsewhere). In a browser both are null and the window is the canvas with id "canvas".
 struct Window {
     *void sdl;
     *void metal;
@@ -79,7 +100,8 @@ struct Window {
 // One input event. key and repeat are set for key events, button for mouse
 // buttons (1 left, 2 middle, 3 right), x and y for mouse events (pixels) and
 // the wheel (scroll amounts), dx and dy for mouse motion, width and height
-// (pixels) for WINDOW_RESIZE.
+// (pixels) for WINDOW_RESIZE. In a browser, a key that is neither printable nor
+// a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT never comes.
 struct WindowEvent {
     int kind;
     int key;
@@ -93,10 +115,114 @@ struct WindowEvent {
     uint32 height;
 }
 
+#ifdef __EMSCRIPTEN__
+string _win_canvas = "#canvas";
+List<WindowEvent> _win_events;
+uint64 _win_next;
+
+void _win_push(WindowEvent ev) {
+    List_push(&_win_events, ev);
+}
+
+float _win_dpr() {
+    double r = emscripten_get_device_pixel_ratio();
+    return (float)(r > 0.0 ? r : 1.0);
+}
+
+// Gives the canvas a backing store of its CSS size times the pixel ratio; a
+// WINDOW_RESIZE when that changes the size.
+void _win_fit(bool notify) {
+    double cw = 0.0;
+    double ch = 0.0;
+    emscripten_get_element_css_size(_win_canvas, &cw, &ch);
+    float dpr = _win_dpr();
+    int w = (int)(cw * (double)dpr + 0.5);
+    int h = (int)(ch * (double)dpr + 0.5);
+    if (w <= 0 || h <= 0) return;
+    int ow = 0;
+    int oh = 0;
+    emscripten_get_canvas_element_size(_win_canvas, &ow, &oh);
+    if (w == ow && h == oh) return;
+    emscripten_set_canvas_element_size(_win_canvas, w, h);
+    if (notify) _win_push(WindowEvent{kind: WINDOW_RESIZE, width: (uint32)w, height: (uint32)h});
+}
+
+int _win_key_code(*uint8 e) {
+    string key = (string)(e + 32);
+    int n = (int)strlen(key);
+    if (n == 1 && e[32] < 128) {
+        int c = (int)e[32];
+        if (c >= 65 && c <= 90) c = c + 32;
+        return c;
+    }
+    if (strcmp(key, "Escape") == 0) return KEY_ESCAPE;
+    if (strcmp(key, "Enter") == 0) return KEY_RETURN;
+    if (strcmp(key, "ArrowRight") == 0) return KEY_RIGHT;
+    if (strcmp(key, "ArrowLeft") == 0) return KEY_LEFT;
+    if (strcmp(key, "ArrowDown") == 0) return KEY_DOWN;
+    if (strcmp(key, "ArrowUp") == 0) return KEY_UP;
+    if (strcmp(key, "Backspace") == 0) return 8;
+    if (strcmp(key, "Tab") == 0) return 9;
+    if (strcmp(key, "Delete") == 0) return 127;
+    return 0x40000000 | *(*int)(e + 24);
+}
+
+bool _win_on_key(int kind, *uint8 e, *void u) {
+    _win_push(WindowEvent{kind: kind == 2 ? WINDOW_KEY_DOWN : WINDOW_KEY_UP, key: _win_key_code(e), repeat: e[16] != 0});
+    return false;
+}
+
+bool _win_on_mouse(int kind, *uint8 e, *void u) {
+    float dpr = _win_dpr();
+    WindowEvent ev = WindowEvent{x: (float)*(*int)(e + 40) * dpr, y: (float)*(*int)(e + 44) * dpr};
+    if (kind == 8) {
+        ev.kind = WINDOW_MOUSE_MOVE;
+        ev.dx = (float)*(*int)(e + 32) * dpr;
+        ev.dy = (float)*(*int)(e + 36) * dpr;
+    } else {
+        ev.kind = kind == 5 ? WINDOW_MOUSE_DOWN : WINDOW_MOUSE_UP;
+        ev.button = (int)*(*uint16)(e + 28) + 1;
+    }
+    _win_push(ev);
+    return false;
+}
+
+bool _win_on_wheel(int kind, *uint8 e, *void u) {
+    double dx = *(*double)(e + 64);
+    double dy = *(*double)(e + 72);
+    uint32 mode = *(*uint32)(e + 88);
+    double unit = mode == 0 ? 100.0 : (mode == 1 ? 3.0 : 1.0);
+    _win_push(WindowEvent{kind: WINDOW_WHEEL, x: (float)(dx / unit), y: (float)(-dy / unit)});
+    return true;
+}
+
+bool _win_on_resize(int kind, *void e, *void u) {
+    _win_fit(true);
+    return false;
+}
+#endif
+
 // Opens a resizable, high-density window of width x height points (the drawable size in
 // pixels may be larger: Window_size). It starts SDL's video system first. Fails with SDL's
-// error message.
+// error message. In a browser it sets the page title and the canvas's CSS size to width x
+// height (0 x 0 keeps the size the page gives it) and listens to the page's events.
 Result<Window, string> window_open(string title, int width, int height) {
+#ifdef __EMSCRIPTEN__
+    Window web;
+    emscripten_set_window_title(title);
+    if (width > 0 && height > 0) emscripten_set_element_css_size(_win_canvas, (double)width, (double)height);
+    _win_fit(false);
+    *void thread = (*void)(uint64)2;
+    string page = (string)(*void)(uint64)2;
+    emscripten_set_keydown_callback_on_thread(page, null, false, (*void)_win_on_key, thread);
+    emscripten_set_keyup_callback_on_thread(page, null, false, (*void)_win_on_key, thread);
+    emscripten_set_mousedown_callback_on_thread(_win_canvas, null, false, (*void)_win_on_mouse, thread);
+    emscripten_set_mouseup_callback_on_thread(page, null, false, (*void)_win_on_mouse, thread);
+    emscripten_set_mousemove_callback_on_thread(_win_canvas, null, false, (*void)_win_on_mouse, thread);
+    emscripten_set_wheel_callback_on_thread(_win_canvas, null, false, (*void)_win_on_wheel, thread);
+    emscripten_set_resize_callback_on_thread(page, null, false, (*void)_win_on_resize, thread);
+    return Ok<Window, string>(web);
+#else
     if (!SDL_Init(_SDL_INIT_VIDEO)) return Err<Window, string>(SDL_GetError());
     uint64 flags = _SDL_WINDOW_RESIZABLE | _SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef __APPLE__
@@ -109,21 +235,33 @@ Result<Window, string> window_open(string title, int width, int height) {
     w.metal = SDL_Metal_CreateView(w.sdl);
 #endif
     return Ok<Window, string>(w);
+#endif
 }
 
 // Destroys the window and shuts SDL down, so a program has one window at a time. Release
-// the window's GpuSurface first.
+// the window's GpuSurface first. In a browser it removes the page's event listeners set
+// through Emscripten's html5 API.
 void Window_release(*Window self) {
+#ifdef __EMSCRIPTEN__
+    emscripten_html5_remove_all_event_listeners();
+    List_free(&_win_events);
+    _win_next = 0;
+#else
     if (self.metal != null) SDL_Metal_DestroyView(self.metal);
     if (self.sdl != null) SDL_DestroyWindow(self.sdl);
     self.metal = null;
     self.sdl = null;
     SDL_Quit();
+#endif
 }
 
 // Sets the title shown in the window's title bar (UTF-8).
 void Window_set_title(*Window self, string title) {
+#ifdef __EMSCRIPTEN__
+    emscripten_set_window_title(title);
+#else
     SDL_SetWindowTitle(self.sdl, title);
+#endif
 }
 
 // The drawable size in pixels (larger than the window's size in points on a
@@ -131,14 +269,22 @@ void Window_set_title(*Window self, string title) {
 void Window_size(*Window self, *uint32 width, *uint32 height) {
     int w = 0;
     int h = 0;
+#ifdef __EMSCRIPTEN__
+    emscripten_get_canvas_element_size(_win_canvas, &w, &h);
+#else
     SDL_GetWindowSizeInPixels(self.sdl, &w, &h);
+#endif
     *width = (uint32)w;
     *height = (uint32)h;
 }
 
 // Milliseconds since the window system started.
 uint64 window_ticks() {
+#ifdef __EMSCRIPTEN__
+    return (uint64)emscripten_get_now();
+#else
     return SDL_GetTicks();
+#endif
 }
 
 float _win_f32(*uint8 e, int off) {
@@ -152,6 +298,16 @@ int _win_i32(*uint8 e, int off) {
 // Takes the next pending event into ev; false when there is none. Events the
 // layer does not describe are skipped.
 bool Window_poll(*Window self, *WindowEvent ev) {
+#ifdef __EMSCRIPTEN__
+    if (_win_next < (uint64)_win_events.size) {
+        *ev = _win_events.data[_win_next];
+        _win_next++;
+        return true;
+    }
+    List_clear(&_win_events);
+    _win_next = 0;
+    return false;
+#else
     uint64[16] raw;
     *uint8 e = (*uint8)&raw;
     while (SDL_PollEvent(e)) {
@@ -188,12 +344,15 @@ bool Window_poll(*Window self, *WindowEvent ev) {
         return true;
     }
     return false;
+#endif
 }
 
 // A GPU surface over the window, configured to its current size.
 Result<GpuSurface, string> Window_surface(*Window self, *Gpu gpu) {
     Result<GpuSurface, string> r;
-#ifdef __APPLE__
+#ifdef __EMSCRIPTEN__
+    r = Gpu_surface_canvas(gpu, _win_canvas);
+#elif defined(__APPLE__)
     r = Gpu_surface_metal(gpu, SDL_Metal_GetLayer(self.metal));
 #elif defined(_WIN32)
     uint32 props = SDL_GetWindowProperties(self.sdl);

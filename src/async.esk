@@ -1,6 +1,7 @@
 // async.esk: waiting for the GPU from async code. The device is polled from
 // the event loop every millisecond until the work is done, so other tasks run
-// meanwhile.
+// meanwhile. In a browser each poll also lets the browser run for a moment, since
+// the callbacks come from its event loop.
 //
 //     int r = await gpu.wait_async(lp);
 //     Result<int, string> got = await v.read_async(lp, out, bytes);
@@ -14,16 +15,14 @@ import <eventloop>;
 import <gpu/raw>;
 import <gpu/core>;
 
-void _gpu_on_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, *void u1, *void u2) {
-    *_GpuWait w = (*_GpuWait)u1;
-    w.status = status;
-    w.done = 1;
-}
-
 // Polls until w is done; 1 when it was, 0 after ms_limit milliseconds.
 async int _gpu_poll_async(*Gpu g, EventLoop* lp, *_GpuWait w, int ms_limit) {
     for (i in 0..ms_limit) {
+#ifdef __EMSCRIPTEN__
+        if (w.done == 0) emscripten_sleep(0);
+#else
         wgpuDevicePoll(g.device, 0, null);
+#endif
         if (w.done) return 1;
         await timer_after(lp, (int64)1);
     }

@@ -11,6 +11,10 @@
 //     defer v.release();
 //
 // The raw WebGPU API is in <gpu/raw> for anything this layer does not cover.
+//
+// In a browser (wasm32-unknown-emscripten) the API is the same: each wait for the
+// GPU suspends the program until the browser's promise settles, which needs a build
+// with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md).
 
 import <io>;
 import <mem>;
@@ -26,7 +30,13 @@ struct _GpuWait {
     uint32 status;
     *void handle;
     String msg;
+    uint64 future;
 }
+
+#ifdef __EMSCRIPTEN__
+extern void emscripten_sleep(uint32 ms);
+extern int emscripten_run_script_int(string script);
+#endif
 
 struct _GpuState {
     String uncaptured;
@@ -136,12 +146,31 @@ void _gpu_on_uncaptured(*WGPUDevice device, WGPUErrorType kind, WGPUStringView m
     _gpu_set_msg(&st.uncaptured, message);
 }
 
+void _gpu_on_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, *void u1, *void u2) {
+    *_GpuWait w = (*_GpuWait)u1;
+    w.status = status;
+    w.done = 1;
+}
+
+// Waits for w's callback. In a browser the program is suspended (JSPI or Asyncify)
+// on w's future, for a minute at most; the callbacks run from the browser's event loop.
 void _gpu_wait(*Gpu g, *_GpuWait w) {
+#ifdef __EMSCRIPTEN__
+    if (w.done == 0 && w.future != 0) {
+        WGPUFutureWaitInfo info = WGPUFutureWaitInfo{future: WGPUFuture{w.future}};
+        wgpuInstanceWaitAny(g.instance, 1, &info, (uint64)60000000000);
+    }
+    for (i in 0..100) {
+        if (w.done) return;
+        emscripten_sleep(0);
+    }
+#else
     for (i in 0..100000) {
         if (w.done) return;
         if (g.device != null) wgpuDevicePoll(g.device, 1, null);
         else wgpuInstanceProcessEvents(g.instance);
     }
+#endif
 }
 
 // Adds feature to the list when the adapter has it.
@@ -154,16 +183,28 @@ bool _gpu_want(*Gpu g, WGPUFeatureName feature, *WGPUFeatureName list, *uint64 n
 
 // Opens the high-performance adapter and a device with the adapter's full limits and every
 // optional feature listed on Gpu that it has. Fails with "no WebGPU instance", "no GPU
-// adapter" or "no GPU device" and the driver's message.
+// adapter" or "no GPU device" and the driver's message; in a browser also with "no
+// WebGPU in this browser".
 Result<Gpu, string> gpu_open() {
     Gpu g;
+#ifdef __EMSCRIPTEN__
+    if (emscripten_run_script_int("typeof navigator !== 'undefined' && !!navigator.gpu ? 1 : 0") == 0) {
+        return Err<Gpu, string>(_gpu_fail("no WebGPU in this browser", null));
+    }
+    // Timed waits let _gpu_wait suspend on a future; they need JSPI or Asyncify.
+    WGPUInstanceFeatureName timed = WGPUInstanceFeatureName_TimedWaitAny;
+    WGPUInstanceDescriptor idesc = WGPUInstanceDescriptor{requiredFeatureCount: 1, requiredFeatures: &timed};
+    g.instance = wgpuCreateInstance(&idesc);
+    if (g.instance == null) return Err<Gpu, string>(_gpu_fail("no WebGPU instance (build with --link-arg=-sJSPI or --link-arg=-sASYNCIFY)", null));
+#else
     g.instance = wgpuCreateInstance(null);
     if (g.instance == null) return Err<Gpu, string>(_gpu_fail("no WebGPU instance", null));
+#endif
     _GpuWait w;
     defer String_free(&w.msg);
     WGPURequestAdapterOptions opts = WGPURequestAdapterOptions{powerPreference: WGPUPowerPreference_HighPerformance};
     WGPURequestAdapterCallbackInfo ai = WGPURequestAdapterCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_adapter, userdata1: &w};
-    wgpuInstanceRequestAdapter(g.instance, &opts, ai);
+    w.future = wgpuInstanceRequestAdapter(g.instance, &opts, ai).id;
     _gpu_wait(&g, &w);
     if (w.status != WGPURequestAdapterStatus_Success || w.handle == null) {
         wgpuInstanceRelease(g.instance);
@@ -187,11 +228,14 @@ Result<Gpu, string> gpu_open() {
         features[nfeatures] = WGPUFeatureName_Subgroups;
         nfeatures++;
         g.subgroups = true;
-    } else if (wgpuAdapterHasFeature(g.adapter, (WGPUFeatureName)WGPUNativeFeature_Subgroup) != 0) {
+    }
+#ifndef __EMSCRIPTEN__
+    if (!g.subgroups && wgpuAdapterHasFeature(g.adapter, (WGPUFeatureName)WGPUNativeFeature_Subgroup) != 0) {
         features[nfeatures] = (WGPUFeatureName)WGPUNativeFeature_Subgroup;
         nfeatures++;
         g.subgroups = true;
     }
+#endif
     if (wgpuAdapterHasFeature(g.adapter, WGPUFeatureName_Depth32FloatStencil8) != 0) {
         features[nfeatures] = WGPUFeatureName_Depth32FloatStencil8;
         nfeatures++;
@@ -215,7 +259,7 @@ Result<Gpu, string> gpu_open() {
         requiredFeatures: &features[0], requiredLimits: &limits,
         uncapturedErrorCallbackInfo: WGPUUncapturedErrorCallbackInfo{callback: (*void)_gpu_on_uncaptured, userdata1: g.state}};
     WGPURequestDeviceCallbackInfo di = WGPURequestDeviceCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_device, userdata1: &w};
-    wgpuAdapterRequestDevice(g.adapter, &dd, di);
+    w.future = wgpuAdapterRequestDevice(g.adapter, &dd, di).id;
     _gpu_wait(&g, &w);
     if (w.status != WGPURequestDeviceStatus_Success || w.handle == null) {
         wgpuAdapterRelease(g.adapter);
@@ -252,7 +296,15 @@ void Gpu_name(*Gpu self, String* out) {
 
 // Blocks until the work submitted so far has finished.
 void Gpu_wait(*Gpu self) {
+#ifdef __EMSCRIPTEN__
+    _GpuWait w;
+    WGPUQueueWorkDoneCallbackInfo ci = WGPUQueueWorkDoneCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_done, userdata1: &w};
+    w.future = wgpuQueueOnSubmittedWorkDone(self.queue, ci).id;
+    _gpu_wait(self, &w);
+    String_free(&w.msg);
+#else
     wgpuDevicePoll(self.device, 1, null);
+#endif
 }
 
 void _gpu_push(*Gpu g) {
@@ -265,7 +317,7 @@ string _gpu_pop(*Gpu g, string what) {
     _GpuWait w;
     defer String_free(&w.msg);
     WGPUPopErrorScopeCallbackInfo pi = WGPUPopErrorScopeCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_scope, userdata1: &w};
-    wgpuDevicePopErrorScope(g.device, pi);
+    w.future = wgpuDevicePopErrorScope(g.device, pi).id;
     _gpu_wait(g, &w);
     if (w.status == WGPUErrorType_NoError) return null;
     return _gpu_fail(what, &w.msg);
@@ -335,7 +387,7 @@ Result<int, string> GpuBuffer_read_mapped(*GpuBuffer self, *void out, uint64 byt
     _GpuWait w;
     defer String_free(&w.msg);
     WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: &w};
-    wgpuBufferMapAsync(staging.handle, WGPUMapMode_Read, 0, bytes, mi);
+    w.future = wgpuBufferMapAsync(staging.handle, WGPUMapMode_Read, 0, bytes, mi).id;
     _gpu_wait(g, &w);
     if (w.status != WGPUMapAsyncStatus_Success) return Err<int, string>(_gpu_fail("read", &w.msg));
     memcpy(out, wgpuBufferGetConstMappedRange(staging.handle, 0, bytes), (int64)bytes);

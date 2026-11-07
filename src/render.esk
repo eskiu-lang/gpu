@@ -825,7 +825,7 @@ Result<GpuReadback, string> _gpu_read_start(*GpuTexture self, uint32 layer, uint
     }
     rb.wait = alloc<_GpuWait>(1);
     WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: rb.wait};
-    wgpuBufferMapAsync(rb.staging, WGPUMapMode_Read, 0, (uint64)rb.padded * rb.height, mi);
+    rb.wait.future = wgpuBufferMapAsync(rb.staging, WGPUMapMode_Read, 0, (uint64)rb.padded * rb.height, mi).id;
     return Ok<GpuReadback, string>(rb);
 }
 
@@ -853,10 +853,15 @@ Result<GpuReadback, string> GpuTexture_read_async(*GpuTexture self) {
     return _gpu_read_start(self, 0, 0);
 }
 
-// Whether the pixels have arrived; it checks without blocking.
+// Whether the pixels have arrived; it checks without blocking. In a browser, when they
+// have not, it lets the browser run for a moment (its callbacks bring them).
 bool GpuReadback_ready(*GpuReadback self) {
     if (self.wait == null) return false;
+#ifdef __EMSCRIPTEN__
+    if (self.wait.done == 0) emscripten_sleep(0);
+#else
     if (self.wait.done == 0) wgpuDevicePoll(self.gpu.device, 0, null);
+#endif
     return self.wait.done != 0;
 }
 
@@ -1327,8 +1332,15 @@ Result<int, string> GpuEncoder_submit(*GpuEncoder self) {
 string _gpu_finish(*Gpu g, WGPUCommandEncoder enc, string what) {
     WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
     wgpuCommandEncoderRelease(enc);
+#ifdef __EMSCRIPTEN__
+    // The wait for the scope lets the browser run, and a canvas texture expires at the
+    // next display refresh: the work goes to the queue before that wait.
+    if (cmd != null) wgpuQueueSubmit(g.queue, 1, &cmd);
+    string err = _gpu_pop(g, what);
+#else
     string err = _gpu_pop(g, what);
     if (err == null && cmd != null) wgpuQueueSubmit(g.queue, 1, &cmd);
+#endif
     if (cmd != null) wgpuCommandBufferRelease(cmd);
     return err;
 }
@@ -1611,34 +1623,88 @@ Result<GpuSurface, string> _gpu_surface(*Gpu self, *WGPUChainedStruct source) {
     return Ok<GpuSurface, string>(GpuSurface{*self, s, format, 0, 0, WGPUTextureFormat_Undefined});
 }
 
+#ifdef __EMSCRIPTEN__
+extern int emscripten_get_canvas_element_size(string target, *int width, *int height);
+extern int emscripten_request_animation_frame(*void callback, *void user_data);
+
+bool _gpu_on_animation_frame(double time, *void u) {
+    *(*int)u = 1;
+    return false;
+}
+
+Result<GpuSurface, string> _gpu_native_only(string what) {
+    String_clear(&_gpu_err);
+    String_appendf(&_gpu_err, "%s: not in a browser (use Gpu_surface_canvas)", what);
+    return Err<GpuSurface, string>(_gpu_err.data);
+}
+#endif
+
 // A surface over a CAMetalLayer (macOS, iOS).
 Result<GpuSurface, string> Gpu_surface_metal(*Gpu self, *void layer) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_metal");
+#else
     WGPUSurfaceSourceMetalLayer src = WGPUSurfaceSourceMetalLayer{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceMetalLayer}, layer: layer};
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
 }
 
 // A surface over an X11 window (display is the Display*).
 Result<GpuSurface, string> Gpu_surface_x11(*Gpu self, *void display, uint64 window) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_x11");
+#else
     WGPUSurfaceSourceXlibWindow src = WGPUSurfaceSourceXlibWindow{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceXlibWindow}, display: display, window: window};
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
 }
 
 // A surface over a Wayland wl_surface (display is the wl_display*).
 Result<GpuSurface, string> Gpu_surface_wayland(*Gpu self, *void display, *void surface) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_wayland");
+#else
     WGPUSurfaceSourceWaylandSurface src = WGPUSurfaceSourceWaylandSurface{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceWaylandSurface}, display: display, surface: surface};
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
 }
 
 // A surface over a Win32 window.
 Result<GpuSurface, string> Gpu_surface_win32(*Gpu self, *void hinstance, *void hwnd) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_win32");
+#else
     WGPUSurfaceSourceWindowsHWND src = WGPUSurfaceSourceWindowsHWND{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceWindowsHWND}, hinstance: hinstance, hwnd: hwnd};
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
 }
 
 // A surface over an Android ANativeWindow*.
 Result<GpuSurface, string> Gpu_surface_android(*Gpu self, *void window) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_android");
+#else
     WGPUSurfaceSourceAndroidNativeWindow src = WGPUSurfaceSourceAndroidNativeWindow{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceAndroidNativeWindow}, window: window};
     return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over an HTML canvas in a browser, found by a CSS selector such as "#canvas",
+// and configured to the canvas's size in pixels (its width and height attributes).
+// Fails outside a browser (wasm32-unknown-emscripten). docs/web.md has the build flags.
+Result<GpuSurface, string> Gpu_surface_canvas(*Gpu self, string selector) {
+#ifdef __EMSCRIPTEN__
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector src = WGPUEmscriptenSurfaceSourceCanvasHTMLSelector{
+        chain: WGPUChainedStruct{null, WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector}, selector: gpu_str(selector)};
+    GpuSurface s = _gpu_surface(self, (*WGPUChainedStruct)&src)?;
+    int w = 0;
+    int h = 0;
+    emscripten_get_canvas_element_size(selector, &w, &h);
+    GpuSurface_configure(&s, (uint32)(w > 0 ? w : 300), (uint32)(h > 0 ? h : 150));
+    return Ok<GpuSurface, string>(s);
+#else
+    return Err<GpuSurface, string>(_gpu_fail("surface_canvas: only in a browser (wasm32-unknown-emscripten)", null));
+#endif
 }
 
 // Sets the size of the surface's frames, in pixels; call it again when the
@@ -1687,12 +1753,24 @@ Result<GpuFrame, string> GpuSurface_frame(*GpuSurface self) {
     return Ok<GpuFrame, string>(f);
 }
 
-// Shows the frame and releases it.
+// Shows the frame and releases it. In a browser the canvas shows it at the next display
+// refresh: present releases the frame and suspends the program until the browser's
+// next animation frame, which keeps a frame loop at the display's rate.
 void GpuSurface_present(*GpuSurface self, *GpuFrame frame) {
+#ifndef __EMSCRIPTEN__
     wgpuSurfacePresent(self.handle);
+#endif
     if (frame.alt_view != null) wgpuTextureViewRelease(frame.alt_view);
     wgpuTextureViewRelease(frame.view);
     wgpuTextureRelease(frame.texture);
+#ifdef __EMSCRIPTEN__
+    int shown = 0;
+    emscripten_request_animation_frame((*void)_gpu_on_animation_frame, &shown);
+    for (i in 0..1000) {
+        if (shown != 0) break;
+        emscripten_sleep(1);
+    }
+#endif
 }
 
 // Unconfigures and releases the surface; a second call does nothing. Present or drop the
