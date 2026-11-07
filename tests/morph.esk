@@ -1,0 +1,170 @@
+// Morph targets: a glTF written by the test (a quad with two targets, one of
+// them a sparse accessor, mesh default weights, a second node with its own
+// weights, and a linear "weights" animation) is parsed and checked value by
+// value, then drawn offscreen: target 0 slides the red unlit quad right, so
+// the pixels it covers follow the weights from the animation and from
+// GpuModel_set_weights.
+import <io>;
+import <mem>;
+import <string>;
+import <base64>;
+import <math>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/model>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool same(float a, float b) {
+    return fabs((double)(a - b)) < 1e-5;
+}
+
+void put_f(*uint8 buf, int at, float v) {
+    memcpy(buf + at, &v, 4);
+}
+
+void put_u16(*uint8 buf, int at, int v) {
+    buf[at] = (uint8)(v & 255);
+    buf[at + 1] = (uint8)(v >> 8);
+}
+
+// The test model as glTF JSON with its buffer in a data URI.
+void build(String* out) {
+    *uint8 b = alloc<uint8>(256);
+    defer free(b);
+    float[12] pos = {-0.5, -0.5, 0.0, 0.5, -0.5, 0.0, 0.5, 0.5, 0.0, -0.5, 0.5, 0.0};
+    for (i in 0..12) put_f(b, i * 4, pos[i]);
+    for (v in 0..4) put_f(b, 48 + v * 12 + 8, 1.0);
+    for (v in 0..4) put_f(b, 96 + v * 12, 0.8);
+    put_u16(b, 144, 0);
+    put_u16(b, 146, 2);
+    put_f(b, 148 + 4, 1.0);
+    put_f(b, 160 + 4, 1.0);
+    for (v in 0..4) put_f(b, 172 + v * 12 + 8, 0.5);
+    int[6] idx = {0, 1, 2, 0, 2, 3};
+    for (i in 0..6) put_u16(b, 220 + i * 2, idx[i]);
+    put_f(b, 232, 0.0);
+    put_f(b, 236, 1.0);
+    float[4] w = {0.0, 0.0, 1.0, 0.0};
+    for (i in 0..4) put_f(b, 240 + i * 4, w[i]);
+    *uint8 enc = alloc<uint8>(base64_encoded_len(256) + 1);
+    defer free(enc);
+    int n = base64_encode(b, 256, enc);
+    enc[n] = 0;
+    String_append(out, "{\"asset\":{\"version\":\"2.0\"},\"extensionsUsed\":[\"KHR_materials_unlit\"],");
+    String_append(out, "\"buffers\":[{\"byteLength\":256,\"uri\":\"data:application/octet-stream;base64,");
+    String_append(out, (string)enc);
+    String_append(out, "\"}],\"bufferViews\":[");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":48},{\"buffer\":0,\"byteOffset\":48,\"byteLength\":48},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":96,\"byteLength\":48},{\"buffer\":0,\"byteOffset\":144,\"byteLength\":4},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":148,\"byteLength\":24},{\"buffer\":0,\"byteOffset\":172,\"byteLength\":48},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":220,\"byteLength\":12},{\"buffer\":0,\"byteOffset\":232,\"byteLength\":8},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":240,\"byteLength\":16}],\"accessors\":[");
+    String_append(out, "{\"bufferView\":0,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"min\":[-0.5,-0.5,0],\"max\":[0.5,0.5,0]},");
+    String_append(out, "{\"bufferView\":1,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    String_append(out, "{\"bufferView\":2,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    String_append(out, "{\"componentType\":5126,\"count\":4,\"type\":\"VEC3\",\"sparse\":{\"count\":2,");
+    String_append(out, "\"indices\":{\"bufferView\":3,\"componentType\":5123},\"values\":{\"bufferView\":4}}},");
+    String_append(out, "{\"bufferView\":5,\"componentType\":5126,\"count\":4,\"type\":\"VEC3\"},");
+    String_append(out, "{\"bufferView\":6,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},");
+    String_append(out, "{\"bufferView\":7,\"componentType\":5126,\"count\":2,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]},");
+    String_append(out, "{\"bufferView\":8,\"componentType\":5126,\"count\":4,\"type\":\"SCALAR\"}],");
+    String_append(out, "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,0,0,1]},\"extensions\":{\"KHR_materials_unlit\":{}}}],");
+    String_append(out, "\"meshes\":[{\"weights\":[0.25,0],\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"indices\":5,\"material\":0,");
+    String_append(out, "\"targets\":[{\"POSITION\":2},{\"POSITION\":3,\"NORMAL\":4}]}]}],");
+    String_append(out, "\"nodes\":[{\"mesh\":0},{\"mesh\":0,\"translation\":[0,10,0],\"weights\":[1,0.5]}],");
+    String_append(out, "\"scenes\":[{\"nodes\":[0,1]}],\"scene\":0,");
+    String_append(out, "\"animations\":[{\"samplers\":[{\"input\":6,\"output\":7,\"interpolation\":\"LINEAR\"}],");
+    String_append(out, "\"channels\":[{\"sampler\":0,\"target\":{\"node\":0,\"path\":\"weights\"}}]}]}");
+}
+
+void parsed(*Gltf g) {
+    check("one mesh, two nodes", g.meshes.size == 1 && g.nodes.size == 2);
+    GltfPrimitive* p = &g.meshes.data[0].primitives.data[0];
+    check("two targets", p.target_count == 2);
+    check("position deltas", p.target_positions != null && same(p.target_positions[0], 0.8) && same(p.target_positions[9], 0.8)
+        && same(p.target_positions[1], 0.0));
+    check("sparse target: vertices 0 and 2 move up, 1 and 3 stay", same(p.target_positions[12 + 1], 1.0)
+        && same(p.target_positions[12 + 4], 0.0) && same(p.target_positions[12 + 7], 1.0) && same(p.target_positions[12 + 10], 0.0));
+    check("normal deltas: zero for a target without NORMAL", p.target_normals != null && same(p.target_normals[2], 0.0)
+        && same(p.target_normals[12 + 2], 0.5));
+    check("no tangent deltas", p.target_tangents == null);
+    List<float>* mw = &g.meshes.data[0].weights;
+    check("mesh default weights", mw.size == 2 && same(mw.data[0], 0.25) && same(mw.data[1], 0.0));
+    check("node without weights takes the mesh's", g.nodes.data[0].weights.size == 2 && same(g.nodes.data[0].weights.data[0], 0.25));
+    check("node weights override", same(g.nodes.data[1].weights.data[0], 1.0) && same(g.nodes.data[1].weights.data[1], 0.5));
+    check("weights channel", g.animations.size == 1 && g.animations.data[0].channels.data[0].path == GLTF_WEIGHTS);
+    g.animate(0, 0.5);
+    check("animated weights at t = 0.5", same(g.nodes.data[0].weights.data[0], 0.5) && same(g.nodes.data[0].weights.data[1], 0.0));
+    check("animation leaves the other node", same(g.nodes.data[1].weights.data[0], 1.0));
+    float[3] set = {0.1, 0.2, 9.0};
+    g.set_weights(1, &set[0], 3);
+    check("set_weights keeps one weight per target", same(g.nodes.data[1].weights.data[0], 0.1) && same(g.nodes.data[1].weights.data[1], 0.2)
+        && g.nodes.data[1].weights.size == 2);
+}
+
+bool red(*uint8 px, int x) {
+    *uint8 p = px + (32 * 64 + x) * 4;
+    return p[0] > 200 && p[1] < 40;
+}
+
+Result<int, string> draw(*Gpu gpu, *GpuModel model, *GpuTexture target, *GpuTexture depth, *uint8 out) {
+    GpuCamera cam = gpu_camera(Vec3{0.0, 0.0, 3.0}, Vec3{0.0, 0.0, 0.0}, 0.8, 1.0, 0.1, 10.0);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, depth);
+    model.draw(&pass, &cam);
+    pass.end()?;
+    target.read(out)?;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    String json;
+    defer String_free(&json);
+    build(&json);
+    Gltf g = gltf_parse((*uint8)json.data, (uint64)json.len, null)?;
+    defer g.free();
+    parsed(&g);
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuTexture target = gpu.target(64, 64)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(64, 64)?;
+    defer depth.release();
+    GpuModel model = gpu.model(&g, target.format)?;
+    defer model.release();
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    // Quad x from -0.5 to 0.5 plus 0.8 * weight; 25 pixels a unit, center 32.
+    g.animate(0, 0.0);
+    model.update(mat4_identity());
+    draw(&gpu, &model, &target, &depth, px)?;
+    check("weight 0: the quad covers the center", red(px, 32) && !red(px, 52) && red(px, 22));
+    float[2] one = {1.0, 0.0};
+    model.set_weights(0, &one[0], 2);
+    draw(&gpu, &model, &target, &depth, px)?;
+    check("weight 1 (set_weights): the quad moved right", !red(px, 32) && red(px, 52) && !red(px, 22));
+    g.animate(0, 0.5);
+    model.update(mat4_identity());
+    draw(&gpu, &model, &target, &depth, px)?;
+    check("weight 0.5 (animation): halfway", red(px, 32) && red(px, 52) && !red(px, 22));
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("morph: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

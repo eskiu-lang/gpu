@@ -1,0 +1,205 @@
+// Shadow maps and image-based lighting in <gpu/model>: a gray ground plane (y = 0, 4 x 4) under a
+// small square occluder (y = 1, 1 x 1), lit at 45 degrees from +X, seen
+// straight down through an orthographic camera (16 pixels a unit). With
+// shadows on, the ground under the occluder's shadow (x 0.5 to 1.5) is much
+// darker than the open ground, and the occluder's own top stays lit; with
+// them off (the default, and after disable_shadows) both ground points get
+// the same light. Rendering through a GpuEncoder gives the same image.
+// Then image-based lighting: with the direct light off and a constant
+// environment of radiance 0.5, open ground (base 0.5, roughness 1,
+// metallic 0) is 0.5 * 0.5 * (1 - 0.04) diffuse plus 0.5 * 0.04 * 0.32
+// specular (the BRDF table's scale at NdotV 1, roughness 1): 0.246 in linear
+// light, 136 once sRGB encoded; at intensity 2 it is 0.493, 186. A rough
+// white metal gets 0.5 * the table's scale + bias: about 0.16, 112.
+import <io>;
+import <mem>;
+import <string>;
+import <base64>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/model>;
+import <gpu/image>;
+import <gpu/ibl>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+void put_f(*uint8 buf, int at, float v) {
+    memcpy(buf + at, &v, 4);
+}
+
+// Ground and occluder: 8 positions, 8 normals (up), 12 uint16 indices.
+void build(String* out, bool metal) {
+    *uint8 b = alloc<uint8>(216);
+    defer free(b);
+    float[24] pos = {-2.0, 0.0, -2.0, 2.0, 0.0, -2.0, 2.0, 0.0, 2.0, -2.0, 0.0, 2.0,
+        -0.5, 1.0, -0.5, 0.5, 1.0, -0.5, 0.5, 1.0, 0.5, -0.5, 1.0, 0.5};
+    for (i in 0..24) put_f(b, i * 4, pos[i]);
+    for (v in 0..8) put_f(b, 96 + v * 12 + 4, 1.0);
+    int[12] idx = {0, 2, 1, 0, 3, 2, 4, 6, 5, 4, 7, 6};
+    for (i in 0..12) {
+        b[192 + i * 2] = (uint8)idx[i];
+        b[193 + i * 2] = 0;
+    }
+    *uint8 enc = alloc<uint8>(base64_encoded_len(216) + 1);
+    defer free(enc);
+    int n = base64_encode(b, 216, enc);
+    enc[n] = 0;
+    String_append(out, "{\"asset\":{\"version\":\"2.0\"},\"buffers\":[{\"byteLength\":216,\"uri\":\"data:application/octet-stream;base64,");
+    String_append(out, (string)enc);
+    String_append(out, "\"}],\"bufferViews\":[{\"buffer\":0,\"byteOffset\":0,\"byteLength\":96},{\"buffer\":0,\"byteOffset\":96,\"byteLength\":96},");
+    String_append(out, "{\"buffer\":0,\"byteOffset\":192,\"byteLength\":12},{\"buffer\":0,\"byteOffset\":204,\"byteLength\":12}],\"accessors\":[");
+    String_append(out, "{\"bufferView\":0,\"componentType\":5126,\"count\":8,\"type\":\"VEC3\",\"min\":[-2,0,-2],\"max\":[2,1,2]},");
+    String_append(out, "{\"bufferView\":1,\"componentType\":5126,\"count\":8,\"type\":\"VEC3\"},");
+    String_append(out, "{\"bufferView\":2,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"},");
+    String_append(out, "{\"bufferView\":3,\"componentType\":5123,\"count\":6,\"type\":\"SCALAR\"}],");
+    String_append(out, metal ? "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[1,1,1,1],\"metallicFactor\":1,\"roughnessFactor\":1},\"doubleSided\":true}],"
+        : "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.5,0.5,0.5,1],\"metallicFactor\":0,\"roughnessFactor\":1},\"doubleSided\":true}],");
+    String_append(out, "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"indices\":2,\"material\":0},");
+    String_append(out, "{\"attributes\":{\"POSITION\":0,\"NORMAL\":1},\"indices\":3,\"material\":0}]}],");
+    String_append(out, "\"nodes\":[{\"mesh\":0}],\"scenes\":[{\"nodes\":[0]}],\"scene\":0}");
+}
+
+int luma(*uint8 px, float x, float z) {
+    int ix = (int)((x + 2.0) * 16.0);
+    int iz = (int)((z + 2.0) * 16.0);
+    *uint8 p = px + (iz * 64 + ix) * 4;
+    return ((int)p[0] + (int)p[1] + (int)p[2]) / 3;
+}
+
+GpuCamera top_camera() {
+    Vec3 eye = Vec3{0.0, 6.0, 0.0};
+    return GpuCamera{mat4_look_at(eye, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 0.0, -1.0}), mat4_ortho(-2.0, 2.0, -2.0, 2.0, 0.1, 10.0), eye};
+}
+
+Result<int, string> render(*Gpu gpu, *GpuModel model, *GpuTexture target, *GpuTexture depth, *uint8 out, bool encoder) {
+    GpuCamera cam = top_camera();
+    if (encoder) {
+        GpuEncoder enc = gpu.encoder();
+        model.render_shadows_in(&enc)?;
+        GpuPass pass = enc.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, depth);
+        model.draw(&pass, &cam);
+        pass.end()?;
+        enc.submit()?;
+    } else {
+        model.render_shadows()?;
+        GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, depth);
+        model.draw(&pass, &cam);
+        pass.end()?;
+    }
+    target.read(out)?;
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    String json;
+    defer String_free(&json);
+    build(&json, false);
+    Gltf g = gltf_parse((*uint8)json.data, (uint64)json.len, null)?;
+    defer g.free();
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuTexture target = gpu.target(64, 64)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(64, 64)?;
+    defer depth.release();
+    GpuModel model = gpu.model(&g, target.format)?;
+    defer model.release();
+    model.light.direction = Vec3{1.0, -1.0, 0.0};
+    model.update(mat4_identity());
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+
+    render(&gpu, &model, &target, &depth, px, false)?;
+    int open = luma(px, -1.5, 0.0);
+    int under = luma(px, 1.0, 0.0);
+    printf("  no shadows: open %d, shadow spot %d\n", open, under);
+    check("shadows off by default: the ground is evenly lit", under - open < 6 && open - under < 6 && open > 60);
+
+    GpuShadowOptions so = GpuShadowOptions{size: 256};
+    model.enable_shadows(&so)?;
+    render(&gpu, &model, &target, &depth, px, false)?;
+    int open2 = luma(px, -1.5, 0.0);
+    int under2 = luma(px, 1.0, 0.0);
+    int side = luma(px, 1.0, 1.2);
+    int top = luma(px, 0.0, 0.0);
+    printf("  shadows: open %d, in shadow %d, beside it %d, occluder top %d\n", open2, under2, side, top);
+    check("open ground keeps its light", open2 - open < 6 && open - open2 < 6);
+    check("the occluder's shadow is dark", under2 < open2 - 40);
+    check("beside the shadow is lit", side - open2 < 6 && open2 - side < 6);
+    check("the occluder's top is lit", top > under2 + 40);
+
+    *uint8 px2 = alloc<uint8>(64 * 64 * 4);
+    defer free(px2);
+    render(&gpu, &model, &target, &depth, px2, true)?;
+    int diff = 0;
+    for (i in 0..64 * 64 * 4) {
+        int d = (int)px[i] - (int)px2[i];
+        if (d > 2 || d < -2) diff++;
+    }
+    check("render_shadows_in through an encoder gives the same image", diff == 0);
+
+    model.disable_shadows();
+    render(&gpu, &model, &target, &depth, px, false)?;
+    check("disable_shadows brings the even light back", luma(px, 1.0, 0.0) - open < 6 && open - luma(px, 1.0, 0.0) < 6);
+
+    HdrBitmap env = HdrBitmap{8, 4, alloc<float>(8 * 4 * 4)};
+    defer env.free();
+    for (i in 0..8 * 4 * 4) env.rgba[i] = 0.5;
+    GpuIblOptions io = GpuIblOptions{environment_size: 16, irradiance_size: 4, specular_size: 8, specular_mips: 3,
+        brdf_size: 32, samples: 32, brdf_samples: 256};
+    GpuIbl ibl = gpu.ibl(&env, &io)?;
+    defer ibl.release();
+    model.light.intensity = 0.0;
+    model.set_ibl(&ibl);
+    render(&gpu, &model, &target, &depth, px, false)?;
+    int lit = luma(px, -1.5, 0.0);
+    printf("  ibl: open ground %d (want 136)\n", lit);
+    check("constant environment lights the ground analytically", lit >= 130 && lit <= 142);
+    ibl.intensity = 2.0;
+    render(&gpu, &model, &target, &depth, px, false)?;
+    lit = luma(px, -1.5, 0.0);
+    printf("  ibl at intensity 2: %d (want 186)\n", lit);
+    check("ibl intensity scales the ambient", lit >= 180 && lit <= 192);
+
+    // A white metal (F0 = 1): no diffuse, specular 0.5 * (scale + bias) with
+    // scale about 0.32 and bias 0 at NdotV 1 and roughness 1: 0.16, 112 encoded.
+    String mjson;
+    defer String_free(&mjson);
+    build(&mjson, true);
+    Gltf mg = gltf_parse((*uint8)mjson.data, (uint64)mjson.len, null)?;
+    defer mg.free();
+    GpuModel metal = gpu.model(&mg, target.format)?;
+    defer metal.release();
+    metal.light.intensity = 0.0;
+    metal.set_ibl(&ibl);
+    ibl.intensity = 1.0;
+    metal.update(mat4_identity());
+    render(&gpu, &metal, &target, &depth, px, false)?;
+    lit = luma(px, -1.5, 0.0);
+    printf("  ibl on rough metal: %d (want about 112)\n", lit);
+    check("rough metal takes its specular from the BRDF table", lit >= 104 && lit <= 120);
+
+    model.set_ibl(null);
+    model.light.intensity = 3.0;
+    render(&gpu, &model, &target, &depth, px, false)?;
+    check("set_ibl(null) brings the hemisphere ambient back", luma(px, -1.5, 0.0) - open < 3 && open - luma(px, -1.5, 0.0) < 3);
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("model lighting: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

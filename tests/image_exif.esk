@@ -1,0 +1,239 @@
+// EXIF orientation and the pixel limit of <gpu/image>.
+// tests/data/exif_base.jpg is 32x16 with quadrants red, green (top), blue,
+// white (bottom) and no EXIF; the test inserts an APP1 Exif segment with each
+// orientation 1 to 8, in little-endian (II) and big-endian (MM) TIFF order,
+// and checks image_orientation, that image_decode keeps the pixels as stored,
+// and that ImageOptions.orient turns them upright (size and the color of each
+// corner quadrant, from the EXIF definitions). exif_6.jpg is orientation 6 as
+// Pillow writes it (tools/gen_exif_jpegs.py). Bitmap_orient is also checked
+// exactly on a 3x2 bitmap; a non-Exif APP1 and a broken TIFF are ignored; and
+// max_pixels rejects JPEG and PNG images one pixel over the limit.
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <gpu/image>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// R, G, B, W, or ? for a pixel that is none of them.
+char color_at(*Bitmap b, int x, int y) {
+    *uint8 p = b.rgba + ((int64)y * b.width + x) * 4;
+    bool r = p[0] > 190;
+    bool g = p[1] > 190;
+    bool bl = p[2] > 190;
+    bool r0 = p[0] < 60;
+    bool g0 = p[1] < 60;
+    bool b0 = p[2] < 60;
+    if (r && g0 && b0) return 'R';
+    if (r0 && g && b0) return 'G';
+    if (r0 && g0 && bl) return 'B';
+    if (r && g && bl) return 'W';
+    return '?';
+}
+
+// The colors at the centers of the four quadrants: top left, top right,
+// bottom left, bottom right.
+void corners(*Bitmap b, *char out) {
+    int qx = (int)b.width / 4;
+    int qy = (int)b.height / 4;
+    out[0] = color_at(b, qx, qy);
+    out[1] = color_at(b, (int)b.width - 1 - qx, qy);
+    out[2] = color_at(b, qx, (int)b.height - 1 - qy);
+    out[3] = color_at(b, (int)b.width - 1 - qx, (int)b.height - 1 - qy);
+    out[4] = 0;
+}
+
+void put16(*uint8 p, int v, bool le) {
+    if (le) {
+        p[0] = (uint8)(v & 255);
+        p[1] = (uint8)(v >> 8);
+    } else {
+        p[0] = (uint8)(v >> 8);
+        p[1] = (uint8)(v & 255);
+    }
+}
+
+void put32(*uint8 p, int v, bool le) {
+    if (le) {
+        put16(p, v & 0xFFFF, true);
+        put16(p + 2, v >> 16, true);
+    } else {
+        put16(p, v >> 16, false);
+        put16(p + 2, v & 0xFFFF, false);
+    }
+}
+
+// base with an APP1 segment (marker, length, body of n bytes) after SOI.
+*uint8 with_app1(*uint8 base, int64 len, *uint8 body, int n, *int64 out_len) {
+    *uint8 d = alloc<uint8>(len + n + 4);
+    d[0] = 255;
+    d[1] = 0xD8;
+    d[2] = 255;
+    d[3] = 0xE1;
+    put16(d + 4, n + 2, false);
+    memcpy(d + 6, body, n);
+    memcpy(d + 6 + n, base + 2, len - 2);
+    *out_len = len + n + 4;
+    return d;
+}
+
+// An Exif body: "Exif\0\0", a TIFF header and IFD0 with the orientation.
+int exif_body(*uint8 b, int orientation, bool le) {
+    memcpy(b, (*void)"Exif\0\0", 6);
+    *uint8 t = b + 6;
+    t[0] = le ? (uint8)73 : (uint8)77;
+    t[1] = t[0];
+    put16(t + 2, 42, le);
+    put32(t + 4, 8, le);
+    put16(t + 8, 1, le);
+    put16(t + 10, 0x0112, le);
+    put16(t + 12, 3, le);
+    put32(t + 14, 1, le);
+    put16(t + 18, orientation, le);
+    put16(t + 20, 0, le);
+    put32(t + 22, 0, le);
+    return 32;
+}
+
+// For each orientation: width, height and the quadrant colors once upright.
+const string[8] UPRIGHT = {"RGBW", "GRWB", "WBGR", "BWRG", "RBGW", "BRWG", "WGBR", "GWRB"};
+
+void exif_cases(*uint8 base, int64 len) {
+    uint8[64] body;
+    char[5] got;
+    for (k in 0..2) {
+        bool le = k == 0;
+        for (o in 1..9) {
+            int n = exif_body(&body[0], o, le);
+            int64 dl = 0;
+            *uint8 d = with_app1(base, len, &body[0], n, &dl);
+            check("image_orientation reads the tag", image_orientation(d, (uint64)dl) == o);
+            Result<Bitmap, string> plain = image_decode(d, (uint64)dl);
+            check("decodes", plain.ok);
+            if (plain.ok) {
+                corners(&plain.value, &got[0]);
+                check("without orient the pixels stay as stored", plain.value.width == 32 && strcmp((string)&got[0], "RGBW") == 0);
+                plain.value.free();
+            }
+            ImageOptions opt = ImageOptions{orient: true};
+            Result<Bitmap, string> up = image_decode_with(d, (uint64)dl, &opt);
+            if (up.ok) {
+                corners(&up.value, &got[0]);
+                bool size = o >= 5 ? up.value.width == 16 && up.value.height == 32 : up.value.width == 32 && up.value.height == 16;
+                if (!size || strcmp((string)&got[0], UPRIGHT[o - 1]) != 0) {
+                    printf("FAIL orientation %d (%s): %ux%u %s, want %s\n", o, le ? "II" : "MM", up.value.width, up.value.height,
+                        (string)&got[0], UPRIGHT[o - 1]);
+                    fails++;
+                }
+                up.value.free();
+            } else {
+                check("decodes with orient", false);
+            }
+            free(d);
+        }
+    }
+}
+
+void bitmap_orient() {
+    string[8] want = {"abcdef", "cbafed", "fedcba", "defabc", "adbecf", "daebfc", "fcebda", "cfbead"};
+    for (o in 1..9) {
+        Bitmap b = Bitmap{3, 2, alloc<uint8>(24)};
+        for (i in 0..6) b.rgba[i * 4] = (uint8)('a' + i);
+        b.orient(o);
+        bool ok = o >= 5 ? b.width == 2 && b.height == 3 : b.width == 3 && b.height == 2;
+        for (i in 0..6) {
+            if (b.rgba[i * 4] != (uint8)want[o - 1][i]) ok = false;
+        }
+        if (!ok) {
+            printf("FAIL Bitmap_orient %d\n", o);
+            fails++;
+        }
+        b.free();
+    }
+}
+
+void limits(*uint8 jpg, int64 jlen) {
+    ImageOptions small = ImageOptions{max_pixels: 511};
+    Result<Bitmap, string> r = jpeg_decode_with(jpg, (uint64)jlen, &small);
+    check("a JPEG one pixel over max_pixels is rejected", !r.ok && strstr(r.error, "too large") != null);
+    small.max_pixels = 512;
+    r = jpeg_decode_with(jpg, (uint64)jlen, &small);
+    check("a JPEG of exactly max_pixels decodes", r.ok);
+    if (r.ok) r.value.free();
+    int64 n = 0;
+    *uint8 png = fs_read_all("tests/data/rgba8.png", &n);
+    check("read rgba8.png", png != null);
+    if (png == null) return;
+    defer free(png);
+    Result<Bitmap, string> full = png_decode(png, (uint64)n);
+    check("png decodes", full.ok);
+    if (!full.ok) return;
+    int64 pixels = (int64)full.value.width * full.value.height;
+    full.value.free();
+    ImageOptions po = ImageOptions{max_pixels: pixels - 1};
+    Result<Bitmap, string> pr = image_decode_with(png, (uint64)n, &po);
+    check("a PNG one pixel over max_pixels is rejected", !pr.ok && strstr(pr.error, "too large") != null);
+    po.max_pixels = pixels;
+    pr = image_decode_with(png, (uint64)n, &po);
+    check("a PNG of exactly max_pixels decodes", pr.ok);
+    if (pr.ok) pr.value.free();
+    check("the default limit", IMAGE_MAX_PIXELS == 268435456);
+}
+
+int main() {
+    int64 len = 0;
+    *uint8 base = fs_read_all("tests/data/exif_base.jpg", &len);
+    if (base == null) {
+        printf("error: cannot read tests/data/exif_base.jpg\n");
+        return 1;
+    }
+    defer free(base);
+    check("no EXIF: orientation 1", image_orientation(base, (uint64)len) == 1);
+    exif_cases(base, len);
+
+    int64 plen = 0;
+    *uint8 pil = fs_read_all("tests/data/exif_6.jpg", &plen);
+    check("read exif_6.jpg", pil != null);
+    if (pil != null) {
+        check("Pillow's EXIF: orientation 6", image_orientation(pil, (uint64)plen) == 6);
+        ImageOptions opt = ImageOptions{orient: true};
+        Result<Bitmap, string> up = image_decode_with(pil, (uint64)plen, &opt);
+        char[5] got;
+        if (up.ok) {
+            corners(&up.value, &got[0]);
+            check("Pillow's orientation 6 upright", up.value.width == 16 && strcmp((string)&got[0], "BRWG") == 0);
+            up.value.free();
+        }
+        free(pil);
+    }
+
+    // An XMP APP1 and an Exif segment whose IFD points past its end.
+    uint8[64] body;
+    memcpy(&body[0], (*void)"http://ns.adobe.com/xap/1.0/\0<x/>", 33);
+    int64 dl = 0;
+    *uint8 d = with_app1(base, len, &body[0], 33, &dl);
+    check("a non-Exif APP1 is ignored", image_orientation(d, (uint64)dl) == 1);
+    free(d);
+    int n = exif_body(&body[0], 6, true);
+    put32(&body[0] + 10, 1000, true);
+    d = with_app1(base, len, &body[0], n, &dl);
+    Result<Bitmap, string> br = image_decode(d, (uint64)dl);
+    check("a broken TIFF is ignored", image_orientation(d, (uint64)dl) == 1 && br.ok);
+    if (br.ok) br.value.free();
+    free(d);
+    uint8[8] sig = {137, 80, 78, 71, 13, 10, 26, 10};
+    check("a PNG has orientation 1", image_orientation(&sig[0], 8) == 1);
+
+    bitmap_orient();
+    limits(base, len);
+    printf("image exif: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}
