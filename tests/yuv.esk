@@ -1,0 +1,372 @@
+// <gpu/yuv>: frames in each layout (NV12 with padded rows, NV21, I420, three
+// planes with chroma 2 bytes apart, a pixel stride no texture format reads,
+// RGBA), each matrix and range, turned by each rotation, converted on the GPU
+// and read back, against the BT.601 and BT.709 formulas in doubles on the CPU.
+// A software rasterizer (lavapipe, WARP) may round differently, so a channel
+// may be 1 step off. Then draws into a larger target: stretch, contain, cover
+// and mirror, and an sRGB target, which must store the same bytes. Each check
+// that fails is counted; the test exits with 1 when any did.
+import <io>;
+import <mem>;
+import <math>;
+import <gpu>;
+import <gpu/yuv>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+// The test picture: 7 x 5 (odd, so chroma planes are 4 x 3), Y and the chroma
+// samples spread over the range, limited extremes included.
+const int W = 7;
+const int H = 5;
+const int CW = 4;
+const int CH = 3;
+
+int luma_at(int x, int y) { return (x * 37 + y * 53 + 3) % 256; }
+int u_at(int x, int y) { return (x * 71 + y * 29 + 16) % 256; }
+int v_at(int x, int y) { return (x * 43 + y * 97 + 240) % 256; }
+
+// R, G and B in doubles from the matrix's Kr and Kb, rounded and clamped.
+int reference(int matrix, bool full, int y, int u, int v, int channel) {
+    double kr = matrix == GPU_YUV_BT709 ? 0.2126 : 0.299;
+    double kb = matrix == GPU_YUV_BT709 ? 0.0722 : 0.114;
+    double kg = 1.0 - kr - kb;
+    double yy = (double)y;
+    double cb = (double)(u - 128);
+    double cr = (double)(v - 128);
+    if (!full) {
+        yy = (yy - 16.0) * 255.0 / 219.0;
+        cb = cb * 255.0 / 224.0;
+        cr = cr * 255.0 / 224.0;
+    }
+    double value = yy + 2.0 * (1.0 - kr) * cr;
+    if (channel == 1) value = yy - 2.0 * kb * (1.0 - kb) / kg * cb - 2.0 * kr * (1.0 - kr) / kg * cr;
+    if (channel == 2) value = yy + 2.0 * (1.0 - kb) * cb;
+    int rounded = (int)floor(value + 0.5);
+    if (rounded < 0) return 0;
+    if (rounded > 255) return 255;
+    return rounded;
+}
+
+// The expected RGB of source pixel (x, y).
+void expected(int matrix, bool full, int x, int y, *int rgb) {
+    for (c in 0..3) rgb[c] = reference(matrix, full, luma_at(x, y), u_at(x / 2, y / 2), v_at(x / 2, y / 2), c);
+}
+
+int distance(int a, int b) { return a > b ? a - b : b - a; }
+
+// The source pixel an upright output pixel (dx, dy) shows, as CameraFrame_to_rgba turns.
+void source_of(int rotation, int dx, int dy, *int sx, *int sy) {
+    *sx = dx;
+    *sy = dy;
+    if (rotation == 90) { *sx = dy; *sy = H - 1 - dx; }
+    else if (rotation == 180) { *sx = W - 1 - dx; *sy = H - 1 - dy; }
+    else if (rotation == 270) { *sx = W - 1 - dy; *sy = dx; }
+}
+
+// The largest channel difference between `px` (ow x oh RGBA) and the picture
+// turned by rotation; alpha must be 255.
+int worst(*uint8 px, int ow, int oh, int rotation, int matrix, bool full) {
+    int bad = 0;
+    int[3] rgb;
+    for (dy in 0..oh) {
+        for (dx in 0..ow) {
+            int sx = 0;
+            int sy = 0;
+            source_of(rotation, dx, dy, &sx, &sy);
+            expected(matrix, full, sx, sy, &rgb[0]);
+            *uint8 p = px + (dy * ow + dx) * 4;
+            for (c in 0..3) {
+                int d = distance(p[c], rgb[c]);
+                if (d > bad) bad = d;
+            }
+            if (p[3] != 255) bad = 999;
+        }
+    }
+    return bad;
+}
+
+// Plane buffers for every layout, filled from the picture.
+uint8[16 * H] y_padded;
+uint8[16 * CH] uv_nv12;
+uint8[16 * CH] vu_nv21;
+uint8[CW * CH] u_i420;
+uint8[CW * CH] v_i420;
+uint8[8 * CH] u_wide;
+uint8[8 * CH] v_wide;
+uint8[12 * CH] u_three;
+uint8[12 * CH] v_three;
+uint8[W * H * 4] rgba;
+
+void fill() {
+    for (y in 0..H) for (x in 0..W) y_padded[y * 16 + x] = (uint8)luma_at(x, y);
+    for (y in 0..CH) {
+        for (x in 0..CW) {
+            uv_nv12[y * 16 + x * 2] = (uint8)u_at(x, y);
+            uv_nv12[y * 16 + x * 2 + 1] = (uint8)v_at(x, y);
+            vu_nv21[y * 16 + x * 2] = (uint8)v_at(x, y);
+            vu_nv21[y * 16 + x * 2 + 1] = (uint8)u_at(x, y);
+            u_i420[y * CW + x] = (uint8)u_at(x, y);
+            v_i420[y * CW + x] = (uint8)v_at(x, y);
+            u_wide[y * 8 + x * 2] = (uint8)u_at(x, y);
+            v_wide[y * 8 + x * 2] = (uint8)v_at(x, y);
+            u_three[y * 12 + x * 3] = (uint8)u_at(x, y);
+            v_three[y * 12 + x * 3] = (uint8)v_at(x, y);
+        }
+    }
+    int[3] c;
+    for (y in 0..H) {
+        for (x in 0..W) {
+            expected(GPU_YUV_BT601, true, x, y, &c[0]);
+            for (k in 0..3) rgba[(y * W + x) * 4 + k] = (uint8)c[k];
+            rgba[(y * W + x) * 4 + 3] = 255;
+        }
+    }
+}
+
+GpuYuvImage image(int format, int matrix, bool full, int rotation) {
+    GpuYuvImage im = GpuYuvImage{width: W, height: H, format: format, rotation: rotation, matrix: matrix, full_range: full};
+    im.planes[0] = GpuYuvPlane{&y_padded[0], 16, 1, (int64)(16 * (H - 1) + W)};
+    if (format == GPU_YUV_NV12 || format == GPU_YUV_NV21) {
+        im.plane_count = 2;
+        *uint8 uv = format == GPU_YUV_NV12 ? &uv_nv12[0] : &vu_nv21[0];
+        im.planes[1] = GpuYuvPlane{uv, 16, 2, (int64)(16 * (CH - 1) + CW * 2)};
+    } else if (format == GPU_YUV_I420) {
+        im.plane_count = 3;
+        im.planes[1] = GpuYuvPlane{&u_i420[0], CW, 1, (int64)(CW * CH)};
+        im.planes[2] = GpuYuvPlane{&v_i420[0], CW, 1, (int64)(CW * CH)};
+    } else if (format == GPU_YUV_RGBA) {
+        im.plane_count = 1;
+        im.planes[0] = GpuYuvPlane{&rgba[0], W * 4, 4, (int64)(W * H * 4)};
+    }
+    return im;
+}
+
+// The picture through to_rgba, turned when upright, compared with the formula.
+void convert(*GpuYuv yuv, *GpuYuvImage im, bool upright, int matrix, bool full, string what) {
+    Result<int, string> up = yuv.upload(im);
+    if (!up.ok) {
+        printf("FAIL %s: %s\n", what, up.error);
+        fails++;
+        return;
+    }
+    Result<*GpuTexture, string> out = yuv.to_rgba(upright);
+    if (!out.ok) {
+        printf("FAIL %s: %s\n", what, out.error);
+        fails++;
+        return;
+    }
+    *GpuTexture t = out.value;
+    int ow = yuv.out_width(upright);
+    int oh = yuv.out_height(upright);
+    check(what, (int)t.width == ow && (int)t.height == oh);
+    uint8[W * H * 4] px;
+    Result<int, string> read = t.read(&px[0]);
+    check(what, read.ok);
+    int bad = worst(&px[0], ow, oh, upright ? im.rotation : 0, matrix, full);
+    if (bad > 1) printf("  %s: off by %d\n", what, bad);
+    check(what, bad <= 1);
+}
+
+void layouts(*GpuYuv yuv) {
+    for (m in 0..2) {
+        for (f in 0..2) {
+            for (format in 0..4) {
+                GpuYuvImage im = image(format, m, f == 1, 0);
+                if (format == GPU_YUV_420) {
+                    // Chroma 2 bytes apart with the last sample's partner byte past the
+                    // plane's end: uploaded as R8 after a repack.
+                    im.plane_count = 3;
+                    im.planes[1] = GpuYuvPlane{&u_wide[0], 8, 2, (int64)(8 * (CH - 1) + (CW - 1) * 2 + 1)};
+                    im.planes[2] = GpuYuvPlane{&v_wide[0], 8, 2, (int64)(8 * (CH - 1) + CW * 2)};
+                }
+                convert(yuv, &im, false, m, f == 1, "layout, matrix and range");
+            }
+        }
+    }
+    // Chroma 3 bytes apart: no texture format reads that, so it is repacked.
+    GpuYuvImage three = image(GPU_YUV_420, GPU_YUV_BT709, false, 0);
+    three.plane_count = 3;
+    three.planes[1] = GpuYuvPlane{&u_three[0], 12, 3, (int64)(12 * CH)};
+    three.planes[2] = GpuYuvPlane{&v_three[0], 12, 3, (int64)(12 * CH)};
+    convert(yuv, &three, false, GPU_YUV_BT709, false, "chroma 3 bytes apart");
+    // RGBA passes through.
+    GpuYuvImage pass = image(GPU_YUV_RGBA, GPU_YUV_BT601, true, 0);
+    convert(yuv, &pass, false, GPU_YUV_BT601, true, "RGBA");
+    // Each rotation, turned upright, in NV12 and I420.
+    for (r in 0..4) {
+        GpuYuvImage nv = image(GPU_YUV_NV12, GPU_YUV_BT601, true, r * 90);
+        convert(yuv, &nv, true, GPU_YUV_BT601, true, "NV12 turned upright");
+        GpuYuvImage i4 = image(GPU_YUV_I420, GPU_YUV_BT709, false, r * 90);
+        convert(yuv, &i4, true, GPU_YUV_BT709, false, "I420 turned upright");
+    }
+}
+
+void refusals(*GpuYuv yuv) {
+    GpuYuvImage im = image(GPU_YUV_NV12, GPU_YUV_BT601, true, 0);
+    im.planes[1].size = 3;
+    check("a short chroma plane is refused", !yuv.upload(&im).ok);
+    im = image(GPU_YUV_NV12, GPU_YUV_BT601, true, 45);
+    check("a rotation of 45 is refused", !yuv.upload(&im).ok);
+    im = image(GPU_YUV_NV12, GPU_YUV_BT601, true, 0);
+    im.plane_count = 3;
+    check("a plane count that does not fit is refused", !yuv.upload(&im).ok);
+    im = image(GPU_YUV_I420, GPU_YUV_BT601, true, 0);
+    im.planes[2].data = null;
+    check("a missing plane is refused", !yuv.upload(&im).ok);
+    im = image(GPU_YUV_NV12, GPU_YUV_BT601, true, 0);
+    im.planes[0].row_stride = 6;
+    check("a row stride under the width is refused", !yuv.upload(&im).ok);
+}
+
+// A target of tw x th cleared to blue with the picture drawn by d; the pixels into out.
+Result<int, string> drawn(*Gpu gpu, *GpuYuv yuv, uint32 tw, uint32 th, WGPUTextureFormat format, *GpuYuvDraw d, *uint8 out) {
+    GpuTexture target = gpu.target_with(tw, th, format)?;
+    defer target.release();
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 1.0, 1.0}, null);
+    yuv.draw(&pass, d);
+    pass.end()?;
+    target.read(out)?;
+    return Ok<int, string>(0);
+}
+
+bool blue(*uint8 p) { return p[0] == 0 && p[1] == 0 && p[2] == 255; }
+
+// Pixel (dx, dy) of an upright picture drawn at 1:1 from (ox, oy) of a tw-wide target.
+int picture_off(*uint8 px, int tw, int ox, int oy, int ow, int oh, int rotation, bool mirror) {
+    int bad = 0;
+    int[3] rgb;
+    for (dy in 0..oh) {
+        for (dx in 0..ow) {
+            int sx = 0;
+            int sy = 0;
+            source_of(rotation, mirror ? ow - 1 - dx : dx, dy, &sx, &sy);
+            expected(GPU_YUV_BT601, true, sx, sy, &rgb[0]);
+            *uint8 p = px + ((oy + dy) * tw + ox + dx) * 4;
+            for (c in 0..3) {
+                int d = distance(p[c], rgb[c]);
+                if (d > bad) bad = d;
+            }
+        }
+    }
+    return bad;
+}
+
+Result<int, string> draws(*Gpu gpu) {
+    uint8[16 * 16 * 4] px;
+    GpuYuv yuv = gpu.yuv(WGPUTextureFormat_RGBA8Unorm)?;
+    defer yuv.release();
+    GpuYuvImage im = image(GPU_YUV_NV12, GPU_YUV_BT601, true, 90);
+    yuv.upload(&im)?;
+    // Stretch at 1:1 at an offset, nearest: the upright picture (5 x 7) exactly.
+    GpuYuvDraw d = GpuYuvDraw{x: 2.0, y: 3.0, width: 5.0, height: 7.0, nearest: true};
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    check("stretch at 1:1", picture_off(&px[0], 16, 2, 3, 5, 7, 90, false) <= 1);
+    check("outside the rectangle is untouched", blue(&px[0]) && blue(&px[(10 * 16 + 1) * 4]));
+    // Mirrored.
+    d.mirror = true;
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    check("mirror", picture_off(&px[0], 16, 2, 3, 5, 7, 90, true) <= 1);
+    // Not turned: 7 x 5.
+    d = GpuYuvDraw{width: 7.0, height: 5.0, nearest: true, upright: false};
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    check("as the sensor gives it", picture_off(&px[0], 16, 0, 0, 7, 5, 0, false) <= 1);
+    // Contain: a 5 x 7 picture at twice its size in a 16 x 14 box, centered: x from 3.
+    d = GpuYuvDraw{width: 16.0, height: 14.0, fit: GPU_YUV_CONTAIN, nearest: true};
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    check("contain leaves the sides", blue(&px[(5 * 16 + 1) * 4]) && blue(&px[(5 * 16 + 14) * 4]));
+    check("contain fills the middle", !blue(&px[(5 * 16 + 4) * 4]) && !blue(&px[(5 * 16 + 12) * 4]));
+    check("contain stops at the box", blue(&px[(15 * 16 + 8) * 4]));
+    // Cover: the same box filled, the picture cropped top and bottom.
+    d.fit = GPU_YUV_COVER;
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    bool full = true;
+    for (y in 0..14) for (x in 0..16) if (blue(&px[(y * 16 + x) * 4])) full = false;
+    check("cover fills the box", full && blue(&px[(15 * 16 + 8) * 4]));
+    // Cover of 7 x 5 (not turned) into 7 x 3: the middle 3 rows of 5, at scale 1.
+    d = GpuYuvDraw{width: 7.0, height: 3.0, fit: GPU_YUV_COVER, nearest: true, upright: false};
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    int bad = 0;
+    int[3] rgb;
+    for (y in 0..3) {
+        for (x in 0..7) {
+            expected(GPU_YUV_BT601, true, x, y + 1, &rgb[0]);
+            for (c in 0..3) {
+                int dd = distance(px[(y * 16 + x) * 4 + c], rgb[c]);
+                if (dd > bad) bad = dd;
+            }
+        }
+    }
+    check("cover crops about the center", bad <= 1);
+    // An sRGB target stores the picture's own values.
+    GpuYuv srgb = gpu.yuv(WGPUTextureFormat_RGBA8UnormSrgb)?;
+    defer srgb.release();
+    srgb.upload(&im)?;
+    d = GpuYuvDraw{width: 5.0, height: 7.0, nearest: true};
+    drawn(gpu, &srgb, 16, 16, WGPUTextureFormat_RGBA8UnormSrgb, &d, &px[0])?;
+    check("sRGB target", picture_off(&px[0], 16, 0, 0, 5, 7, 90, false) <= 1);
+    // Linear filtering keeps a flat picture flat.
+    d = GpuYuvDraw{width: 16.0, height: 16.0};
+    drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
+    check("filtered draw covers the target", !blue(&px[0]) && !blue(&px[(15 * 16 + 15) * 4]));
+    return Ok<int, string>(0);
+}
+
+// eskiu-lang/ui-camera's CameraFrame (and eskiu-lang/video's VideoFrame) as they are
+// declared: GpuYuvImage must keep their layout for a pointer cast to work.
+struct CameraPlaneShape { *uint8 data; int row_stride; int pixel_stride; int64 size; }
+struct CameraFrameShape {
+    int width;
+    int height;
+    int format;
+    int plane_count;
+    CameraPlaneShape[3] planes;
+    int rotation;
+    int64 timestamp_ns;
+    bool front;
+    int matrix;
+    bool full_range;
+}
+
+void layout() {
+    CameraFrameShape c;
+    GpuYuvImage g;
+    int64 cb = (int64)&c;
+    int64 gb = (int64)&g;
+    check("same size as CameraFrame", sizeof(CameraFrameShape) == sizeof(GpuYuvImage));
+    check("planes at the same offset", (int64)&c.planes[1].pixel_stride - cb == (int64)&g.planes[1].pixel_stride - gb);
+    check("rotation at the same offset", (int64)&c.rotation - cb == (int64)&g.rotation - gb);
+    check("matrix at the same offset", (int64)&c.matrix - cb == (int64)&g.matrix - gb);
+    check("full_range at the same offset", (int64)&c.full_range - cb == (int64)&g.full_range - gb);
+}
+
+Result<int, string> run() {
+    layout();
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    fill();
+    GpuYuv yuv = gpu.yuv(0)?;
+    defer yuv.release();
+    check("nothing to convert before an upload", !yuv.to_rgba(true).ok);
+    layouts(&yuv);
+    refusals(&yuv);
+    draws(&gpu)?;
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    if (fails > 0) return 1;
+    printf("PASS yuv\n");
+    return 0;
+}
