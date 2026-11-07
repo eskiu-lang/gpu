@@ -65,6 +65,13 @@ All notable changes to this package are documented in this file. The format is b
   `image_decode_with`, `image_load_with`, `jpeg_decode_with`, `png_decode_with` and
   `IMAGE_MAX_PIXELS`; the JPEG EXIF orientation (`image_orientation`, `jpeg_orientation`, both
   TIFF byte orders) and `Bitmap_orient`.
+- WebGPU in a browser (`wasm32-unknown-emscripten`, through Emscripten's `emdawnwebgpu`
+  port): the same API, with each wait for the GPU suspending the program under `-sJSPI` or
+  `-sASYNCIFY`. `Gpu_surface_canvas` draws into an HTML canvas, `GpuSurface_present` waits for
+  the browser's next animation frame, and `<gpu/window>` maps to the page's canvas and events,
+  so the triangle, cube and model examples run in a page unchanged. `<gpu/raw>` has a section
+  generated from emdawnwebgpu's `webgpu.h` (`tools/gen.py --web`, checked by
+  `tools/layout_check.sh --web`). Guide: `docs/web.md`.
 
 ### Fixed
 

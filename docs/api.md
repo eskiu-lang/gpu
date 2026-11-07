@@ -38,7 +38,8 @@ into textures and window surfaces. The raw WebGPU API is in `<gpu/raw>`.
 
 Waiting for the GPU from async code. The device is polled from
 the event loop every millisecond until the work is done, so other tasks run
-meanwhile.
+meanwhile. In a browser each poll also lets the browser run for a moment, since
+the callbacks come from its event loop.
 
 ```eskiu
 int r = await gpu.wait_async(lp);
@@ -80,6 +81,10 @@ defer v.release();
 ```
 
 The raw WebGPU API is in `<gpu/raw>` for anything this layer does not cover.
+
+In a browser (wasm32-unknown-emscripten) the API is the same: each wait for the
+GPU suspends the program until the browser's promise settles, which needs a build
+with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md).
 
 ### Gpu
 
@@ -160,7 +165,8 @@ Result<Gpu, string> gpu_open()
 
 Opens the high-performance adapter and a device with the adapter's full limits and every
 optional feature listed on Gpu that it has. Fails with "no WebGPU instance", "no GPU
-adapter" or "no GPU device" and the driver's message.
+adapter" or "no GPU device" and the driver's message; in a browser also with "no
+WebGPU in this browser".
 
 ### Gpu_release
 
@@ -3189,7 +3195,8 @@ if (rb.ready()) { rb.take(pixels)?; rb.release(); }
 bool GpuReadback_ready(*GpuReadback self)
 ```
 
-Whether the pixels have arrived; it checks without blocking.
+Whether the pixels have arrived; it checks without blocking. In a browser, when they
+have not, it lets the browser run for a moment (its callbacks bring them).
 
 ### GpuReadback_take
 
@@ -3638,6 +3645,16 @@ Result<GpuSurface, string> Gpu_surface_android(*Gpu self, *void window)
 
 A surface over an Android ANativeWindow*.
 
+### Gpu_surface_canvas
+
+```eskiu
+Result<GpuSurface, string> Gpu_surface_canvas(*Gpu self, string selector)
+```
+
+A surface over an HTML canvas in a browser, found by a CSS selector such as "#canvas",
+and configured to the canvas's size in pixels (its width and height attributes).
+Fails outside a browser (wasm32-unknown-emscripten). docs/web.md has the build flags.
+
 ### GpuSurface_configure
 
 ```eskiu
@@ -3675,7 +3692,9 @@ again (after a resize) or the frame was skipped.
 void GpuSurface_present(*GpuSurface self, *GpuFrame frame)
 ```
 
-Shows the frame and releases it.
+Shows the frame and releases it. In a browser the canvas shows it at the next display
+refresh: present releases the frame and suspends the program until the browser's
+next animation frame, which keeps a frame loop at the display's rate.
 
 ### GpuSurface_release
 
@@ -4321,6 +4340,9 @@ while (running) {
 }
 ```
 
+In a browser (wasm32-unknown-emscripten) the window is the page's canvas with id
+"canvas": the same program builds for both, and the events come from the page.
+
 ### WINDOW_NONE, WINDOW_QUIT, WINDOW_RESIZE, WINDOW_KEY_DOWN, WINDOW_KEY_UP, WINDOW_MOUSE_MOVE, WINDOW_MOUSE_DOWN, WINDOW_MOUSE_UP, WINDOW_WHEEL
 
 ```eskiu
@@ -4362,7 +4384,7 @@ struct Window {
 ```
 
 A desktop window: sdl is the SDL_Window and metal its Metal view on macOS (null
-elsewhere).
+elsewhere). In a browser both are null and the window is the canvas with id "canvas".
 
 ### WindowEvent
 
@@ -4384,7 +4406,8 @@ struct WindowEvent {
 One input event. key and repeat are set for key events, button for mouse
 buttons (1 left, 2 middle, 3 right), x and y for mouse events (pixels) and
 the wheel (scroll amounts), dx and dy for mouse motion, width and height
-(pixels) for WINDOW_RESIZE.
+(pixels) for WINDOW_RESIZE. In a browser, a key that is neither printable nor
+a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT never comes.
 
 ### window_open
 
@@ -4394,7 +4417,8 @@ Result<Window, string> window_open(string title, int width, int height)
 
 Opens a resizable, high-density window of width x height points (the drawable size in
 pixels may be larger: Window_size). It starts SDL's video system first. Fails with SDL's
-error message.
+error message. In a browser it sets the page title and the canvas's CSS size to width x
+height (0 x 0 keeps the size the page gives it) and listens to the page's events.
 
 ### Window_release
 
@@ -4403,7 +4427,8 @@ void Window_release(*Window self)
 ```
 
 Destroys the window and shuts SDL down, so a program has one window at a time. Release
-the window's GpuSurface first.
+the window's GpuSurface first. In a browser it removes the page's event listeners set
+through Emscripten's html5 API.
 
 ### Window_set_title
 
