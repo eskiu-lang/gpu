@@ -1,0 +1,379 @@
+// ibl.esk: image-based lighting from an environment map (<gpu/ibl>).
+//
+// Gpu_ibl turns an equirectangular (latitude-longitude) HDR image into the
+// textures a physically based shader lights with: the environment as a cube
+// map, its diffuse irradiance, its specular reflection prefiltered for each
+// roughness (one per mip level, GGX importance sampling) and the split-sum
+// BRDF table. Everything is made on the GPU with render passes into the cube
+// faces and mip levels (no compute shaders), so it runs wherever rendering
+// does.
+//
+//     HdrBitmap sky = hdr_load("sky.hdr")?;
+//     defer sky.free();
+//     GpuIbl ibl = gpu.ibl(&sky, null)?;
+//     defer ibl.release();
+//     model.set_ibl(&ibl);      // <gpu/model>
+//
+// Shading with it (what <gpu/model> does):
+//
+//     diffuse  = irradiance(n) * base * (1 - metallic) * (1 - F)
+//     specular = specular(reflect(-v, n), lod = roughness * (mips - 1)) * (F0 * lut.r + lut.g)
+//
+// where lut = brdf(NdotV, roughness).
+
+import <mem>;
+import <string>;
+import <result>;
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+import <gpu/image>;
+
+// Sizes and sample counts; each 0 picks the default.
+struct GpuIblOptions {
+    uint32 environment_size;
+    uint32 irradiance_size;
+    uint32 specular_size;
+    uint32 specular_mips;
+    uint32 brdf_size;
+    uint32 samples;
+    uint32 brdf_samples;
+}
+
+struct GpuIbl {
+    Gpu gpu;
+    GpuTexture environment;
+    GpuTexture irradiance;
+    GpuTexture specular;
+    GpuTexture brdf;
+    GpuSampler sampler;
+    float intensity;
+}
+
+string _gpu_ibl_common =
+    "const PI = 3.14159265358979;\n"
+    "@group(0) @binding(0) var<uniform> jobs: array<vec4<f32>, 128>;\n"
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) @interpolate(flat) job: u32 };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) j: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    var o: V;\n"
+    "    o.pos = vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "    o.job = j;\n"
+    "    return o;\n"
+    "}\n"
+    "fn face_dir(face: u32, pos: vec2<f32>, size: f32) -> vec3<f32> {\n"
+    "    let st = pos / size * 2.0 - 1.0;\n"
+    "    let s = st.x;\n"
+    "    let t = st.y;\n"
+    "    var d = vec3<f32>(s, -t, -1.0);\n"
+    "    switch face {\n"
+    "        case 0u: { d = vec3<f32>(1.0, -t, -s); }\n"
+    "        case 1u: { d = vec3<f32>(-1.0, -t, s); }\n"
+    "        case 2u: { d = vec3<f32>(s, 1.0, t); }\n"
+    "        case 3u: { d = vec3<f32>(s, -1.0, -t); }\n"
+    "        case 4u: { d = vec3<f32>(s, -t, 1.0); }\n"
+    "        default: { d = vec3<f32>(-s, -t, -1.0); }\n"
+    "    }\n"
+    "    return normalize(d);\n"
+    "}\n"
+    "fn hammersley(i: u32, n: u32) -> vec2<f32> {\n"
+    "    return vec2<f32>(f32(i) / f32(n), f32(reverseBits(i)) * 2.3283064365386963e-10);\n"
+    "}\n"
+    "fn ggx_half(xi: vec2<f32>, n: vec3<f32>, a: f32) -> vec3<f32> {\n"
+    "    let phi = 2.0 * PI * xi.x;\n"
+    "    let ct = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));\n"
+    "    let st = sqrt(max(1.0 - ct * ct, 0.0));\n"
+    "    let h = vec3<f32>(cos(phi) * st, sin(phi) * st, ct);\n"
+    "    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.z) > 0.999);\n"
+    "    let tx = normalize(cross(up, n));\n"
+    "    let ty = cross(n, tx);\n"
+    "    return normalize(tx * h.x + ty * h.y + n * h.z);\n"
+    "}\n";
+
+string _gpu_ibl_equirect =
+    "@group(0) @binding(1) var src: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let job = jobs[v.job];\n"
+    "    let d = face_dir(u32(job.x), v.pos.xy, job.z);\n"
+    "    let uv = vec2<f32>(atan2(d.z, d.x) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);\n"
+    "    return vec4<f32>(textureSampleLevel(src, samp, uv, 0.0).rgb, 1.0);\n"
+    "}\n";
+
+// Cosine-weighted average of the radiance over the hemisphere around n
+// (midpoint rule in theta and phi, weights normalized), so a constant
+// environment gives back its own value.
+string _gpu_ibl_irradiance =
+    "@group(0) @binding(1) var env: texture_cube<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let job = jobs[v.job];\n"
+    "    let n = face_dir(u32(job.x), v.pos.xy, job.z);\n"
+    "    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.999);\n"
+    "    let right = normalize(cross(up, n));\n"
+    "    let up2 = cross(n, right);\n"
+    "    let nphi = u32(job.w);\n"
+    "    let ntheta = max(nphi / 4u, 1u);\n"
+    "    var sum = vec3<f32>(0.0);\n"
+    "    var wsum = 0.0;\n"
+    "    for (var i = 0u; i < nphi; i++) {\n"
+    "        let phi = (f32(i) + 0.5) * 2.0 * PI / f32(nphi);\n"
+    "        for (var j = 0u; j < ntheta; j++) {\n"
+    "            let th = (f32(j) + 0.5) * 0.5 * PI / f32(ntheta);\n"
+    "            let t = vec3<f32>(sin(th) * cos(phi), sin(th) * sin(phi), cos(th));\n"
+    "            let d = right * t.x + up2 * t.y + n * t.z;\n"
+    "            let w = cos(th) * sin(th);\n"
+    "            sum += textureSampleLevel(env, samp, d, job.y).rgb * w;\n"
+    "            wsum += w;\n"
+    "        }\n"
+    "    }\n"
+    "    return vec4<f32>(sum / wsum, 1.0);\n"
+    "}\n";
+
+// GGX prefilter with N = V = R (Karis), sampling the environment's mip level
+// that matches each sample's solid angle (filtered importance sampling).
+string _gpu_ibl_specular =
+    "@group(0) @binding(1) var env: texture_cube<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let job = jobs[v.job];\n"
+    "    let n = face_dir(u32(job.x), v.pos.xy, job.z);\n"
+    "    let env_size = f32(textureDimensions(env).x);\n"
+    "    let max_lod = f32(textureNumLevels(env) - 1u);\n"
+    "    let rough = job.y;\n"
+    "    if (rough <= 0.0) {\n"
+    "        return vec4<f32>(textureSampleLevel(env, samp, n, clamp(log2(env_size / job.z), 0.0, max_lod)).rgb, 1.0);\n"
+    "    }\n"
+    "    let a = rough * rough;\n"
+    "    let count = u32(job.w);\n"
+    "    let texel = 4.0 * PI / (6.0 * env_size * env_size);\n"
+    "    var sum = vec3<f32>(0.0);\n"
+    "    var wsum = 0.0;\n"
+    "    for (var i = 0u; i < count; i++) {\n"
+    "        let h = ggx_half(hammersley(i, count), n, a);\n"
+    "        let l = normalize(2.0 * dot(n, h) * h - n);\n"
+    "        let nl = dot(n, l);\n"
+    "        if (nl > 0.0) {\n"
+    "            let nh = max(dot(n, h), 0.0);\n"
+    "            let dn = nh * nh * (a * a - 1.0) + 1.0;\n"
+    "            let d = a * a / (PI * dn * dn);\n"
+    "            let pdf = d / 4.0 + 1e-4;\n"
+    "            let sa = 1.0 / (f32(count) * pdf + 1e-4);\n"
+    "            let lod = clamp(0.5 * log2(sa / texel) + 1.0, 0.0, max_lod);\n"
+    "            sum += textureSampleLevel(env, samp, l, lod).rgb * nl;\n"
+    "            wsum += nl;\n"
+    "        }\n"
+    "    }\n"
+    "    return vec4<f32>(sum / max(wsum, 1e-6), 1.0);\n"
+    "}\n";
+
+// The split-sum table: x is NdotV, y the roughness (texel centers), r the
+// scale and g the bias of F0, with Smith-Schlick visibility (k = a / 2).
+string _gpu_ibl_brdf =
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    let job = jobs[v.job];\n"
+    "    let nv = max(v.pos.x / job.z, 1e-4);\n"
+    "    let rough = v.pos.y / job.z;\n"
+    "    let a = rough * rough;\n"
+    "    let k = a / 2.0;\n"
+    "    let view = vec3<f32>(sqrt(1.0 - nv * nv), 0.0, nv);\n"
+    "    let n = vec3<f32>(0.0, 0.0, 1.0);\n"
+    "    let count = u32(job.w);\n"
+    "    var sa = 0.0;\n"
+    "    var sb = 0.0;\n"
+    "    for (var i = 0u; i < count; i++) {\n"
+    "        let h = ggx_half(hammersley(i, count), n, a);\n"
+    "        let vh = max(dot(view, h), 0.0);\n"
+    "        let l = normalize(2.0 * vh * h - view);\n"
+    "        let nl = max(l.z, 0.0);\n"
+    "        let nh = max(h.z, 0.0);\n"
+    "        if (nl > 0.0) {\n"
+    "            let g = (nv / (nv * (1.0 - k) + k)) * (nl / (nl * (1.0 - k) + k));\n"
+    "            let gv = g * vh / max(nh * nv, 1e-6);\n"
+    "            let fc = pow(1.0 - vh, 5.0);\n"
+    "            sa += (1.0 - fc) * gv;\n"
+    "            sb += fc * gv;\n"
+    "        }\n"
+    "    }\n"
+    "    return vec4<f32>(sa / f32(count), sb / f32(count), 0.0, 1.0);\n"
+    "}\n";
+
+uint32 _ibl_or(uint32 v, uint32 d) {
+    return v != 0 ? v : d;
+}
+
+// One full-screen draw per job into views[i], job i's parameters in jobs
+// (face, roughness or lod, face size, samples), all in one submission.
+Result<int, string> _ibl_run(*Gpu g, string body, *GpuTexture src, *GpuSampler samp, WGPUTextureFormat format,
+        *GpuTextureView views, *float jobs, int count) {
+    String wgsl;
+    defer String_free(&wgsl);
+    String_append(&wgsl, _gpu_ibl_common);
+    String_append(&wgsl, body);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: wgsl.data, vertex: "vs", fragment: "fs", format: format};
+    GpuPipeline pipe = Gpu_pipeline(g, &d)?;
+    defer GpuPipeline_release(&pipe);
+    float[512] all;
+    for (i in 0..count * 4) all[i] = jobs[i];
+    GpuBuffer ub = Gpu_uniform(g, &all[0], sizeof(all))?;
+    defer GpuBuffer_release(&ub);
+    GpuPipeline_bind(&pipe, 0, &ub);
+    if (src != null) {
+        GpuPipeline_bind_texture(&pipe, 1, src);
+        GpuPipeline_bind_sampler(&pipe, 2, samp);
+    }
+    GpuEncoder enc = Gpu_encoder(g);
+    string err = null;
+    for (i in 0..count) {
+        GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}};
+        GpuPass pass = GpuEncoder_pass_with(&enc, views[i].view, &o);
+        GpuPass_draw_range(&pass, &pipe, null, 0, 3, (uint32)i, 1);
+        Result<int, string> e = GpuPass_end(&pass);
+        if (!e.ok && err == null) err = e.error;
+    }
+    Result<int, string> s = GpuEncoder_submit(&enc);
+    if (err != null) return Err<int, string>(err);
+    if (!s.ok) return s;
+    return Ok<int, string>(0);
+}
+
+// Renders job list jobs (4 floats each) into face views of cube tex (one per
+// face and mip level, mips levels from 0).
+Result<int, string> _ibl_cube_jobs(*Gpu g, string body, *GpuTexture src, *GpuSampler samp, *GpuTexture cube,
+        uint32 mips, *float extra, float samples) {
+    GpuTextureView[96] views;
+    float[384] jobs;
+    int n = 0;
+    for (mip in 0..mips) {
+        for (face in 0..6) {
+            Result<GpuTextureView, string> v = GpuTexture_view_level(cube, (uint32)face, mip);
+            if (!v.ok) {
+                for (k in 0..n) GpuTextureView_release(&views[k]);
+                return Err<int, string>(v.error);
+            }
+            views[n] = v.value;
+            jobs[n * 4] = (float)face;
+            jobs[n * 4 + 1] = extra[mip];
+            jobs[n * 4 + 2] = (float)views[n].width;
+            jobs[n * 4 + 3] = samples;
+            n++;
+        }
+    }
+    Result<int, string> r = _ibl_run(g, body, src, samp, cube.format, &views[0], &jobs[0], n);
+    for (k in 0..n) GpuTextureView_release(&views[k]);
+    return r;
+}
+
+// The split-sum BRDF table as an RG16Float size x size texture: texel (x, y)
+// holds the scale (r) and bias (g) of F0 for NdotV = (x + 0.5) / size and
+// roughness = (y + 0.5) / size. samples is the GGX samples per texel (0:
+// 512).
+Result<GpuTexture, string> Gpu_brdf_lut(*Gpu self, uint32 size, uint32 samples) {
+    if (size == 0) size = 128;
+    GpuTextureDesc d = GpuTextureDesc{width: size, height: size, format: WGPUTextureFormat_RG16Float};
+    GpuTexture lut = Gpu_texture_with(self, &d)?;
+    Result<GpuTextureView, string> v = GpuTexture_view_level(&lut, 0, 0);
+    if (!v.ok) {
+        GpuTexture_release(&lut);
+        return Err<GpuTexture, string>(v.error);
+    }
+    GpuTextureView view = v.value;
+    float[4] job = {0.0, 0.0, (float)size, (float)_ibl_or(samples, 512)};
+    Result<int, string> r = _ibl_run(self, _gpu_ibl_brdf, null, null, lut.format, &view, &job[0], 1);
+    GpuTextureView_release(&view);
+    if (!r.ok) {
+        GpuTexture_release(&lut);
+        return Err<GpuTexture, string>(r.error);
+    }
+    return Ok<GpuTexture, string>(lut);
+}
+
+// Image-based lighting from an equirectangular HDR image (hdr_load), with
+// options o (null for the defaults).
+Result<GpuIbl, string> Gpu_ibl(*Gpu self, *HdrBitmap equirect, *GpuIblOptions o) {
+    if (equirect == null || equirect.rgba == null || equirect.width == 0 || equirect.height == 0) {
+        return Err<GpuIbl, string>(_gpu_fail("ibl: no image", null));
+    }
+    GpuTextureDesc d = GpuTextureDesc{width: equirect.width, height: equirect.height, format: WGPUTextureFormat_RGBA16Float};
+    GpuTexture src = Gpu_texture_with(self, &d)?;
+    defer GpuTexture_release(&src);
+    *uint16 half = alloc<uint16>((int64)equirect.width * equirect.height * 4);
+    HdrBitmap_to_half(equirect, half);
+    Result<int, string> w = GpuTexture_write_level(&src, 0, 0, half);
+    free(half);
+    if (!w.ok) return Err<GpuIbl, string>(w.error);
+    return Gpu_ibl_texture(self, &src, o);
+}
+
+// Gpu_ibl from an equirectangular texture already on the GPU: a filterable
+// float 2D texture (RGBA16Float, or RGBA32Float when Gpu.float32_filterable),
+// or an RGBA8 one for a low dynamic range image. It is only read.
+Result<GpuIbl, string> Gpu_ibl_texture(*Gpu self, *GpuTexture equirect, *GpuIblOptions o) {
+    GpuIblOptions opts;
+    if (o != null) opts = *o;
+    uint32 env_size = _ibl_or(opts.environment_size, 512);
+    uint32 irr_size = _ibl_or(opts.irradiance_size, 32);
+    uint32 spec_size = _ibl_or(opts.specular_size, 128);
+    uint32 spec_mips = _ibl_or(opts.specular_mips, 5);
+    uint32 chain = gpu_mip_count(spec_size, spec_size);
+    if (spec_mips > chain) spec_mips = chain;
+    if (spec_mips > 16) spec_mips = 16;
+    GpuIbl ibl;
+    ibl.gpu = *self;
+    ibl.intensity = 1.0;
+    Result<int, string> r = _ibl_make(&ibl, equirect, env_size, irr_size, spec_size, spec_mips, &opts);
+    if (!r.ok) {
+        GpuIbl_release(&ibl);
+        return Err<GpuIbl, string>(r.error);
+    }
+    return Ok<GpuIbl, string>(ibl);
+}
+
+Result<int, string> _ibl_make(*GpuIbl ibl, *GpuTexture equirect, uint32 env_size, uint32 irr_size, uint32 spec_size,
+        uint32 spec_mips, *GpuIblOptions o) {
+    *Gpu g = &ibl.gpu;
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge};
+    ibl.sampler = Gpu_sampler_with(g, &so)?;
+    GpuSamplerOptions eo = GpuSamplerOptions{wrap_v: WGPUAddressMode_ClampToEdge};
+    GpuSampler esamp = Gpu_sampler_with(g, &eo)?;
+    defer GpuSampler_release(&esamp);
+
+    GpuTextureDesc ed = GpuTextureDesc{width: env_size, height: env_size, format: WGPUTextureFormat_RGBA16Float, cube: true, mipmaps: true};
+    ibl.environment = Gpu_texture_with(g, &ed)?;
+    float[16] zero;
+    _ibl_cube_jobs(g, _gpu_ibl_equirect, equirect, &esamp, &ibl.environment, 1, &zero[0], 0.0)?;
+    GpuTexture_generate_mips(&ibl.environment)?;
+
+    GpuTextureDesc id = GpuTextureDesc{width: irr_size, height: irr_size, format: WGPUTextureFormat_RGBA16Float, cube: true};
+    ibl.irradiance = Gpu_texture_with(g, &id)?;
+    // The environment level whose texels are about as far apart as the
+    // irradiance samples (64 around, 16 up).
+    float lod = 0.0;
+    for (uint32 s = env_size; s > 16; s = s / 2) lod = lod + 1.0;
+    float[16] lods;
+    lods[0] = lod;
+    _ibl_cube_jobs(g, _gpu_ibl_irradiance, &ibl.environment, &ibl.sampler, &ibl.irradiance, 1, &lods[0], 64.0)?;
+
+    GpuTextureDesc sd = GpuTextureDesc{width: spec_size, height: spec_size, format: WGPUTextureFormat_RGBA16Float, cube: true, mips: spec_mips};
+    ibl.specular = Gpu_texture_with(g, &sd)?;
+    float[16] rough;
+    for (m in 0..spec_mips) rough[m] = spec_mips > 1 ? (float)m / (float)(spec_mips - 1) : 0.0;
+    _ibl_cube_jobs(g, _gpu_ibl_specular, &ibl.environment, &ibl.sampler, &ibl.specular, spec_mips, &rough[0],
+        (float)_ibl_or(o.samples, 256))?;
+
+    ibl.brdf = Gpu_brdf_lut(g, _ibl_or(o.brdf_size, 128), o.brdf_samples)?;
+    return Ok<int, string>(0);
+}
+
+// The specular cube's highest mip level (the roughness 1 level).
+float GpuIbl_max_lod(*GpuIbl self) {
+    return self.specular.mips > 0 ? (float)(self.specular.mips - 1) : 0.0;
+}
+
+void GpuIbl_release(*GpuIbl self) {
+    GpuTexture_release(&self.environment);
+    GpuTexture_release(&self.irradiance);
+    GpuTexture_release(&self.specular);
+    GpuTexture_release(&self.brdf);
+    GpuSampler_release(&self.sampler);
+}
