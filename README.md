@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.3.0-6448d4" alt="Version 0.3.0">
+  <img src="https://img.shields.io/badge/version-0.4.0-6448d4" alt="Version 0.4.0">
   <img src="https://img.shields.io/badge/wgpu--native-29-orange" alt="wgpu-native 29">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
@@ -370,7 +370,7 @@ Android, hence the `#if`.
 In an Eskiu package (Eskiu 0.14 or newer, for the iOS and Android archives):
 
 ```bash
-eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.3.0
+eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.4.0
 eskiuc build
 ```
 
