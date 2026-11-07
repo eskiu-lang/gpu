@@ -3,7 +3,8 @@
 // A Bitmap is 8-bit RGBA, four bytes per pixel, rows packed with the top row
 // first, which is what a glTF texture upload wants. image_decode looks at the
 // signature and hands the bytes to png_decode or jpeg_decode; image_load reads
-// a file first. The decoders are pure Eskiu and need no GPU.
+// a file first. The decoders are pure Eskiu and need no GPU. Radiance .hdr
+// files decode to floats instead (hdr_decode, hdr_load: an HdrBitmap).
 //
 //     Bitmap img = image_load("albedo.png")?;
 //     defer img.free();
@@ -13,6 +14,7 @@ import <fs>;
 import <result>;
 import <gpu/png>;
 import <gpu/jpeg>;
+import <gpu/hdr>;
 
 struct Bitmap {
     uint32 width;
