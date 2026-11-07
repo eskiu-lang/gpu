@@ -1,6 +1,6 @@
 # iOS and Android
 
-Rendering into an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app with `<gpu/ui>`, and reading touches. The platform table is in the [README](../README.md#platforms).
+Rendering into an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app with `<gpu/ui>`, and reading touches. The platform table is in the [docs index](README.md#platforms).
 
 API reference: [`<gpu/ui>`](api.md#gpuui), [`<gpu/touch>`](api.md#gputouch).
 

@@ -1,6 +1,6 @@
 # Rendering
 
-The rendering API of `<gpu/render>` (also in `<gpu>`), past the first triangle in the [README](../README.md#rendering). Every call that can fail returns a `Result` with the WebGPU validation message.
+The rendering API of `<gpu/render>` (also in `<gpu>`), from a first window to render targets and shadow maps. Every call that can fail returns a `Result` with the WebGPU validation message.
 
 ## A window and a triangle
 

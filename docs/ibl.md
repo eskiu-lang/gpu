@@ -2,7 +2,7 @@
 
 `<gpu/ibl>` lights physically based materials with an environment map, and `<gpu/model>`
 uses it in place of its hemisphere ambient term. The short example is in the
-[README](../README.md#models).
+[README](models.md#loading-and-drawing-a-model).
 
 API reference: [`<gpu/ibl>`](api.md#gpuibl), [`<gpu/hdr>`](api.md#gpuhdr).
 

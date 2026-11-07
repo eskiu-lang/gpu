@@ -1,6 +1,6 @@
 # Machine learning
 
-`<gpu/nn>` (inference) and `<gpu/train>` (training). Llama 2 numbers are in the [README](../README.md#machine-learning).
+`<gpu/nn>` (inference) and `<gpu/train>` (training). Llama 2 numbers are under [Inference](#inference).
 
 ## Inference
 

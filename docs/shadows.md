@@ -3,7 +3,7 @@
 Shadows from `GpuModel.light` in `<gpu/model>`: one directional light, a shadow map rendered
 from it through an orthographic projection, read back with a comparison sampler and
 percentage-closer filtering. They are off by default, and a model without them draws
-exactly as before. The short example is in the [README](../README.md#models); the
+exactly as before. The short example is in [Models](models.md#loading-and-drawing-a-model); the
 lower-level pieces (depth textures, comparison samplers, depth-only pipelines) are in
 [rendering.md](rendering.md#shadow-maps).
 

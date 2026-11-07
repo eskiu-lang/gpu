@@ -1,6 +1,6 @@
 # Morph targets
 
-glTF morph targets (blend shapes) in `<gpu/gltf>` and `<gpu/model>`. The short example is in the [README](../README.md#models).
+glTF morph targets (blend shapes) in `<gpu/gltf>` and `<gpu/model>`. The short example is in [Models](models.md#loading-and-drawing-a-model).
 
 API reference: [`<gpu/gltf>`](api.md#gpugltf), [`<gpu/model>`](api.md#gpumodel).
 

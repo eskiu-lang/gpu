@@ -3,7 +3,7 @@
 The WebGPU modules also build for `wasm32-unknown-emscripten`. In a browser the GPU is the
 browser's own WebGPU, reached through Emscripten's `emdawnwebgpu` port, and the same Eskiu
 program builds for the desktop and for the web: `examples/triangle.esk`, `cube.esk` and
-`model.esk` run in a page unchanged. The platform table is in the [README](../README.md#platforms).
+`model.esk` run in a page unchanged. The platform table is in the [docs index](README.md#platforms).
 
 API reference: [`Gpu_surface_canvas`](api.md#gpu_surface_canvas), [`<gpu/window>`](api.md#gpuwindow).
 
