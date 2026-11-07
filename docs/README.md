@@ -12,6 +12,7 @@ Guides and reference for gpu. The [README](../README.md) has the overview.
 - [Rendering](rendering.md)
 - [Model shadows](shadows.md)
 - [In a browser](web.md)
+- [Camera and video frames](yuv.md)
 - [API reference](api.md): every public function and type
 <!-- /pages -->
 
@@ -19,7 +20,7 @@ Guides and reference for gpu. The [README](../README.md) has the overview.
 
 | Modules | macOS arm64 | Linux x86-64 | Windows x86-64 | iOS (arm64, simulator) | Android (arm64, x86-64) | WebAssembly |
 |---|---|---|---|---|---|---|
-| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | yes (the browser's WebGPU) |
+| WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/yuv>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | yes (the browser's WebGPU) |
 | `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | yes (the page's canvas) |
 | `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
 | `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
@@ -43,6 +44,7 @@ fingers at once) is in [docs/mobile.md](mobile.md).
 | `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-lang/ui` apps on iOS and Android |
 | `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8; `hdr_load`, `hdr_decode`: Radiance `.hdr` to floats (`HdrBitmap`) |
+| `<gpu/yuv>` | `Gpu_yuv`, `GpuYuv` (`upload`, `draw`, `to_rgba`): camera and video frames (NV12, NV21, I420, three-plane YUV, RGBA) to RGB in a shader, BT.601 and BT.709, full and limited range, turned upright |
 | `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2` |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |

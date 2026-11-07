@@ -72,6 +72,15 @@ All notable changes to this package are documented in this file. The format is b
   so the triangle, cube and model examples run in a page unchanged. `<gpu/raw>` has a section
   generated from emdawnwebgpu's `webgpu.h` (`tools/gen.py --web`, checked by
   `tools/layout_check.sh --web`). Guide: `docs/web.md`.
+- `<gpu/yuv>`: camera and video frames on the GPU. `Gpu_yuv` and `GpuYuv_upload` put a
+  frame's planes in textures as they are (Y as R8, interleaved chroma as RG8, separate U and V
+  as R8, uploaded with the frame's row stride; a plane is repacked on the CPU only when no
+  texture format reads it in place), `GpuYuv_draw` converts to RGB in a shader (BT.601 or
+  BT.709, full or limited range; an sRGB target stores the same bytes) into a rectangle of a
+  pass, stretched, contained or covering it, turned upright by the frame's rotation and
+  optionally mirrored, and `GpuYuv_to_rgba` renders it into an RGBA8 texture. `GpuYuvImage`
+  has the layout of ui-camera's `CameraFrame` and video's `VideoFrame` (NV12, NV21, I420,
+  three planes with any pixel stride, RGBA). Guide: `docs/yuv.md`.
 
 ### Fixed
 

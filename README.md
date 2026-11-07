@@ -96,6 +96,7 @@ $ eskiuc run twice.esk
 - [Rendering](docs/rendering.md): windows, textures, passes, stencil, multisampling, render targets, cube maps, mipmaps, shadow maps, compressed textures
 - [Models](docs/models.md): glTF and OBJ, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
 - [Images](docs/image.md): PNG, JPEG, HDR, KTX2, EXIF orientation and limits
+- [Camera and video frames](docs/yuv.md): `<gpu/yuv>`, YUV planes to RGB on the GPU
 - [Web](docs/web.md): the browser through emdawnwebgpu
 - [iOS and Android](docs/mobile.md): `GpuView`, the frame loop, touches
 - [Machine learning](docs/ml.md): `<gpu/nn>` inference and `<gpu/train>`
