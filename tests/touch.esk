@@ -1,0 +1,137 @@
+// <gpu/touch>: the "gpu" channel's touch payload and the GpuTouches state (ids, phases,
+// cancel, a lost or out-of-order up). Headless: no GPU, no ui.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu/touch>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+GpuTouch touch(int id, int phase, float x, float y, double time) {
+    return GpuTouch{id, phase, x, y, time};
+}
+
+void parse_tests() {
+    GpuTouch[4] got;
+    *GpuTouch out = &got[0];
+    int n = gpu_touch_parse("touch 1500 3 0 1 10 20 1 0 -5 7 4 2 300 400", out, 4);
+    check("parse count", n == 3);
+    check("parse time", got[0].time == 1.5 && got[2].time == 1.5);
+    check("parse first", got[0].id == 0 && got[0].phase == GPU_TOUCH_MOVE && got[0].x == 10.0 && got[0].y == 20.0);
+    check("parse negative x", got[1].id == 1 && got[1].phase == GPU_TOUCH_DOWN && got[1].x == -5.0 && got[1].y == 7.0);
+    check("parse up", got[2].id == 4 && got[2].phase == GPU_TOUCH_UP && got[2].x == 300.0);
+    check("parse max", gpu_touch_parse("touch 0 3 0 0 1 1 1 0 2 2 2 0 3 3", out, 2) == 2);
+    check("parse empty", gpu_touch_parse("touch 0 0", out, 4) == 0);
+    check("not touch: resize", gpu_touch_parse("resize 100 200", out, 4) == -1);
+    check("not touch: destroy", gpu_touch_parse("destroy", out, 4) == -1);
+    check("not touch: null", gpu_touch_parse(null, out, 4) == -1);
+    check("short payload", gpu_touch_parse("touch 0 2 0 0 1 1", out, 4) == -1);
+    check("bad phase", gpu_touch_parse("touch 0 1 0 7 1 1", out, 4) == -1);
+}
+
+void state_tests() {
+    GpuTouches t;
+    defer t.free();
+    // Three fingers: a joystick, an attack button, an aim drag.
+    t.apply(touch(0, GPU_TOUCH_DOWN, 100.0, 900.0, 1.0));
+    t.apply(touch(1, GPU_TOUCH_DOWN, 900.0, 900.0, 1.1));
+    t.apply(touch(2, GPU_TOUCH_DOWN, 700.0, 500.0, 1.2));
+    check("three down", t.count() == 3);
+    check("order kept", t.down.data[0].id == 0 && t.down.data[1].id == 1 && t.down.data[2].id == 2);
+    check("began", t.down.data[0].began && t.down.data[2].began);
+    t.end_frame();
+    check("began cleared", !t.down.data[0].began && !t.down.data[1].began);
+
+    t.apply(touch(0, GPU_TOUCH_MOVE, 130.0, 860.0, 1.3));
+    t.apply(touch(2, GPU_TOUCH_MOVE, 650.0, 480.0, 1.3));
+    *GpuTouchPoint stick = t.find(0);
+    check("find", stick != null && stick.x == 130.0 && stick.y == 860.0);
+    check("start kept", stick != null && stick.start_x == 100.0 && stick.start_y == 900.0 && stick.start_time == 1.0);
+    check("phase move", stick != null && stick.phase == GPU_TOUCH_MOVE);
+    check("unmoved stays down", t.find(1).phase == GPU_TOUCH_DOWN);
+
+    // The middle finger lifts first (out of the order they went down).
+    t.apply(touch(1, GPU_TOUCH_UP, 905.0, 902.0, 1.4));
+    check("two down after up", t.count() == 2);
+    check("released one", t.released.size == 1 && t.released.data[0].id == 1);
+    check("released phase", t.released.data[0].phase == GPU_TOUCH_UP && t.released.data[0].x == 905.0);
+    check("gone", t.find(1) == null);
+    check("others kept", t.down.data[0].id == 0 && t.down.data[1].id == 2);
+    t.end_frame();
+    check("released cleared", t.released.size == 0);
+
+    // A move or up for an id that is not down (a late or repeated event) is ignored.
+    t.apply(touch(1, GPU_TOUCH_MOVE, 1.0, 1.0, 1.5));
+    t.apply(touch(1, GPU_TOUCH_UP, 1.0, 1.0, 1.5));
+    t.apply(touch(9, GPU_TOUCH_CANCEL, 1.0, 1.0, 1.5));
+    check("unknown ignored", t.count() == 2 && t.released.size == 0);
+
+    // The id comes back for a new finger.
+    t.apply(touch(1, GPU_TOUCH_DOWN, 50.0, 60.0, 1.6));
+    check("id reused", t.count() == 3 && t.find(1) != null && t.find(1).start_x == 50.0);
+
+    // A down for an id that is down: its up was lost, the old finger is cancelled.
+    t.apply(touch(2, GPU_TOUCH_DOWN, 10.0, 10.0, 1.7));
+    check("lost up count", t.count() == 3);
+    check("lost up cancelled", t.released.size == 1 && t.released.data[0].id == 2 &&
+        t.released.data[0].phase == GPU_TOUCH_CANCEL && t.released.data[0].x == 650.0);
+    check("lost up new finger", t.find(2).start_x == 10.0 && t.find(2).began);
+    t.end_frame();
+
+    // A tap between two frames: down and up before end_frame.
+    t.apply(touch(5, GPU_TOUCH_DOWN, 300.0, 300.0, 1.8));
+    t.apply(touch(5, GPU_TOUCH_UP, 301.0, 300.0, 1.81));
+    check("tap released", t.released.size == 1 && t.released.data[0].began &&
+        t.released.data[0].phase == GPU_TOUCH_UP);
+    check("tap not down", t.find(5) == null);
+    t.end_frame();
+
+    // Cancel: one finger, then every finger.
+    t.apply(touch(0, GPU_TOUCH_CANCEL, 140.0, 850.0, 1.9));
+    check("cancel one", t.count() == 2 && t.released.size == 1 && t.released.data[0].phase == GPU_TOUCH_CANCEL);
+    t.cancel_all(2.0);
+    check("cancel all", t.count() == 0 && t.released.size == 3);
+    check("cancel all phase", t.released.data[1].phase == GPU_TOUCH_CANCEL && t.released.data[2].time == 2.0);
+    t.end_frame();
+    check("empty", t.count() == 0 && t.released.size == 0);
+}
+
+void stream_tests() {
+    // The payloads a three-finger session sends, applied as use_gpu_touches does.
+    string[6] payloads = {
+        "touch 1000 1 0 0 10 10",
+        "touch 1010 1 1 0 20 20",
+        "touch 1016 2 0 1 12 11 1 1 22 21",
+        "touch 1020 1 2 0 30 30",
+        "touch 1033 3 0 1 14 12 1 1 24 22 2 1 31 33",
+        "touch 1040 3 0 3 14 12 1 3 24 22 2 3 31 33"
+    };
+    GpuTouches t;
+    defer t.free();
+    GpuTouch[8] buf;
+    int peak = 0;
+    for (i in 0..6) {
+        int n = gpu_touch_parse(payloads[i], &buf[0], 8);
+        check("stream parse", n > 0);
+        for (k in 0..n) t.apply(buf[k]);
+        if (t.count() > peak) peak = t.count();
+    }
+    check("stream peak", peak == 3);
+    check("stream cancelled", t.count() == 0 && t.released.size == 3);
+    check("stream last position", t.released.data[2].id == 2 && t.released.data[2].x == 31.0 && t.released.data[2].y == 33.0);
+}
+
+int main() {
+    parse_tests();
+    state_tests();
+    stream_tests();
+    printf("touch: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

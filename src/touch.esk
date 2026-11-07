@@ -1,0 +1,163 @@
+// touch.esk: touches on a GpuView (<gpu/ui>) and the set of fingers that are down.
+//
+// <gpu/ui>'s use_gpu_touch calls a handler with each GpuTouch; use_gpu_touches keeps a
+// GpuTouches up to date for a game to read once per frame:
+//
+//     *GpuTouches touches = use_gpu_touches();
+//     use_frame(true, void(Tick t) {
+//         for (i in 0..touches.down.size) { GpuTouchPoint p = touches.down.data[i]; ... }
+//         for (i in 0..touches.released.size) { ... }   // went up since the last frame
+//         touches.end_frame();
+//     });
+//
+// This module has no <ui> dependency: it is the part of <gpu/ui> that runs anywhere.
+
+import <mem>;
+import <list>;
+
+const int GPU_TOUCH_DOWN = 0;
+const int GPU_TOUCH_MOVE = 1;
+const int GPU_TOUCH_UP = 2;
+const int GPU_TOUCH_CANCEL = 3;
+
+// One finger's change. id stays the same from GPU_TOUCH_DOWN to its GPU_TOUCH_UP or
+// GPU_TOUCH_CANCEL, and is reused by a later finger after that (Android's pointer ids;
+// on iOS the smallest id not in use). x and y are pixels from the GpuView's top left, the
+// units of use_gpu_surface's size; time is seconds on the platform's event clock.
+struct GpuTouch {
+    int id;
+    int phase;
+    float x;
+    float y;
+    double time;
+}
+
+// A finger as GpuTouches tracks it: where it is, where and when it went down, and phase,
+// the last change (GPU_TOUCH_DOWN or GPU_TOUCH_MOVE while down, GPU_TOUCH_UP or
+// GPU_TOUCH_CANCEL once released). began is true until the end_frame after it went down,
+// so a tap that goes down and up between two frames is still seen.
+struct GpuTouchPoint {
+    int id;
+    int phase;
+    float x;
+    float y;
+    float start_x;
+    float start_y;
+    double start_time;
+    double time;
+    bool began;
+}
+
+// The fingers that are down, in the order they went down, and those released since the
+// last end_frame.
+struct GpuTouches {
+    List<GpuTouchPoint> down;
+    List<GpuTouchPoint> released;
+}
+
+int _gpu_touch_index(*GpuTouches self, int id) {
+    for (i in 0..self.down.size) {
+        if (self.down.data[i].id == id) return i;
+    }
+    return -1;
+}
+
+void _gpu_touch_release(*GpuTouches self, int at, int phase, double time) {
+    GpuTouchPoint p = self.down.data[at];
+    p.phase = phase;
+    p.time = time;
+    self.down.remove(at);
+    self.released.push(p);
+}
+
+// Applies one touch. A down for an id already down releases the old finger as cancelled
+// first (its up was lost); a move, up or cancel for an id that is not down is ignored.
+void GpuTouches_apply(*GpuTouches self, GpuTouch t) {
+    int at = _gpu_touch_index(self, t.id);
+    if (t.phase == GPU_TOUCH_DOWN) {
+        if (at >= 0) _gpu_touch_release(self, at, GPU_TOUCH_CANCEL, t.time);
+        self.down.push(GpuTouchPoint{t.id, GPU_TOUCH_DOWN, t.x, t.y, t.x, t.y, t.time, t.time, true});
+        return;
+    }
+    if (at < 0) return;
+    *GpuTouchPoint p = &self.down.data[at];
+    p.x = t.x;
+    p.y = t.y;
+    p.time = t.time;
+    if (t.phase == GPU_TOUCH_MOVE) {
+        p.phase = GPU_TOUCH_MOVE;
+    } else if (t.phase == GPU_TOUCH_UP || t.phase == GPU_TOUCH_CANCEL) {
+        _gpu_touch_release(self, at, t.phase, t.time);
+    }
+}
+
+// The finger with this id while it is down, else null. The pointer is good until the next
+// apply.
+*GpuTouchPoint GpuTouches_find(*GpuTouches self, int id) {
+    int at = _gpu_touch_index(self, id);
+    return at < 0 ? null : &self.down.data[at];
+}
+
+int GpuTouches_count(*GpuTouches self) {
+    return self.down.size;
+}
+
+// Ends a frame: forgets the released fingers and clears began.
+void GpuTouches_end_frame(*GpuTouches self) {
+    self.released.clear();
+    for (i in 0..self.down.size) self.down.data[i].began = false;
+}
+
+// Releases every finger as cancelled (the surface went away, the screen changed).
+void GpuTouches_cancel_all(*GpuTouches self, double time) {
+    while (self.down.size > 0) _gpu_touch_release(self, 0, GPU_TOUCH_CANCEL, time);
+}
+
+void GpuTouches_free(*GpuTouches self) {
+    self.down.free();
+    self.released.free();
+}
+
+bool _gpu_touch_int(string text, *int at, *int64 value) {
+    int i = *at;
+    while (text[i] == ' ') i++;
+    bool negative = text[i] == '-';
+    if (negative) i++;
+    int start = i;
+    int64 v = 0;
+    while (text[i] >= '0' && text[i] <= '9') {
+        v = v * 10 + (int64)(text[i] - '0');
+        i++;
+    }
+    if (i == start) return false;
+    *value = negative ? -v : v;
+    *at = i;
+    return true;
+}
+
+// Parses the "gpu" channel's "touch TIME_MS COUNT (ID PHASE X Y)..." into out, at most
+// max touches. Returns how many, or -1 when the payload is not a well-formed touch event.
+int gpu_touch_parse(string payload, *GpuTouch out, int max) {
+    if (payload == null || strncmp(payload, "touch ", 6) != 0) return -1;
+    int at = 6;
+    int64 ms = 0;
+    int64 count = 0;
+    if (!_gpu_touch_int(payload, &at, &ms) || !_gpu_touch_int(payload, &at, &count)) return -1;
+    if (count < 0) return -1;
+    double time = (double)ms / 1000.0;
+    int n = 0;
+    for (int64 k = 0; k < count; k++) {
+        int64 id = 0;
+        int64 phase = 0;
+        int64 x = 0;
+        int64 y = 0;
+        if (!_gpu_touch_int(payload, &at, &id) || !_gpu_touch_int(payload, &at, &phase) ||
+            !_gpu_touch_int(payload, &at, &x) || !_gpu_touch_int(payload, &at, &y)) return -1;
+        if (phase < GPU_TOUCH_DOWN || phase > GPU_TOUCH_CANCEL) return -1;
+        if (n < max) {
+            out[n] = GpuTouch{(int)id, (int)phase, (float)x, (float)y, time};
+            n++;
+        }
+    }
+    return n;
+}
