@@ -1,0 +1,402 @@
+// Renders a fixed set of scenes offscreen and prints each one's pixels, for comparing
+// backends: native WebGPU, the browser's WebGPU and the WebGL2 backend
+// (tools/compare_scenes.py reads the outputs). Every scene is 128x128 RGBA8, printed as
+// "SCENE name width height hex" on one line.
+//
+//     eskiuc tools/render_scenes.esk -o build/scenes && build/scenes > native.txt
+//     node tools/web_run.mjs build/web/render_scenes.js --no-webgpu > webgl2.txt
+//
+// Arguments name extra glTF files to draw with <gpu/model>, posed at 0.3 s into their
+// first animation.
+import <io>;
+import <mem>;
+import <string>;
+import <libc>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/model>;
+
+const uint32 W = 128;
+const uint32 H = 128;
+
+void print_scene(string name, *GpuTexture t) {
+    *uint8 px = alloc<uint8>((int)(W * H * 4));
+    defer free(px);
+    Result<int, string> r = t.read(px);
+    if (!r.ok) {
+        printf("ERROR %s: %s\n", name, r.error);
+        return;
+    }
+    String line;
+    defer String_free(&line);
+    String_appendf(&line, "SCENE %s %d %d ", name, (int)W, (int)H);
+    for (i in 0..W * H * 4) String_appendf(&line, "%02x", (int)px[i]);
+    printf("%s\n", line.data);
+}
+
+string colored =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };\n"
+    "@vertex fn vs(@location(0) p: vec2<f32>, @location(1) c: vec3<f32>) -> V {\n"
+    "    return V(vec4<f32>(p, 0.0, 1.0), c);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return vec4<f32>(v.color, 1.0); }\n";
+
+Result<int, string> triangle(*Gpu gpu) {
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    float[15] v = {-0.8, -0.7, 1.0, 0.1, 0.1, 0.8, -0.7, 0.1, 1.0, 0.1, 0.0, 0.85, 0.1, 0.2, 1.0};
+    GpuBuffer vb = gpu.vertices(&v, sizeof(v))?;
+    defer vb.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 20};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x2, 0);
+    l.add(WGPUVertexFormat_Float32x3, 8);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: colored, vertex: "vs", fragment: "fs", format: t.format, layout: &l};
+    GpuPipeline p = gpu.pipeline(&d)?;
+    defer p.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.1, 0.1, 0.12, 1.0}, null);
+    pass.draw(&p, &vb, 3, 1);
+    pass.end()?;
+    print_scene("triangle", &t);
+    return Ok<int, string>(0);
+}
+
+string textured =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) shade: f32 };\n"
+    "@group(0) @binding(0) var<uniform> mvp: mat4x4<f32>;\n"
+    "@group(0) @binding(1) var tex: texture_2d<f32>;\n"
+    "@group(0) @binding(2) var samp: sampler;\n"
+    "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) shade: f32) -> V {\n"
+    "    return V(mvp * vec4(p, 1.0), uv, shade);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    return vec4(textureSample(tex, samp, v.uv).rgb * v.shade, 1.0);\n"
+    "}\n";
+
+void cube(*float out, *uint32 idx) {
+    float[72] p = {-1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1, 1,
+                    1, -1, -1, -1, -1, -1, -1, 1, -1, 1, 1, -1,
+                   -1, -1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1,
+                    1, -1, 1, 1, -1, -1, 1, 1, -1, 1, 1, 1,
+                   -1, 1, 1, 1, 1, 1, 1, 1, -1, -1, 1, -1,
+                   -1, -1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1};
+    float[8] uv = {0, 1, 1, 1, 1, 0, 0, 0};
+    float[6] shade = {1.0, 0.7, 0.8, 0.8, 0.95, 0.6};
+    for (f in 0..6) {
+        for (c in 0..4) {
+            int v = f * 4 + c;
+            for (k in 0..3) out[v * 6 + k] = p[v * 3 + k];
+            out[v * 6 + 3] = uv[c * 2];
+            out[v * 6 + 4] = uv[c * 2 + 1];
+            out[v * 6 + 5] = shade[f];
+        }
+        uint32 b = (uint32)(f * 4);
+        uint32[6] q = {b, b + 1, b + 2, b, b + 2, b + 3};
+        for (k in 0..6) idx[f * 6 + k] = q[k];
+    }
+}
+
+// The textured cube of examples/cube.esk, with an sRGB mipmapped texture and a
+// trilinear sampler, turned 0.7 radians.
+Result<int, string> textured_cube(*Gpu gpu) {
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    GpuTexture depth = gpu.depth(W, H)?;
+    defer depth.release();
+    float[144] verts;
+    uint32[36] idx;
+    cube(&verts[0], &idx[0]);
+    GpuBuffer vb = gpu.vertices(&verts, sizeof(verts))?;
+    defer vb.release();
+    GpuBuffer ib = gpu.indices(&idx[0], 36)?;
+    defer ib.release();
+    *uint8 pixels = alloc<uint8>(64 * 64 * 4);
+    defer free(pixels);
+    for (y in 0..64) {
+        for (x in 0..64) {
+            bool on = ((x / 8) + (y / 8)) % 2 == 0;
+            int i = (y * 64 + x) * 4;
+            pixels[i] = on ? (uint8)240 : (uint8)(x * 3);
+            pixels[i + 1] = on ? (uint8)140 : (uint8)60;
+            pixels[i + 2] = on ? (uint8)40 : (uint8)(y * 3);
+            pixels[i + 3] = 255;
+        }
+    }
+    GpuImageOptions io = GpuImageOptions{srgb: true, mipmaps: true};
+    GpuTexture image = gpu.image_with(64, 64, pixels, &io)?;
+    defer image.release();
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true};
+    GpuSampler samp = gpu.sampler_with(&so)?;
+    defer samp.release();
+    Mat4 view = mat4_look_at(Vec3{0.0, 1.5, 5.0}, Vec3{0.0, 0.0, 0.0}, Vec3{0.0, 1.0, 0.0});
+    Mat4 mvp = mat4_perspective(0.9, 1.0, 0.1, 100.0) * view * quat_axis_angle(Vec3{0.4, 1.0, 0.2}, 0.7).to_mat4();
+    GpuBuffer ub = gpu.uniform(&mvp, sizeof(Mat4))?;
+    defer ub.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 24};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x3, 0);
+    l.add(WGPUVertexFormat_Float32x2, 12);
+    l.add(WGPUVertexFormat_Float32, 20);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: textured, vertex: "vs", fragment: "fs", format: t.format,
+        layout: &l, depth: true, cull: WGPUCullMode_Back};
+    GpuPipeline p = gpu.pipeline(&d)?;
+    defer p.release();
+    p.bind(0, &ub);
+    p.bind_texture(1, &image);
+    p.bind_sampler(2, &samp);
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.08, 0.08, 0.1, 1.0}, &depth);
+    pass.draw_indexed(&p, &vb, &ib, 36, 1);
+    pass.end()?;
+    print_scene("textured", &t);
+    return Ok<int, string>(0);
+}
+
+string instanced =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) n: u32,\n"
+    "              @location(0) at: vec2<f32>, @location(1) color: vec4<f32>) -> V {\n"
+    "    let c = vec2<f32>(f32(i & 1u), f32((i >> 1u) & 1u)) * 0.5 - 0.25;\n"
+    "    return V(vec4<f32>(at + c * (1.0 + f32(n) * 0.1), 0.0, 1.0), color);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+
+// Instanced quads from an instance-step buffer, drawn from a first instance, alpha
+// blended, inside a viewport and a scissor rectangle.
+Result<int, string> instancing(*Gpu gpu) {
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    float[30] inst = {-0.5, -0.5, 1.0, 0.0, 0.0, 0.8,
+                       0.5, -0.5, 0.0, 1.0, 0.0, 0.6,
+                       0.0, 0.0, 0.0, 0.0, 1.0, 0.5,
+                      -0.5, 0.5, 1.0, 1.0, 0.0, 0.7,
+                       0.5, 0.5, 1.0, 0.0, 1.0, 0.9};
+    GpuBuffer ib = gpu.vertices(&inst, sizeof(inst))?;
+    defer ib.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 24, step: WGPUVertexStepMode_Instance};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x2, 0);
+    l.add(WGPUVertexFormat_Float32x4, 8);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: instanced, vertex: "vs", fragment: "fs", format: t.format,
+        layout: &l, topology: WGPUPrimitiveTopology_TriangleStrip, blend_mode: GPU_BLEND_ALPHA};
+    GpuPipeline p = gpu.pipeline(&d)?;
+    defer p.release();
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.2, 0.2, 0.2, 1.0}, null);
+    pass.set_viewport(8.0, 16.0, 112.0, 100.0);
+    pass.set_scissor(4, 20, 100, 90);
+    pass.set_vertices(0, &ib);
+    pass.draw_range(&p, null, 0, 4, 1, 4);
+    pass.end()?;
+    print_scene("instancing", &t);
+    return Ok<int, string>(0);
+}
+
+string stencil_shader =
+    "@group(0) @binding(0) var<uniform> color: vec4<f32>;\n"
+    "@vertex fn vs(@location(0) p: vec2<f32>) -> @builtin(position) vec4<f32> {\n"
+    "    return vec4<f32>(p, 0.5, 1.0);\n"
+    "}\n"
+    "@fragment fn fs() -> @location(0) vec4<f32> { return color; }\n";
+
+// A star written into the stencil only, then a full quad drawn where the stencil is 1
+// and another where it is not.
+Result<int, string> stencil(*Gpu gpu) {
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    GpuTexture ds = gpu.depth_stencil(W, H)?;
+    defer ds.release();
+    float[36] star;
+    for (i in 0..6) {
+        float a0 = (float)i * 2.0943951;
+        float a1 = a0 + 1.0471976;
+        star[i * 6] = 0.0;
+        star[i * 6 + 1] = 0.0;
+        star[i * 6 + 2] = 0.9 * cosf(a0);
+        star[i * 6 + 3] = 0.9 * sinf(a0);
+        star[i * 6 + 4] = 0.3 * cosf(a1);
+        star[i * 6 + 5] = 0.3 * sinf(a1);
+    }
+    GpuBuffer sb = gpu.vertices(&star, sizeof(star))?;
+    defer sb.release();
+    float[12] quad = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+    GpuBuffer qb = gpu.vertices(&quad, sizeof(quad))?;
+    defer qb.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 8};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x2, 0);
+    GpuPipelineDesc mark = GpuPipelineDesc{wgsl: stencil_shader, vertex: "vs", fragment: "fs", format: t.format, layout: &l,
+        depth: true, depth_format: WGPUTextureFormat_Depth24PlusStencil8, depth_compare: WGPUCompareFunction_Always,
+        depth_read_only: true, no_color_write: true,
+        stencil_front: GpuStencilFace{compare: WGPUCompareFunction_Always, pass: WGPUStencilOperation_Replace}};
+    GpuPipeline pm = gpu.pipeline(&mark)?;
+    defer pm.release();
+    GpuPipelineDesc inside = mark;
+    inside.no_color_write = false;
+    inside.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_Equal};
+    GpuPipeline pin = gpu.pipeline(&inside)?;
+    defer pin.release();
+    GpuPipelineDesc outside = inside;
+    outside.stencil_front = GpuStencilFace{compare: WGPUCompareFunction_NotEqual};
+    GpuPipeline pout = gpu.pipeline(&outside)?;
+    defer pout.release();
+    float[4] gold = {1.0, 0.8, 0.1, 1.0};
+    float[4] blue = {0.1, 0.2, 0.6, 1.0};
+    GpuBuffer ug = gpu.uniform(&gold, 16)?;
+    defer ug.release();
+    GpuBuffer ub = gpu.uniform(&blue, 16)?;
+    defer ub.release();
+    pm.bind(0, &ug);
+    pin.bind(0, &ug);
+    pout.bind(0, &ub);
+    GpuPassOptions o = GpuPassOptions{clear: GpuColor{0.0, 0.0, 0.0, 1.0}, depth: &ds};
+    GpuPass pass = gpu.pass_with(t.view, &o);
+    pass.set_stencil_reference(1);
+    pass.draw(&pm, &sb, 18, 1);
+    pass.draw(&pin, &qb, 6, 1);
+    pass.draw(&pout, &qb, 6, 1);
+    pass.end()?;
+    print_scene("stencil", &t);
+    return Ok<int, string>(0);
+}
+
+string mrt_shader =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "struct O { @location(0) a: vec4<f32>, @location(1) b: vec4<f32> };\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return V(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), p);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> O {\n"
+    "    let r = length(v.uv - vec2<f32>(0.5, 0.5));\n"
+    "    return O(vec4<f32>(v.uv, 0.5, 1.0), vec4<f32>(r, 1.0 - r, v.uv.x * v.uv.y, 0.5));\n"
+    "}\n";
+
+// Two color targets in one pass: the first replaced, the second added over its clear
+// color (GPU_BLEND_ADDITIVE).
+Result<int, string> mrt(*Gpu gpu) {
+    GpuTexture a = gpu.target(W, H)?;
+    defer a.release();
+    GpuTexture b = gpu.target(W, H)?;
+    defer b.release();
+    GpuColorTarget[2] targets = {GpuColorTarget{format: a.format}, GpuColorTarget{format: b.format, blend_mode: GPU_BLEND_ADDITIVE}};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: mrt_shader, vertex: "vs", fragment: "fs", targets: &targets[0], target_count: 2};
+    GpuPipeline p = gpu.pipeline(&d)?;
+    defer p.release();
+    GpuColorAttachment[2] cs = {GpuColorAttachment{view: a.view, clear: GpuColor{0.0, 0.0, 0.0, 1.0}},
+        GpuColorAttachment{view: b.view, clear: GpuColor{0.2, 0.1, 0.3, 1.0}}};
+    GpuPassOptions o = GpuPassOptions{colors: &cs[0], color_count: 2};
+    GpuPass pass = gpu.pass_with(null, &o);
+    pass.draw(&p, null, 3, 1);
+    pass.end()?;
+    print_scene("mrt0", &a);
+    print_scene("mrt1", &b);
+    return Ok<int, string>(0);
+}
+
+string sample_shader =
+    "struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };\n"
+    "@group(0) @binding(0) var tex: texture_2d<f32>;\n"
+    "@group(0) @binding(1) var samp: sampler;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> V {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return V(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), vec2<f32>(p.x, 1.0 - p.y) * 3.0 - 1.0);\n"
+    "}\n"
+    "@fragment fn fs(v: V) -> @location(0) vec4<f32> {\n"
+    "    return textureSample(tex, samp, v.uv);\n"
+    "}\n";
+
+// The triangle scene rendered into a 32x32 texture with mip levels (generate_mips), then
+// sampled with mirror-repeat and trilinear filtering over the whole target.
+Result<int, string> render_to_texture(*Gpu gpu) {
+    GpuTextureDesc td = GpuTextureDesc{width: 32, height: 32, mipmaps: true};
+    GpuTexture src = gpu.texture_with(&td)?;
+    defer src.release();
+    GpuTextureView level0 = src.view_level(0, 0)?;
+    defer level0.release();
+    float[15] v = {-0.8, -0.7, 1.0, 0.1, 0.1, 0.8, -0.7, 0.1, 1.0, 0.1, 0.0, 0.85, 0.1, 0.2, 1.0};
+    GpuBuffer vb = gpu.vertices(&v, sizeof(v))?;
+    defer vb.release();
+    GpuVertexLayout l = GpuVertexLayout{stride: 20};
+    defer l.release();
+    l.add(WGPUVertexFormat_Float32x2, 0);
+    l.add(WGPUVertexFormat_Float32x3, 8);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: colored, vertex: "vs", fragment: "fs", format: src.format, layout: &l};
+    GpuPipeline p = gpu.pipeline(&d)?;
+    defer p.release();
+    GpuPass pass = gpu.pass(level0.view, GpuColor{0.9, 0.9, 0.9, 1.0}, null);
+    pass.draw(&p, &vb, 3, 1);
+    pass.end()?;
+    src.generate_mips()?;
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    GpuSamplerOptions so = GpuSamplerOptions{mipmaps: true, wrap_u: WGPUAddressMode_MirrorRepeat, wrap_v: WGPUAddressMode_Repeat};
+    GpuSampler samp = gpu.sampler_with(&so)?;
+    defer samp.release();
+    GpuPipelineDesc sd = GpuPipelineDesc{wgsl: sample_shader, vertex: "vs", fragment: "fs", format: t.format};
+    GpuPipeline sp = gpu.pipeline(&sd)?;
+    defer sp.release();
+    sp.bind_texture(0, &src);
+    sp.bind_sampler(1, &samp);
+    GpuPass p2 = gpu.pass(t.view, GpuColor{0.0, 0.0, 0.0, 1.0}, null);
+    p2.draw(&sp, null, 3, 1);
+    p2.end()?;
+    print_scene("render_to_texture", &t);
+    return Ok<int, string>(0);
+}
+
+// A glTF file drawn by GpuModel, framed by its bounds, at 0.3 s into its first animation.
+Result<int, string> model(*Gpu gpu, string path, string name) {
+    Gltf data = gltf_load(path)?;
+    defer data.free();
+    GpuTexture t = gpu.target(W, H)?;
+    defer t.release();
+    GpuTexture depth = gpu.depth(W, H)?;
+    defer depth.release();
+    GpuModel m = gpu.model(&data, t.format)?;
+    defer m.release();
+    if (data.animations.size > 0) data.animate(0, 0.3);
+    m.update(mat4_identity());
+    Vec3 lo;
+    Vec3 hi;
+    data.bounds(&lo, &hi);
+    Vec3 c = (lo + hi) * 0.5;
+    Vec3 e = hi - lo;
+    float r = sqrtf(e.x * e.x + e.y * e.y + e.z * e.z) * 0.5;
+    if (r <= 0.0) r = 1.0;
+    GpuCamera cam = gpu_camera(c + Vec3{r * 0.6, r * 0.4, r * 2.2}, c, 0.8, 1.0, r * 0.05, r * 10.0);
+    GpuPass pass = gpu.pass(t.view, GpuColor{0.05, 0.05, 0.08, 1.0}, &depth);
+    m.draw(&pass, &cam);
+    pass.end()?;
+    print_scene(name, &t);
+    return Ok<int, string>(0);
+}
+
+void run_case(string name, Result<int, string> r) {
+    if (!r.ok) printf("ERROR %s: %s\n", name, r.error);
+}
+
+int main(int argc, **char argv) {
+    Result<Gpu, string> opened = gpu_open();
+    if (!opened.ok) {
+        printf("error: %s\n", opened.error);
+        return 1;
+    }
+    Gpu gpu = opened.value;
+    defer gpu.release();
+    printf("backend %s\n", gpu.webgl2 ? "webgl2" : "webgpu");
+    run_case("triangle", triangle(&gpu));
+    run_case("textured", textured_cube(&gpu));
+    run_case("instancing", instancing(&gpu));
+    run_case("stencil", stencil(&gpu));
+    run_case("mrt", mrt(&gpu));
+    run_case("render_to_texture", render_to_texture(&gpu));
+    run_case("skinned", model(&gpu, "tests/data/skin_anim.gltf", "skinned"));
+    run_case("quad", model(&gpu, "tests/data/textured_quad.glb", "textured_quad"));
+    for (i in 1..argc) {
+        String name;
+        String_appendf(&name, "model%d", i);
+        run_case(argv[i], model(&gpu, argv[i], name.data));
+    }
+    printf("done\n");
+    return 0;
+}
