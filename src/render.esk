@@ -1490,6 +1490,17 @@ Result<int, string> GpuTexture_generate_mips(*GpuTexture self) {
     if (self.usage != 0 && (self.usage & need) != need) {
         return Err<int, string>(_gpu_fail("generate_mips: the texture needs RenderAttachment and TextureBinding usage", null));
     }
+#ifdef __EMSCRIPTEN__
+    // WebGL2 cannot sample one layer of a cube or array texture as a 2D texture, so the
+    // backend makes the levels itself, with the same 2x2 box filter.
+    if (g.webgl2) {
+        _gpu_push(g);
+        wgpuTextureSetLabel(self.handle, gpu_str("__gpu_generate_mipmap"));
+        string merr = _gpu_pop(g, "generate_mips");
+        if (merr != null) return Err<int, string>(merr);
+        return Ok<int, string>(0);
+    }
+#endif
     GpuBindLayout bl = Gpu_bind_layout(g);
     defer GpuBindLayout_release(&bl);
     GpuBindLayout_texture(&bl, 0, WGPUShaderStage_Fragment, WGPUTextureSampleType_UnfilterableFloat);

@@ -77,6 +77,7 @@ struct _GpuPrim {
     uint32 index_count;
     bool drawable;
     GpuBuffer morph;
+    GpuTexture morph_tex;
     int targets;
     uint32 vertex_count;
 }
@@ -129,6 +130,7 @@ struct GpuModel {
     GpuSampler shadow_sampler;
     Mat4 light_view_proj;
     GpuBuffer _no_morph;
+    GpuTexture _no_morph_tex;
     float[4] _shadow_params;
     GpuTexture _no_cube;
     GpuTexture _no_shadow;
@@ -156,6 +158,27 @@ struct GpuShadowOptions {
 
 const int _GM_VERTEX_FLOATS = 26;
 
+// The joint matrices and morph targets: storage buffers on WebGPU; on WebGL2, which has
+// none, a uniform array of _GM_GL_JOINTS joints, the deltas in an RGBA32Float texture
+// _GM_GL_MORPH_WIDTH texels wide and the weights in a uniform array.
+const int _GM_GL_JOINTS = 256;
+const int _GM_GL_TARGETS = 256;
+const uint32 _GM_GL_MORPH_WIDTH = 1024;
+
+string _gpu_model_storage =
+    "@group(0) @binding(3) var<storage, read> joints: array<mat4x4<f32>>;\n"
+    "@group(0) @binding(14) var<storage, read> morph: array<vec4<f32>>;\n"
+    "@group(0) @binding(15) var<storage, read> morph_w: array<f32>;\n"
+    "fn morph_at(i: u32) -> vec4<f32> { return morph[i]; }\n"
+    "fn morph_weight(t: u32) -> f32 { return morph_w[t]; }\n";
+
+string _gpu_model_uniform =
+    "@group(0) @binding(3) var<uniform> joints: array<mat4x4<f32>, 256>;\n"
+    "@group(0) @binding(14) var morph: texture_2d<f32>;\n"
+    "@group(0) @binding(15) var<uniform> morph_w: array<vec4<f32>, 64>;\n"
+    "fn morph_at(i: u32) -> vec4<f32> { return textureLoad(morph, vec2<i32>(i32(i % 1024u), i32(i / 1024u)), 0); }\n"
+    "fn morph_weight(t: u32) -> f32 { return morph_w[t / 4u][t % 4u]; }\n";
+
 string _gpu_model_shader =
     "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, light_dir: vec4<f32>, light_color: vec4<f32>, ambient: vec4<f32>,\n"
     "    light_vp: mat4x4<f32>, shadow: vec4<f32>, ibl: vec4<f32> };\n"
@@ -165,7 +188,6 @@ string _gpu_model_shader =
     "@group(0) @binding(0) var<uniform> frame: Frame;\n"
     "@group(0) @binding(1) var<uniform> draw: Draw;\n"
     "@group(0) @binding(2) var<uniform> mat: Material;\n"
-    "@group(0) @binding(3) var<storage, read> joints: array<mat4x4<f32>>;\n"
     "@group(0) @binding(4) var base_tex: texture_2d<f32>;\n"
     "@group(0) @binding(5) var base_samp: sampler;\n"
     "@group(0) @binding(6) var mr_tex: texture_2d<f32>;\n"
@@ -176,8 +198,6 @@ string _gpu_model_shader =
     "@group(0) @binding(11) var occ_samp: sampler;\n"
     "@group(0) @binding(12) var em_tex: texture_2d<f32>;\n"
     "@group(0) @binding(13) var em_samp: sampler;\n"
-    "@group(0) @binding(14) var<storage, read> morph: array<vec4<f32>>;\n"
-    "@group(0) @binding(15) var<storage, read> morph_w: array<f32>;\n"
     "@group(0) @binding(16) var irr_tex: texture_cube<f32>;\n"
     "@group(0) @binding(17) var spec_tex: texture_cube<f32>;\n"
     "@group(0) @binding(18) var brdf_tex: texture_2d<f32>;\n"
@@ -198,12 +218,12 @@ string _gpu_model_shader =
     "    let nt = u32(draw.flags.y);\n"
     "    let vc = u32(draw.flags.z);\n"
     "    for (var t = 0u; t < nt; t++) {\n"
-    "        let w = morph_w[t];\n"
+    "        let w = morph_weight(t);\n"
     "        if (w != 0.0) {\n"
     "            let at = (t * vc + v.vi) * 3u;\n"
-    "            s.pos += morph[at].xyz * w;\n"
-    "            s.normal += morph[at + 1u].xyz * w;\n"
-    "            s.tangent += morph[at + 2u].xyz * w;\n"
+    "            s.pos += morph_at(at).xyz * w;\n"
+    "            s.normal += morph_at(at + 1u).xyz * w;\n"
+    "            s.tangent += morph_at(at + 2u).xyz * w;\n"
     "        }\n"
     "    }\n"
     "    s.skin = mat4x4<f32>(vec4(1.0, 0.0, 0.0, 0.0), vec4(0.0, 1.0, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0), vec4(0.0, 0.0, 0.0, 1.0));\n"
@@ -339,6 +359,19 @@ string _gpu_model_shader =
     "    return vec4(outc, select(1.0, base.a, mat.misc.x > 1.5));\n"
     "}\n";
 
+String _gpu_model_src;
+String _gpu_model_src_gl;
+
+// The model shader for g's backend.
+string _gpu_model_wgsl(*Gpu g) {
+    String* s = g.webgl2 ? &_gpu_model_src_gl : &_gpu_model_src;
+    if (s.len == 0) {
+        String_append(s, g.webgl2 ? _gpu_model_uniform : _gpu_model_storage);
+        String_append(s, _gpu_model_shader);
+    }
+    return s.data;
+}
+
 // Loads a model file: Wavefront OBJ when the name ends in .obj (any case),
 // glTF (.gltf or .glb) otherwise.
 Result<Gltf, string> model_load(string path) {
@@ -462,6 +495,24 @@ void _gpu_model_layout(*GpuVertexLayout layout) {
     layout.add(WGPUVertexFormat_Float32x4, 88);
 }
 
+// The deltas of _gpu_model_morph in an RGBA32Float texture, row after row of
+// _GM_GL_MORPH_WIDTH texels (WebGL2).
+Result<GpuTexture, string> _gpu_model_morph_texture(*Gpu g, *GltfPrimitive p) {
+    if (p.target_count > _GM_GL_TARGETS) return Err<GpuTexture, string>(_gpu_fail("model: more than 256 morph targets in a primitive (WebGL2)", null));
+    uint64 texels = (uint64)p.target_count * p.vertex_count * 3;
+    uint32 rows = (uint32)((texels + _GM_GL_MORPH_WIDTH - 1) / _GM_GL_MORPH_WIDTH);
+    *float deltas = _gpu_model_morph(p);
+    *float padded = alloc<float>((int64)rows * _GM_GL_MORPH_WIDTH * 4);
+    memset(padded, 0, (int64)rows * _GM_GL_MORPH_WIDTH * 16);
+    memcpy(padded, deltas, (int64)texels * 16);
+    free(deltas);
+    Result<GpuTexture, string> t = Gpu_texture(g, _GM_GL_MORPH_WIDTH, rows, WGPUTextureFormat_RGBA32Float,
+        WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst);
+    if (t.ok) GpuTexture_write_region(&t.value, 0, 0, _GM_GL_MORPH_WIDTH, rows, padded);
+    free(padded);
+    return t;
+}
+
 // A primitive's morph target deltas for the shader: three vec4 (position,
 // normal, tangent) for each target and vertex, target-major.
 *float _gpu_model_morph(*GltfPrimitive p) {
@@ -484,7 +535,7 @@ Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat forma
     for (i in 0..4) {
         bool blend = i >= 2;
         bool two_sided = i % 2 == 1;
-        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_shader, vertex: "vs", fragment: "fs", format: format,
+        GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_wgsl(&self.gpu), vertex: "vs", fragment: "fs", format: format,
             layout: &layout, depth: true, depth_read_only: blend, blend: blend,
             cull: two_sided ? WGPUCullMode_None : WGPUCullMode_Back};
         GpuPipeline p = Gpu_pipeline(&self.gpu, &d)?;
@@ -649,7 +700,17 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
                 prim.indices = ib.value;
                 prim.index_count = gp.index_count;
                 prim.vertex_count = gp.vertex_count;
-                if (gp.target_count > 0) {
+                if (gp.target_count > 0 && self.webgl2) {
+                    Result<GpuTexture, string> mt = _gpu_model_morph_texture(self, gp);
+                    if (!mt.ok) {
+                        prim.vertices.release();
+                        prim.indices.release();
+                        GpuModel_release(&m);
+                        return Err<GpuModel, string>(mt.error);
+                    }
+                    prim.morph_tex = mt.value;
+                    prim.targets = gp.target_count;
+                } else if (gp.target_count > 0) {
                     *float deltas = _gpu_model_morph(gp);
                     Result<GpuBuffer, string> mb = Gpu_buffer(self, (uint64)gp.target_count * gp.vertex_count * 48,
                         WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
@@ -689,7 +750,14 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
             d.skinned = node.skin >= 0 && node.skin < data.skins.size && mesh.primitives.data[p].joints != null;
             if (d.skinned) njoints = data.skins.data[node.skin].joints.size;
             if (njoints < 1) njoints = 1;
-            Result<GpuBuffer, string> jb = Gpu_buffer(self, (uint64)njoints * 64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+            if (self.webgl2 && njoints > _GM_GL_JOINTS) {
+                if (ub.ok) ub.value.release();
+                GpuModel_release(&m);
+                return Err<GpuModel, string>(_gpu_fail("model: a skin with more than 256 joints (WebGL2)", null));
+            }
+            Result<GpuBuffer, string> jb = self.webgl2
+                ? Gpu_buffer(self, (uint64)_GM_GL_JOINTS * 64, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)
+                : Gpu_buffer(self, (uint64)njoints * 64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
             if (!ub.ok || !jb.ok) {
                 GpuModel_release(&m);
                 return Err<GpuModel, string>(!ub.ok ? ub.error : jb.error);
@@ -699,8 +767,9 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
             if (!d.skinned) d.joints.write(0, &ident, 64);
             d.targets = m.prims.data[pi].targets;
             if (d.targets > 0) {
-                Result<GpuBuffer, string> wb = Gpu_buffer(self, (uint64)((d.targets + 3) / 4 * 16),
-                    WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+                Result<GpuBuffer, string> wb = self.webgl2
+                    ? Gpu_buffer(self, (uint64)_GM_GL_TARGETS * 4, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)
+                    : Gpu_buffer(self, (uint64)((d.targets + 3) / 4 * 16), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
                 if (!wb.ok) {
                     d.uniforms.release();
                     d.joints.release();
@@ -801,7 +870,12 @@ void GpuModel_set_ibl(*GpuModel self, *GpuIbl ibl) {
 // The textures bound when a feature is off: a zero storage buffer, a 1x1
 // cube and a 1x1 depth texture.
 Result<int, string> _gpu_model_fallbacks(*GpuModel self) {
-    self._no_morph = Gpu_buffer(&self.gpu, 48, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    if (self.gpu.webgl2) {
+        self._no_morph = Gpu_buffer(&self.gpu, (uint64)_GM_GL_TARGETS * 4, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)?;
+        self._no_morph_tex = Gpu_texture(&self.gpu, 1, 1, WGPUTextureFormat_RGBA32Float, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    } else {
+        self._no_morph = Gpu_buffer(&self.gpu, 48, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    }
     GpuTextureDesc cd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float, cube: true};
     self._no_cube = Gpu_texture_with(&self.gpu, &cd)?;
     self._no_shadow = Gpu_depth_texture(&self.gpu, 1, 1, 0, 1)?;
@@ -826,7 +900,7 @@ Result<int, string> GpuModel_enable_shadows(*GpuModel self, *GpuShadowOptions o)
     GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
     defer layout.release();
     _gpu_model_layout(&layout);
-    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_shader, vertex: "vs_shadow", fragment: null, layout: &layout,
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_wgsl(&self.gpu), vertex: "vs_shadow", fragment: null, layout: &layout,
         depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_bias_slope: so.slope_bias};
     Result<GpuPipeline, string> p = Gpu_pipeline(&self.gpu, &d);
     if (!p.ok) {
@@ -897,8 +971,7 @@ void _gpu_model_shadow_draws(*GpuModel self, *GpuPass pass) {
         pipe.bind(0, &self.frame);
         pipe.bind(1, &d.uniforms);
         pipe.bind(3, &d.joints);
-        pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
-        pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+        _gpu_model_bind_morph(self, pipe, d, pr);
         pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
     }
 }
@@ -926,6 +999,12 @@ Result<int, string> GpuModel_render_shadows_in(*GpuModel self, *GpuEncoder enc) 
     return pass.end();
 }
 
+void _gpu_model_bind_morph(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d, _GpuPrim* pr) {
+    if (self.gpu.webgl2) pipe.bind_texture(14, d.targets > 0 ? &pr.morph_tex : &self._no_morph_tex);
+    else pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
+    pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+}
+
 void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
     _GpuMat* mat = &self.materials.data[d.material];
     pipe.bind(0, &self.frame);
@@ -937,8 +1016,7 @@ void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
         pipe.bind_sampler((uint32)(5 + k * 2), &self.samplers.data[mat.samp[k]]);
     }
     _GpuPrim* pr = &self.prims.data[d.prim];
-    pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
-    pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+    _gpu_model_bind_morph(self, pipe, d, pr);
     pipe.bind_texture(16, self.ibl != null ? &self.ibl.irradiance : &self._no_cube);
     pipe.bind_texture(17, self.ibl != null ? &self.ibl.specular : &self._no_cube);
     pipe.bind_texture(18, self.ibl != null ? &self.ibl.brdf : &self.textures.data[1]);
@@ -1045,7 +1123,10 @@ void GpuModel_release(*GpuModel self) {
         }
     }
     for (i in 0..self.prims.size) {
-        if (self.prims.data[i].targets > 0) self.prims.data[i].morph.release();
+        if (self.prims.data[i].targets > 0) {
+            self.prims.data[i].morph.release();
+            self.prims.data[i].morph_tex.release();
+        }
     }
     for (i in 0..self.draws.size) {
         self.draws.data[i].uniforms.release();
@@ -1054,6 +1135,7 @@ void GpuModel_release(*GpuModel self) {
     }
     GpuModel_disable_shadows(self);
     self._no_morph.release();
+    self._no_morph_tex.release();
     self._no_cube.release();
     self._no_shadow.release();
     self.shadow_sampler.release();

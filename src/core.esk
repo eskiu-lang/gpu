@@ -14,7 +14,8 @@
 //
 // In a browser (wasm32-unknown-emscripten) the API is the same: each wait for the
 // GPU suspends the program until the browser's promise settles, which needs a build
-// with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md).
+// with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md). Without WebGPU the
+// device renders through WebGL2 and has no compute.
 
 import <io>;
 import <mem>;
@@ -22,6 +23,7 @@ import <string>;
 import <list>;
 import <result>;
 import <gpu/raw>;
+import <gpu/webgl2>;
 
 String _gpu_err;
 
@@ -52,6 +54,8 @@ struct _GpuState {
 // may be sampled with linear filtering; bc, etc2 and astc whether textures may
 // be in those block-compressed formats (BC on desktop GPUs, ETC2 and ASTC on
 // phones and Apple Silicon). gpu_open turns on each one the adapter has.
+// webgl2 says the device is the WebGL2 backend, which a browser without
+// WebGPU gets (docs/web.md): rendering only, no compute or storage buffers.
 struct Gpu {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -68,6 +72,7 @@ struct Gpu {
     bool bc;
     bool etc2;
     bool astc;
+    bool webgl2;
 }
 
 // A buffer in GPU memory: handle is the WebGPU buffer and size its length in bytes. It
@@ -184,11 +189,13 @@ bool _gpu_want(*Gpu g, WGPUFeatureName feature, *WGPUFeatureName list, *uint64 n
 // Opens the high-performance adapter and a device with the adapter's full limits and every
 // optional feature listed on Gpu that it has. Fails with "no WebGPU instance", "no GPU
 // adapter" or "no GPU device" and the driver's message; in a browser also with "no
-// WebGPU in this browser".
+// WebGPU in this browser". A browser whose WebGPU is missing or gives no adapter gets the
+// WebGL2 backend, with Gpu.webgl2 set (docs/web.md).
 Result<Gpu, string> gpu_open() {
     Gpu g;
 #ifdef __EMSCRIPTEN__
-    if (emscripten_run_script_int("typeof navigator !== 'undefined' && !!navigator.gpu ? 1 : 0") == 0) {
+    // The browser's WebGPU when it has an adapter, else the WebGL2 backend.
+    if (emscripten_run_script_int(_gpu_webgl2_js) == 0) {
         return Err<Gpu, string>(_gpu_fail("no WebGPU in this browser", null));
     }
     // Timed waits let _gpu_wait suspend on a future; they need JSPI or Asyncify.
@@ -211,6 +218,9 @@ Result<Gpu, string> gpu_open() {
         return Err<Gpu, string>(_gpu_fail("no GPU adapter", &w.msg));
     }
     g.adapter = (WGPUAdapter)w.handle;
+#ifdef __EMSCRIPTEN__
+    g.webgl2 = emscripten_run_script_int("globalThis.__gpuWebGL2 && __gpuWebGL2.active ? 1 : 0") != 0;
+#endif
     g.state = alloc<_GpuState>(1);
     w.done = 0;
     // Ask for everything the adapter offers: the WebGPU defaults cap a

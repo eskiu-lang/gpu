@@ -9,13 +9,14 @@ declaration of src/*.esk (a name not starting with `_`, not `extern` or `intrins
 listed under its module with the comment block right above it: functions, structs,
 unions, interfaces, enums, type aliases and constants. The comment at the top of a file
 describes its module. Lines of a comment indented by four or more spaces are code.
-Files listed in API_SKIP (generated bindings) are left out.
+Files listed in API_SKIP (generated bindings and the WebGL2 backend's embedded
+JavaScript) are left out.
 """
 import os
 import re
 import sys
 
-API_SKIP = {"raw.esk"}
+API_SKIP = {"raw.esk", "webgl2.esk"}
 
 DECL_KW = re.compile(r"^(packed\s+)?(struct|union|interface|enum)\s+([A-Za-z_]\w*)")
 TYPE_RE = re.compile(r"^type\s+([A-Za-z_]\w*)\s*=")
