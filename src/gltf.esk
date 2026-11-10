@@ -40,6 +40,15 @@ const int GLTF_TRANSLATION = 0;
 const int GLTF_ROTATION = 1;
 const int GLTF_SCALE = 2;
 const int GLTF_WEIGHTS = 3;
+const int GLTF_VISIBLE = 4;
+const int GLTF_BASE_COLOR = 5;
+const int GLTF_EMISSIVE = 6;
+const int GLTF_METALLIC = 7;
+const int GLTF_ROUGHNESS = 8;
+const int GLTF_ALPHA_CUTOFF = 9;
+const int GLTF_TEX_OFFSET = 10;
+const int GLTF_TEX_ROTATION = 11;
+const int GLTF_TEX_SCALE = 12;
 
 // Key interpolation (GltfAnimSampler.interpolation): linear (rotations along the sphere),
 // step (hold each key) or cubic spline.
@@ -87,11 +96,18 @@ struct GltfMesh {
     List<float> weights;
 }
 
-// A material's use of a texture: texture is an index into Gltf.textures, or -1.
+// A material's use of a texture: texture is an index into Gltf.textures, or -1. With
+// has_transform (KHR_texture_transform) its coordinates are scaled by tscale, turned by
+// rotation (radians) and moved by offset before sampling; texcoord is then the extension's
+// texCoord when it gives one.
 struct GltfTextureRef {
     int texture;
     int texcoord;
     float scale;
+    bool has_transform;
+    Vec2 offset;
+    float rotation;
+    Vec2 tscale;
 }
 
 // A metallic-roughness material, with the glTF defaults for what the file leaves out:
@@ -115,6 +131,7 @@ struct GltfMaterial {
     float alpha_cutoff;
     bool double_sided;
     bool unlit;
+    float emissive_strength;
 }
 
 // A texture: image is an index into Gltf.images and sampler into Gltf.samplers, each -1
@@ -161,6 +178,7 @@ struct GltfNode {
     bool has_matrix;
     Mat4 matrix;
     List<float> weights;
+    bool hidden;
 }
 
 // A skin: joints are node indices, inverse_bind holds one column-major 4x4 matrix (16
@@ -175,11 +193,18 @@ struct GltfSkin {
 
 // One animated property: node is the node index, path one of GLTF_TRANSLATION,
 // GLTF_ROTATION, GLTF_SCALE and GLTF_WEIGHTS, and sampler an index into the animation's
-// samplers. Channels with a bad index or an unknown path are dropped on load.
+// samplers. A KHR_animation_pointer channel may instead drive a node's visibility
+// (GLTF_VISIBLE) or a property of material `material` (GLTF_BASE_COLOR, GLTF_EMISSIVE,
+// GLTF_METALLIC, GLTF_ROUGHNESS, GLTF_ALPHA_CUTOFF, or GLTF_TEX_OFFSET, GLTF_TEX_ROTATION
+// and GLTF_TEX_SCALE of texture `slot`: 0 base color, 1 metallic-roughness, 2 normal,
+// 3 occlusion, 4 emissive). Channels with a bad index or an unknown path or pointer are
+// dropped on load.
 struct GltfAnimChannel {
     int node;
     int path;
     int sampler;
+    int material;
+    int slot;
 }
 
 // Key times and values; width is the floats per value (3 or 4, 1 for morph
@@ -238,6 +263,8 @@ struct _GltfAccessor {
 // A loaded glTF model. Every index field refers to these lists; roots are the root nodes
 // of the default scene (every parentless node when the file has no scene). Free it with
 // free().
+// material_version counts the changes Gltf_animate made to materials (animation pointer
+// channels), so a renderer knows to write them again.
 struct Gltf {
     List<GltfMesh> meshes;
     List<GltfMaterial> materials;
@@ -248,6 +275,7 @@ struct Gltf {
     List<GltfSkin> skins;
     List<GltfAnimation> animations;
     List<int> roots;
+    int material_version;
     List<_GltfBuffer> _buffers;
     List<_GltfView> _views;
     List<_GltfAccessor> _accessors;
@@ -280,6 +308,12 @@ int _gj_int(*JsonValue obj, string key, int def) {
 
 double _gj_num(*JsonValue obj, string key, double def) {
     *JsonValue v = _gj(obj, key);
+    if (v == null || v.kind != JNumber) return def;
+    return v.num;
+}
+
+// A JSON value as a number, or def.
+double _gj_numv(*JsonValue v, double def) {
     if (v == null || v.kind != JNumber) return def;
     return v.num;
 }
@@ -397,7 +431,8 @@ string _gltf_check_extensions(*JsonValue root) {
         if (c.kind != JString || c.str.data == null) continue;
         string e = c.str.data;
         if (strcmp(e, "KHR_mesh_quantization") == 0 || strcmp(e, "KHR_materials_unlit") == 0
-            || strcmp(e, "KHR_texture_transform") == 0 || strcmp(e, "KHR_materials_emissive_strength") == 0) {
+            || strcmp(e, "KHR_texture_transform") == 0 || strcmp(e, "KHR_materials_emissive_strength") == 0
+            || strcmp(e, "KHR_node_visibility") == 0 || strcmp(e, "KHR_animation_pointer") == 0) {
             continue;
         }
         return _gltf_fail("required extension not supported: ", e);
@@ -837,6 +872,20 @@ void _gltf_texref(*JsonValue obj, string key, GltfTextureRef* out, int ntex) {
     out.texture = i;
     out.texcoord = _gj_int(t, "texCoord", 0);
     out.scale = (float)_gj_num(t, "scale", _gj_num(t, "strength", 1.0));
+    *JsonValue tt = _gj(_gj(t, "extensions"), "KHR_texture_transform");
+    if (tt == null) return;
+    out.has_transform = true;
+    out.tscale = Vec2{1.0, 1.0};
+    *JsonValue off = _gj_arr(tt, "offset");
+    if (off != null && off.child != null && off.child.next != null) {
+        out.offset = Vec2{(float)_gj_numv(off.child, 0.0), (float)_gj_numv(off.child.next, 0.0)};
+    }
+    *JsonValue sc = _gj_arr(tt, "scale");
+    if (sc != null && sc.child != null && sc.child.next != null) {
+        out.tscale = Vec2{(float)_gj_numv(sc.child, 1.0), (float)_gj_numv(sc.child.next, 1.0)};
+    }
+    out.rotation = (float)_gj_num(tt, "rotation", 0.0);
+    out.texcoord = _gj_int(tt, "texCoord", out.texcoord);
 }
 
 void _gltf_read_materials(*Gltf g, *JsonValue root, int ntex) {
@@ -860,6 +909,7 @@ void _gltf_read_materials(*Gltf g, *JsonValue root, int ntex) {
         _gj_floats(m, "emissiveFactor", &em[0], 3);
         float strength = (float)_gj_num(_gj(_gj(m, "extensions"), "KHR_materials_emissive_strength"), "emissiveStrength", 1.0);
         mat.emissive = Vec3{em[0] * strength, em[1] * strength, em[2] * strength};
+        mat.emissive_strength = strength;
         string mode = _gj_str(m, "alphaMode");
         mat.alpha_mode = GLTF_OPAQUE;
         if (mode != null && strcmp(mode, "MASK") == 0) mat.alpha_mode = GLTF_MASK;
@@ -945,6 +995,7 @@ string _gltf_read_nodes(*Gltf g, *JsonValue root) {
         node.rotation = Quat{r[0], r[1], r[2], r[3]};
         node.scale = Vec3{s[0], s[1], s[2]};
         if (_gj_floats(n, "matrix", &node.matrix.m[0], 16) == 16) node.has_matrix = true;
+        node.hidden = !_gj_bool(_gj(_gj(n, "extensions"), "KHR_node_visibility"), "visible", true);
         if (node.mesh >= 0) {
             List<float>* mw = &g.meshes.data[node.mesh].weights;
             List_resize(&node.weights, mw.size);
@@ -1044,6 +1095,49 @@ string _gltf_read_skins(*Gltf g, *JsonValue root) {
     return null;
 }
 
+// Reads a KHR_animation_pointer JSON pointer into ch: a node's translation, rotation,
+// scale, weights or KHR_node_visibility, or a material's base color, emissive, metallic,
+// roughness, alpha cutoff, or a texture's KHR_texture_transform offset, rotation or scale.
+// Leaves ch.path -1 for any other pointer.
+void _gltf_pointer(string ptr, *GltfAnimChannel ch) {
+    if (ptr == null) return;
+    int idx = 0;
+    int at = 0;
+    if (strncmp(ptr, "/nodes/", 7) == 0) at = 7;
+    else if (strncmp(ptr, "/materials/", 11) == 0) at = 11;
+    else return;
+    if (ptr[at] < '0' || ptr[at] > '9') return;
+    while (ptr[at] >= '0' && ptr[at] <= '9') { idx = idx * 10 + (int)(ptr[at] - '0'); at++; }
+    string rest = (string)((*uint8)ptr + at);
+    if (ptr[1] == 'n') {
+        ch.node = idx;
+        if (strcmp(rest, "/translation") == 0) ch.path = GLTF_TRANSLATION;
+        else if (strcmp(rest, "/rotation") == 0) ch.path = GLTF_ROTATION;
+        else if (strcmp(rest, "/scale") == 0) ch.path = GLTF_SCALE;
+        else if (strcmp(rest, "/weights") == 0) ch.path = GLTF_WEIGHTS;
+        else if (strcmp(rest, "/extensions/KHR_node_visibility/visible") == 0) ch.path = GLTF_VISIBLE;
+        return;
+    }
+    ch.material = idx;
+    if (strcmp(rest, "/pbrMetallicRoughness/baseColorFactor") == 0) { ch.path = GLTF_BASE_COLOR; return; }
+    if (strcmp(rest, "/emissiveFactor") == 0) { ch.path = GLTF_EMISSIVE; return; }
+    if (strcmp(rest, "/pbrMetallicRoughness/metallicFactor") == 0) { ch.path = GLTF_METALLIC; return; }
+    if (strcmp(rest, "/pbrMetallicRoughness/roughnessFactor") == 0) { ch.path = GLTF_ROUGHNESS; return; }
+    if (strcmp(rest, "/alphaCutoff") == 0) { ch.path = GLTF_ALPHA_CUTOFF; return; }
+    string[5] textures = {"/pbrMetallicRoughness/baseColorTexture", "/pbrMetallicRoughness/metallicRoughnessTexture",
+                          "/normalTexture", "/occlusionTexture", "/emissiveTexture"};
+    for (k in 0..5) {
+        uint64 n = strlen(textures[k]);
+        if (strncmp(rest, textures[k], n) != 0) continue;
+        string tail = (string)((*uint8)rest + n);
+        ch.slot = k;
+        if (strcmp(tail, "/extensions/KHR_texture_transform/offset") == 0) ch.path = GLTF_TEX_OFFSET;
+        else if (strcmp(tail, "/extensions/KHR_texture_transform/rotation") == 0) ch.path = GLTF_TEX_ROTATION;
+        else if (strcmp(tail, "/extensions/KHR_texture_transform/scale") == 0) ch.path = GLTF_TEX_SCALE;
+        return;
+    }
+}
+
 string _gltf_read_animations(*Gltf g, *JsonValue root) {
     *JsonValue arr = _gj_arr(root, "animations");
     if (arr == null) return null;
@@ -1083,12 +1177,17 @@ string _gltf_read_animations(*Gltf g, *JsonValue root) {
             for (*JsonValue c = carr.child; c != null; c = c.next) {
                 *JsonValue t = _gj(c, "target");
                 string path = _gj_str(t, "path");
-                GltfAnimChannel ch = GltfAnimChannel{_gj_int(t, "node", -1), -1, _gj_int(c, "sampler", -1)};
+                GltfAnimChannel ch = GltfAnimChannel{_gj_int(t, "node", -1), -1, _gj_int(c, "sampler", -1), -1, 0};
                 if (path != null && strcmp(path, "translation") == 0) ch.path = GLTF_TRANSLATION;
                 if (path != null && strcmp(path, "rotation") == 0) ch.path = GLTF_ROTATION;
                 if (path != null && strcmp(path, "scale") == 0) ch.path = GLTF_SCALE;
                 if (path != null && strcmp(path, "weights") == 0) ch.path = GLTF_WEIGHTS;
-                if (ch.node >= 0 && ch.node < g.nodes.size && ch.sampler >= 0 && ch.sampler < anim.samplers.size && ch.path >= 0) {
+                if (path != null && strcmp(path, "pointer") == 0) {
+                    _gltf_pointer(_gj_str(_gj(_gj(t, "extensions"), "KHR_animation_pointer"), "pointer"), &ch);
+                }
+                bool on_node = ch.path <= GLTF_VISIBLE && ch.node >= 0 && ch.node < g.nodes.size;
+                bool on_mat = ch.path > GLTF_VISIBLE && ch.material >= 0 && ch.material < g.materials.size;
+                if ((on_node || on_mat) && ch.sampler >= 0 && ch.sampler < anim.samplers.size && ch.path >= 0) {
                     List_push(&anim.channels, ch);
                 }
             }
@@ -1221,6 +1320,46 @@ void _gltf_sample_n(*GltfAnimSampler s, float t, *float out, int w, bool quat) {
     for (c in 0..w) out[c] = a[c] + (b[c] - a[c]) * u;
 }
 
+// Material texture slot k: 0 base color, 1 metallic-roughness, 2 normal, 3 occlusion,
+// 4 emissive.
+*GltfTextureRef _gltf_slot(*GltfMaterial m, int k) {
+    if (k == 1) return &m.metallic_roughness_texture;
+    if (k == 2) return &m.normal_texture;
+    if (k == 3) return &m.occlusion_texture;
+    if (k == 4) return &m.emissive_texture;
+    return &m.base_color_texture;
+}
+
+// Applies one KHR_animation_pointer channel at time t: a node's visibility (a value at or
+// above one half shows it) or a material's property.
+void _gltf_animate_pointer(*Gltf self, *GltfAnimChannel ch, *GltfAnimSampler s, float t) {
+    float[4] v;
+    int w = s.width;
+    if (w < 1 || w > 4 || s.values == null) return;
+    _gltf_sample_n(s, t, &v[0], w, false);
+    if (ch.path == GLTF_VISIBLE) {
+        self.nodes.data[ch.node].hidden = !(v[0] >= 0.5);
+        return;
+    }
+    GltfMaterial* m = &self.materials.data[ch.material];
+    if (ch.path == GLTF_BASE_COLOR && w == 4) m.base_color = Vec4{v[0], v[1], v[2], v[3]};
+    else if (ch.path == GLTF_EMISSIVE && w == 3) {
+        float k = m.emissive_strength > 0.0 ? m.emissive_strength : 1.0;
+        m.emissive = Vec3{v[0] * k, v[1] * k, v[2] * k};
+    } else if (ch.path == GLTF_METALLIC) m.metallic = v[0];
+    else if (ch.path == GLTF_ROUGHNESS) m.roughness = v[0];
+    else if (ch.path == GLTF_ALPHA_CUTOFF) m.alpha_cutoff = v[0];
+    else if (ch.path >= GLTF_TEX_OFFSET) {
+        *GltfTextureRef r = _gltf_slot(m, ch.slot);
+        if (!r.has_transform) { r.has_transform = true; r.tscale = Vec2{1.0, 1.0}; }
+        if (ch.path == GLTF_TEX_OFFSET && w == 2) r.offset = Vec2{v[0], v[1]};
+        else if (ch.path == GLTF_TEX_ROTATION) r.rotation = v[0];
+        else if (ch.path == GLTF_TEX_SCALE && w == 2) r.tscale = Vec2{v[0], v[1]};
+        else return;
+    } else return;
+    self.material_version++;
+}
+
 // Poses the nodes at time t (seconds) of animation anim; t wraps around the
 // animation's duration.
 void Gltf_animate(*Gltf self, int anim, float t) {
@@ -1233,6 +1372,10 @@ void Gltf_animate(*Gltf self, int anim, float t) {
         GltfAnimChannel* ch = &a.channels.data[i];
         GltfAnimSampler* s = &a.samplers.data[ch.sampler];
         if (s.count == 0) continue;
+        if (ch.path >= GLTF_VISIBLE) {
+            _gltf_animate_pointer(self, ch, s, t);
+            continue;
+        }
         GltfNode* n = &self.nodes.data[ch.node];
         if (ch.path == GLTF_WEIGHTS) {
             // Scalar outputs, one per target for each key (three for a cubic
