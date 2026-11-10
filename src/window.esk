@@ -1,5 +1,5 @@
-// window.esk: windows and input over SDL3, with a GPU surface to draw into.
-// A program that imports it links SDL3; <gpu> alone does not.
+// window.esk: windows and input over SDL3, with a GPU surface to draw into: keyboard,
+// mouse, gamepads and touch. A program that imports it links SDL3; <gpu> alone does not.
 //
 //     Window win = window_open("demo", 800, 600)?;
 //     defer win.release();
@@ -13,15 +13,24 @@
 //         ...
 //     }
 //
+// Gamepads come as WINDOW_PAD_* events and as a PadState to read once per frame
+// (Window_pad_state); fingers on a touch screen or a pen come as WINDOW_TOUCH events with a
+// GpuTouch, as on a mobile GpuView, and Window_set_mouse_touch turns the left mouse button
+// into a finger too.
+//
 // In a browser (wasm32-unknown-emscripten) the window is the page's canvas with id
-// "canvas": the same program builds for both, and the events come from the page.
+// "canvas": the same program builds for both, and the events come from the page. Gamepads
+// and fingers are desktop only there: no pad is ever connected and no WINDOW_TOUCH comes,
+// except from the mouse with Window_set_mouse_touch.
 
 import <mem>;
+import <math>;
 import <string>;
 import <result>;
 import <gpu/raw>;
 import <gpu/core>;
 import <gpu/render>;
+import <gpu/touch>;
 
 #if defined(__ANDROID__) || defined(TARGET_OS_IPHONE)
 #error "gpu/window: SDL3 desktop windows run on macOS, Linux and Windows; on iOS and Android use <gpu/ui> or Gpu_surface_metal / Gpu_surface_android"
@@ -62,16 +71,28 @@ extern void SDL_Metal_DestroyView(*void view);
 extern *void SDL_Metal_GetLayer(*void view);
 extern uint64 SDL_GetTicks();
 extern bool SDL_SetWindowTitle(*void window, string title);
+extern float SDL_GetWindowPixelDensity(*void window);
+extern bool SDL_InitSubSystem(uint32 flags);
+extern *void SDL_OpenGamepad(uint32 id);
+extern void SDL_CloseGamepad(*void gamepad);
+extern string SDL_GetGamepadName(*void gamepad);
+extern bool SDL_GetGamepadButton(*void gamepad, int button);
+extern int16 SDL_GetGamepadAxis(*void gamepad, int axis);
+extern bool SDL_RumbleGamepad(*void gamepad, uint16 low, uint16 high, uint32 ms);
 
 const uint32 _SDL_INIT_VIDEO = 0x20;
+const uint32 _SDL_INIT_GAMEPAD = 0x2000;
+const uint32 _SDL_TOUCH_MOUSEID = 0xFFFFFFFF;
 const uint64 _SDL_WINDOW_RESIZABLE = 0x20;
 const uint64 _SDL_WINDOW_HIGH_PIXEL_DENSITY = 0x2000;
 const uint64 _SDL_WINDOW_METAL = 0x20000000;
 #endif
 
 // Event kinds (WindowEvent.kind): none, the user closed the window, the drawable size
-// changed, a key went down or up, the mouse moved, a mouse button went down or up, and the
-// wheel turned.
+// changed, a key went down or up, the mouse moved, a mouse button went down or up, the
+// wheel turned, a gamepad was connected or disconnected, a gamepad button went down or up,
+// a gamepad axis moved, and a finger (or pen, or the mouse with Window_set_mouse_touch)
+// went down, moved, went up or was cancelled.
 const int WINDOW_NONE = 0;
 const int WINDOW_QUIT = 1;
 const int WINDOW_RESIZE = 2;
@@ -81,6 +102,12 @@ const int WINDOW_MOUSE_MOVE = 5;
 const int WINDOW_MOUSE_DOWN = 6;
 const int WINDOW_MOUSE_UP = 7;
 const int WINDOW_WHEEL = 8;
+const int WINDOW_PAD_ADDED = 9;
+const int WINDOW_PAD_REMOVED = 10;
+const int WINDOW_PAD_DOWN = 11;
+const int WINDOW_PAD_UP = 12;
+const int WINDOW_PAD_AXIS = 13;
+const int WINDOW_TOUCH = 14;
 
 // Key codes: printable keys are their lowercase ASCII code ('a', ' ', '1').
 const int KEY_ESCAPE = 27;
@@ -90,6 +117,59 @@ const int KEY_LEFT = 1073741904;
 const int KEY_DOWN = 1073741905;
 const int KEY_UP = 1073741906;
 
+// Gamepad buttons (WindowEvent.button for WINDOW_PAD_DOWN and WINDOW_PAD_UP, and
+// PadState_held), in SDL's standard layout: the face buttons by position (south is A on an
+// Xbox pad, cross on a PlayStation pad, B on a Nintendo pad), back (select, share), guide
+// (the logo button), start (options, menu), the stick clicks, the shoulder buttons (L1 and
+// R1), the directional pad, and misc (share, capture, mute) where the pad has one.
+const int PAD_SOUTH = 0;
+const int PAD_EAST = 1;
+const int PAD_WEST = 2;
+const int PAD_NORTH = 3;
+const int PAD_BACK = 4;
+const int PAD_GUIDE = 5;
+const int PAD_START = 6;
+const int PAD_LEFT_STICK = 7;
+const int PAD_RIGHT_STICK = 8;
+const int PAD_LEFT_SHOULDER = 9;
+const int PAD_RIGHT_SHOULDER = 10;
+const int PAD_DPAD_UP = 11;
+const int PAD_DPAD_DOWN = 12;
+const int PAD_DPAD_LEFT = 13;
+const int PAD_DPAD_RIGHT = 14;
+const int PAD_MISC = 15;
+
+// Gamepad axes (WindowEvent.axis for WINDOW_PAD_AXIS): the sticks run from -1 to 1, with x
+// positive to the right and y positive down; the triggers (L2 and R2) from 0 to 1.
+const int PAD_AXIS_LEFT_X = 0;
+const int PAD_AXIS_LEFT_Y = 1;
+const int PAD_AXIS_RIGHT_X = 2;
+const int PAD_AXIS_RIGHT_Y = 3;
+const int PAD_AXIS_LEFT_TRIGGER = 4;
+const int PAD_AXIS_RIGHT_TRIGGER = 5;
+
+// The pad id that stands for every connected pad in Window_pad_state and Window_pad_rumble
+// (a real pad's id is never 0).
+const int PAD_ANY = 0;
+
+// A gamepad as it is now, with the deadzone applied (Window_set_pad_deadzone): buttons has
+// bit 1 << PAD_ button set for each button held; the axes are those of PAD_AXIS_.
+struct PadState {
+    uint32 buttons;
+    float left_x;
+    float left_y;
+    float right_x;
+    float right_y;
+    float left_trigger;
+    float right_trigger;
+}
+
+// Whether the PAD_ button is held.
+bool PadState_held(*PadState self, int button) {
+    if (button < 0 || button > 31) return false;
+    return (self.buttons & ((uint32)1 << (uint32)button)) != 0;
+}
+
 // A desktop window: sdl is the SDL_Window and metal its Metal view on macOS (null
 // elsewhere). In a browser both are null and the window is the canvas with id "canvas".
 struct Window {
@@ -98,10 +178,16 @@ struct Window {
 }
 
 // One input event. key and repeat are set for key events, button for mouse
-// buttons (1 left, 2 middle, 3 right), x and y for mouse events (pixels) and
-// the wheel (scroll amounts), dx and dy for mouse motion, width and height
-// (pixels) for WINDOW_RESIZE. In a browser, a key that is neither printable nor
-// a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT never comes.
+// buttons (1 left, 2 middle, 3 right) and gamepad buttons (a PAD_ constant), x and y for
+// mouse and touch events (pixels from the drawable's top left) and the wheel (scroll
+// amounts), dx and dy for mouse motion (pixels), width and height (pixels) for
+// WINDOW_RESIZE. pad is the gamepad's id for WINDOW_PAD_ events, stable while it stays
+// connected; axis and value (from -1 to 1, or 0 to 1 for a trigger, with no deadzone) are
+// set for WINDOW_PAD_AXIS. touch is the finger of a WINDOW_TOUCH, to hand to
+// GpuTouches_apply. from_touch marks the mouse events the system makes from a finger on a
+// touch screen, which come along with its WINDOW_TOUCH events. In a browser, a key that is
+// neither printable nor a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT
+// never comes.
 struct WindowEvent {
     int kind;
     int key;
@@ -113,6 +199,126 @@ struct WindowEvent {
     float dy;
     uint32 width;
     uint32 height;
+    int pad;
+    int axis;
+    float value;
+    GpuTouch touch;
+    bool from_touch;
+}
+
+// A finger the window tracks: its small id is its index in _win_fingers.
+struct _WinFinger {
+    uint64 device;
+    uint64 finger;
+    bool used;
+}
+
+// An open gamepad: SDL's SDL_Gamepad and its joystick id.
+struct _WinPad {
+    *void gamepad;
+    int id;
+}
+
+List<_WinFinger> _win_fingers;
+List<_WinPad> _win_pads;
+float _win_deadzone = 0.1;
+bool _win_mouse_touch = false;
+int _win_mouse_finger = -1;
+
+// The smallest finger id not in use for (device, finger), or the one it already has.
+int _win_finger_id(uint64 device, uint64 finger) {
+    int slot = -1;
+    for (i in 0.._win_fingers.size) {
+        _WinFinger f = _win_fingers.data[i];
+        if (f.used && f.device == device && f.finger == finger) return i;
+        if (!f.used && slot < 0) slot = i;
+    }
+    _WinFinger f = _WinFinger{device: device, finger: finger, used: true};
+    if (slot >= 0) {
+        _win_fingers.data[slot] = f;
+        return slot;
+    }
+    List_push(&_win_fingers, f);
+    return _win_fingers.size - 1;
+}
+
+// The id of a finger that is down, or -1.
+int _win_finger_find(uint64 device, uint64 finger) {
+    for (i in 0.._win_fingers.size) {
+        _WinFinger f = _win_fingers.data[i];
+        if (f.used && f.device == device && f.finger == finger) return i;
+    }
+    return -1;
+}
+
+void _win_touch(*WindowEvent ev, int id, int phase, float x, float y, double time) {
+    ev.kind = WINDOW_TOUCH;
+    ev.x = x;
+    ev.y = y;
+    ev.touch = GpuTouch{id, phase, x, y, time};
+    if ((phase == GPU_TOUCH_UP || phase == GPU_TOUCH_CANCEL) && id >= 0 && id < _win_fingers.size)
+        _win_fingers.data[id].used = false;
+}
+
+// With mouse touch on, turns a left button press, the motion while it is held and its
+// release into a finger; other mouse events stay as they are.
+void _win_mouse_as_touch(*WindowEvent ev, double time) {
+    if (!_win_mouse_touch || ev.from_touch) return;
+    if (ev.kind == WINDOW_MOUSE_DOWN && ev.button == 1) {
+        if (_win_mouse_finger >= 0) _win_touch(ev, _win_mouse_finger, GPU_TOUCH_CANCEL, ev.x, ev.y, time);
+        _win_mouse_finger = _win_finger_id(0xFFFFFFFFFFFFFFFF, 0);
+        _win_touch(ev, _win_mouse_finger, GPU_TOUCH_DOWN, ev.x, ev.y, time);
+    } else if (ev.kind == WINDOW_MOUSE_MOVE && _win_mouse_finger >= 0) {
+        _win_touch(ev, _win_mouse_finger, GPU_TOUCH_MOVE, ev.x, ev.y, time);
+    } else if (ev.kind == WINDOW_MOUSE_UP && ev.button == 1 && _win_mouse_finger >= 0) {
+        _win_touch(ev, _win_mouse_finger, GPU_TOUCH_UP, ev.x, ev.y, time);
+        _win_mouse_finger = -1;
+    }
+}
+
+// value with the deadzone taken out and the rest stretched back to the full range.
+float _win_dead1(float value, float dz) {
+    float m = value < 0.0 ? -value : value;
+    if (m <= dz) return 0.0;
+    if (m > 1.0) m = 1.0;
+    float out = (m - dz) / (1.0 - dz);
+    return value < 0.0 ? -out : out;
+}
+
+// A radial deadzone on a stick: the direction is kept, the length stretched as _win_dead1.
+void _win_dead2(*float x, *float y, float dz) {
+    float m = (float)sqrt((double)(*x * *x + *y * *y));
+    if (m <= dz) {
+        *x = 0.0;
+        *y = 0.0;
+        return;
+    }
+    float k = _win_dead1(m, dz) / m;
+    *x = *x * k;
+    *y = *y * k;
+}
+
+// The larger in magnitude of a and b.
+float _win_wider(float a, float b) {
+    float ma = a < 0.0 ? -a : a;
+    float mb = b < 0.0 ? -b : b;
+    return mb > ma ? b : a;
+}
+
+int _win_pad_index(int id) {
+    for (i in 0.._win_pads.size) {
+        if (_win_pads.data[i].id == id) return i;
+    }
+    return -1;
+}
+
+void _win_pads_close() {
+#ifndef __EMSCRIPTEN__
+    for (i in 0.._win_pads.size) SDL_CloseGamepad(_win_pads.data[i].gamepad);
+#endif
+    List_free(&_win_pads);
+    List_free(&_win_fingers);
+    _win_mouse_finger = -1;
 }
 
 #ifdef __EMSCRIPTEN__
@@ -203,8 +409,8 @@ bool _win_on_resize(int kind, *void e, *void u) {
 #endif
 
 // Opens a resizable, high-density window of width x height points (the drawable size in
-// pixels may be larger: Window_size). It starts SDL's video system first. Fails with SDL's
-// error message. In a browser it sets the page title and the canvas's CSS size to width x
+// pixels may be larger: Window_size). It starts SDL's video and gamepad systems first; the
+// pads connected then come as WINDOW_PAD_ADDED events. Fails with SDL's error message. In a browser it sets the page title and the canvas's CSS size to width x
 // height (0 x 0 keeps the size the page gives it) and listens to the page's events.
 Result<Window, string> window_open(string title, int width, int height) {
 #ifdef __EMSCRIPTEN__
@@ -224,29 +430,36 @@ Result<Window, string> window_open(string title, int width, int height) {
     return Ok<Window, string>(web);
 #else
     if (!SDL_Init(_SDL_INIT_VIDEO)) return Err<Window, string>(SDL_GetError());
+    // Without gamepads (no joystick support on this system) the window still opens.
+    SDL_InitSubSystem(_SDL_INIT_GAMEPAD);
     uint64 flags = _SDL_WINDOW_RESIZABLE | _SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef __APPLE__
-    flags = flags | _SDL_WINDOW_METAL;
+    // SDL's offscreen and dummy drivers (tests, no display) have no Metal view.
+    string driver = SDL_GetCurrentVideoDriver();
+    bool metal = driver != null && strcmp(driver, "cocoa") == 0;
+    if (metal) flags = flags | _SDL_WINDOW_METAL;
 #endif
     Window w;
     w.sdl = SDL_CreateWindow(title, width, height, flags);
     if (w.sdl == null) return Err<Window, string>(SDL_GetError());
 #ifdef __APPLE__
-    w.metal = SDL_Metal_CreateView(w.sdl);
+    if (metal) w.metal = SDL_Metal_CreateView(w.sdl);
 #endif
     return Ok<Window, string>(w);
 #endif
 }
 
-// Destroys the window and shuts SDL down, so a program has one window at a time. Release
-// the window's GpuSurface first. In a browser it removes the page's event listeners set
+// Destroys the window, closes its gamepads and shuts SDL down, so a program has one window
+// at a time. Release the window's GpuSurface first. In a browser it removes the page's event listeners set
 // through Emscripten's html5 API.
 void Window_release(*Window self) {
 #ifdef __EMSCRIPTEN__
     emscripten_html5_remove_all_event_listeners();
     List_free(&_win_events);
     _win_next = 0;
+    _win_pads_close();
 #else
+    _win_pads_close();
     if (self.metal != null) SDL_Metal_DestroyView(self.metal);
     if (self.sdl != null) SDL_DestroyWindow(self.sdl);
     self.metal = null;
@@ -302,6 +515,7 @@ bool Window_poll(*Window self, *WindowEvent ev) {
     if (_win_next < (uint64)_win_events.size) {
         *ev = _win_events.data[_win_next];
         _win_next++;
+        _win_mouse_as_touch(ev, emscripten_get_now() / 1000.0);
         return true;
     }
     List_clear(&_win_events);
@@ -313,6 +527,7 @@ bool Window_poll(*Window self, *WindowEvent ev) {
     while (SDL_PollEvent(e)) {
         *ev = WindowEvent{};
         uint32 kind = *(*uint32)e;
+        double time = (double)*(*uint64)(e + 8) / 1000000000.0;
         if (kind == 0x100 || kind == 528) {
             ev.kind = WINDOW_QUIT;
         } else if (kind == 519) {
@@ -324,20 +539,66 @@ bool Window_poll(*Window self, *WindowEvent ev) {
             ev.key = _win_i32(e, 28);
             ev.repeat = e[37] != 0;
         } else if (kind == 0x400) {
+            // SDL gives the mouse in points; the drawable is in pixels.
+            float k = _win_density(self);
             ev.kind = WINDOW_MOUSE_MOVE;
-            ev.x = _win_f32(e, 28);
-            ev.y = _win_f32(e, 32);
-            ev.dx = _win_f32(e, 36);
-            ev.dy = _win_f32(e, 40);
+            ev.from_touch = *(*uint32)(e + 20) == _SDL_TOUCH_MOUSEID;
+            ev.x = _win_f32(e, 28) * k;
+            ev.y = _win_f32(e, 32) * k;
+            ev.dx = _win_f32(e, 36) * k;
+            ev.dy = _win_f32(e, 40) * k;
+            _win_mouse_as_touch(ev, time);
         } else if (kind == 0x401 || kind == 0x402) {
+            float k = _win_density(self);
             ev.kind = kind == 0x401 ? WINDOW_MOUSE_DOWN : WINDOW_MOUSE_UP;
+            ev.from_touch = *(*uint32)(e + 20) == _SDL_TOUCH_MOUSEID;
             ev.button = (int)e[24];
-            ev.x = _win_f32(e, 28);
-            ev.y = _win_f32(e, 32);
+            ev.x = _win_f32(e, 28) * k;
+            ev.y = _win_f32(e, 32) * k;
+            _win_mouse_as_touch(ev, time);
         } else if (kind == 0x403) {
             ev.kind = WINDOW_WHEEL;
             ev.x = _win_f32(e, 24);
             ev.y = _win_f32(e, 28);
+        } else if (kind == 0x653) {
+            int id = _win_i32(e, 16);
+            if (_win_pad_index(id) >= 0) continue;
+            *void gamepad = SDL_OpenGamepad((uint32)id);
+            if (gamepad == null) continue;
+            List_push(&_win_pads, _WinPad{gamepad: gamepad, id: id});
+            ev.kind = WINDOW_PAD_ADDED;
+            ev.pad = id;
+        } else if (kind == 0x654) {
+            int id = _win_i32(e, 16);
+            int at = _win_pad_index(id);
+            if (at < 0) continue;
+            SDL_CloseGamepad(_win_pads.data[at].gamepad);
+            List_remove(&_win_pads, at);
+            ev.kind = WINDOW_PAD_REMOVED;
+            ev.pad = id;
+        } else if (kind == 0x651 || kind == 0x652) {
+            ev.pad = _win_i32(e, 16);
+            if (_win_pad_index(ev.pad) < 0) continue;
+            ev.kind = kind == 0x651 ? WINDOW_PAD_DOWN : WINDOW_PAD_UP;
+            ev.button = (int)e[20];
+        } else if (kind == 0x650) {
+            ev.pad = _win_i32(e, 16);
+            if (_win_pad_index(ev.pad) < 0) continue;
+            ev.kind = WINDOW_PAD_AXIS;
+            ev.axis = (int)e[20];
+            ev.value = _win_axis(*(*int16)(e + 24));
+        } else if (kind >= 0x700 && kind <= 0x703) {
+            // Fingers and pens: SDL gives the position as a fraction of the window.
+            uint64 device = *(*uint64)(e + 16);
+            uint64 finger = *(*uint64)(e + 24);
+            int id = kind == 0x700 ? _win_finger_id(device, finger) : _win_finger_find(device, finger);
+            if (id < 0) continue;
+            uint32 w = 0;
+            uint32 h = 0;
+            Window_size(self, &w, &h);
+            int phase = kind == 0x700 ? GPU_TOUCH_DOWN : (kind == 0x702 ? GPU_TOUCH_MOVE :
+                (kind == 0x701 ? GPU_TOUCH_UP : GPU_TOUCH_CANCEL));
+            _win_touch(ev, id, phase, _win_f32(e, 32) * (float)w, _win_f32(e, 36) * (float)h, time);
         } else {
             continue;
         }
@@ -345,6 +606,114 @@ bool Window_poll(*Window self, *WindowEvent ev) {
     }
     return false;
 #endif
+}
+
+#ifndef __EMSCRIPTEN__
+float _win_density(*Window self) {
+    float k = SDL_GetWindowPixelDensity(self.sdl);
+    return k > 0.0 ? k : 1.0;
+}
+
+// An SDL axis value as -1 to 1 (0 to 1 for a trigger).
+float _win_axis(int16 v) {
+    float f = (float)v / 32767.0;
+    return f < -1.0 ? -1.0 : f;
+}
+#endif
+
+// Turns mouse touch on or off. While it is on, a press of the left mouse button, the
+// motion while it is held and its release come as a WINDOW_TOUCH finger instead of mouse
+// events, for testing a touch interface on the desktop; the motion with no button held,
+// the other buttons and the wheel stay mouse events. Fingers on a touch screen are
+// WINDOW_TOUCH events either way.
+void Window_set_mouse_touch(*Window self, bool on) {
+    _win_mouse_touch = on;
+}
+
+// Sets the gamepad deadzone, from 0 to 0.9 (0.1 to start with): Window_pad_state reads a
+// stick as centered while it is within this distance of the center, and a trigger as
+// released below it, and stretches the rest to the full range. WINDOW_PAD_AXIS values
+// have no deadzone.
+void Window_set_pad_deadzone(*Window self, float deadzone) {
+    _win_deadzone = deadzone < 0.0 ? 0.0 : (deadzone > 0.9 ? 0.9 : deadzone);
+}
+
+// The number of connected gamepads.
+int Window_pad_count(*Window self) {
+    return _win_pads.size;
+}
+
+// The id of the connected gamepad at index (0 to Window_pad_count - 1), in the order they
+// were connected, or -1.
+int Window_pad_id(*Window self, int index) {
+    if (index < 0 || index >= _win_pads.size) return -1;
+    return _win_pads.data[index].id;
+}
+
+// The gamepad's name ("Xbox Series X Controller", "PS5 Controller"), or null when it is not
+// connected.
+string Window_pad_name(*Window self, int pad) {
+    int at = _win_pad_index(pad);
+    if (at < 0) return null;
+#ifdef __EMSCRIPTEN__
+    return null;
+#else
+    return SDL_GetGamepadName(_win_pads.data[at].gamepad);
+#endif
+}
+
+// Reads a gamepad as it is now into out, with the deadzone applied. pad is a pad's id, or
+// PAD_ANY for every connected pad together: a button is held when it is held on any pad,
+// and each axis is the one farthest from rest. False (and out cleared) when the pad is not
+// connected, or with PAD_ANY when none is. The state is that of the last Window_poll.
+bool Window_pad_state(*Window self, int pad, *PadState out) {
+    *out = PadState{};
+    bool found = false;
+#ifndef __EMSCRIPTEN__
+    for (i in 0.._win_pads.size) {
+        _WinPad p = _win_pads.data[i];
+        if (pad != PAD_ANY && p.id != pad) continue;
+        found = true;
+        PadState s;
+        for (b in 0..PAD_MISC + 1) {
+            if (SDL_GetGamepadButton(p.gamepad, b)) s.buttons = s.buttons | ((uint32)1 << (uint32)b);
+        }
+        s.left_x = _win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_LEFT_X));
+        s.left_y = _win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_LEFT_Y));
+        s.right_x = _win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_RIGHT_X));
+        s.right_y = _win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_RIGHT_Y));
+        _win_dead2(&s.left_x, &s.left_y, _win_deadzone);
+        _win_dead2(&s.right_x, &s.right_y, _win_deadzone);
+        s.left_trigger = _win_dead1(_win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_LEFT_TRIGGER)), _win_deadzone);
+        s.right_trigger = _win_dead1(_win_axis(SDL_GetGamepadAxis(p.gamepad, PAD_AXIS_RIGHT_TRIGGER)), _win_deadzone);
+        out.buttons = out.buttons | s.buttons;
+        out.left_x = _win_wider(out.left_x, s.left_x);
+        out.left_y = _win_wider(out.left_y, s.left_y);
+        out.right_x = _win_wider(out.right_x, s.right_x);
+        out.right_y = _win_wider(out.right_y, s.right_y);
+        out.left_trigger = _win_wider(out.left_trigger, s.left_trigger);
+        out.right_trigger = _win_wider(out.right_trigger, s.right_trigger);
+    }
+#endif
+    return found;
+}
+
+// Rumbles a gamepad (or every pad, with PAD_ANY) for ms milliseconds: low is the strength
+// of the low-frequency (left) motor and high of the high-frequency (right) one, from 0 to
+// 1; a new call replaces the last, and 0, 0 stops it. False when no pad that was asked for
+// can rumble.
+bool Window_pad_rumble(*Window self, int pad, float low, float high, uint32 ms) {
+    bool any = false;
+#ifndef __EMSCRIPTEN__
+    float l = low < 0.0 ? 0.0 : (low > 1.0 ? 1.0 : low);
+    float h = high < 0.0 ? 0.0 : (high > 1.0 ? 1.0 : high);
+    for (i in 0.._win_pads.size) {
+        _WinPad p = _win_pads.data[i];
+        if (pad != PAD_ANY && p.id != pad) continue;
+        if (SDL_RumbleGamepad(p.gamepad, (uint16)(l * 65535.0), (uint16)(h * 65535.0), ms)) any = true;
+    }
+#endif
+    return any;
 }
 
 // A GPU surface over the window, configured to its current size.
