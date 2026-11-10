@@ -2895,6 +2895,7 @@ struct GpuPass {
     List<WGPUBindGroup> groups;
     *GpuEncoder encoder;
     string err;
+    WGPUTextureFormat depth_format;
 }
 ```
 
@@ -4602,6 +4603,8 @@ struct GpuYuv {
     GpuSampler sampler;
     GpuPipeline pipe;
     GpuPipeline rgba_pipe;
+    GpuPipeline depth_pipe;
+    WGPUTextureFormat depth_pipe_format;
     GpuBuffer uniforms;
     GpuBuffer rgba_uniforms;
     GpuTexture rgba;
