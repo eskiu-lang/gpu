@@ -6,7 +6,9 @@ main = "examples/compute.esk"
 [deps]
 
 # wgpu-native's own release archives, fetched by eskiuc build / run / test / fetch. SDL3
-# (<gpu/window>) has no prebuilt macOS or Linux library: it comes from the system.
+# (<gpu/window>) comes from the system until a [native.SDL3] table names the archives that
+# tools/sdl3_prebuilt.sh builds and the SDL3 prebuilt workflow publishes (its job summary
+# has the table).
 [native.wgpu_native]
 macos-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip", sha256 = "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e" }
 macos-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip", sha256 = "8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41" }

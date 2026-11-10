@@ -1,0 +1,80 @@
+name: SDL3 prebuilt
+
+# Builds the SDL3 archives that eskiu.toml's [native.SDL3] names (tools/sdl3_prebuilt.sh)
+# and publishes them as the release sdl3-VERSION of this repository, with SHA256SUMS. The
+# job summary has the [native.SDL3] table to put in eskiu.toml. Run it by hand after
+# changing SDL_VERSION in the script.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15
+          # The oldest glibc GitHub offers (2.35), so the library loads on older systems too.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+          - platform: windows-x86_64
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install ninja
+          else
+            sudo apt-get update
+            sudo apt-get install -y cmake ninja-build
+          fi
+      - name: SDL's Linux dependencies (loaded at run time)
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          sudo apt-get install -y libasound2-dev libpulse-dev libpipewire-0.3-dev libx11-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libwayland-dev \
+            wayland-protocols libdecor-0-dev
+      - name: Build
+        run: mkdir -p out && tools/sdl3_prebuilt.sh ${{ matrix.platform }} out | tee out/toml.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdl3-${{ matrix.platform }}
+          path: out/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^SDL_VERSION=//p' tools/sdl3_prebuilt.sh)
+          mkdir dist
+          cp artifacts/*/*.tar.gz dist/
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          gh release create "sdl3-$version" dist/* --title "SDL $version prebuilt" \
+            --notes "SDL $version for [native.SDL3] (zlib license, in each archive). Built by tools/sdl3_prebuilt.sh."
+          {
+            echo '```toml'
+            echo '[native.SDL3]'
+            cat artifacts/*/toml.txt | grep ' = { url = '
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
