@@ -23,7 +23,13 @@ jobs:
           unzip -q wgpu.zip -d $HOME/wgpu
       - name: SDL3 from source, with tools/sdl3_prebuilt.sh (tests/window_input.esk)
         run: |
-          sudo apt-get install -y cmake ninja-build libx11-dev libxext-dev libudev-dev
+          # The same packages as the SDL3 prebuilt workflow: SDL's configure fails on a
+          # missing X11 or Wayland library instead of leaving it out.
+          sudo apt-get install -y cmake ninja-build libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev \
+            libxtst-dev libxkbcommon-dev libdrm-dev libgbm-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libegl1-mesa-dev libdbus-1-dev libibus-1.0-dev libudev-dev libwayland-dev \
+            wayland-protocols libdecor-0-dev
           tools/sdl3_prebuilt.sh linux-x86_64 $HOME/sdl3
           tar -xzf $HOME/sdl3/sdl3-*-linux-x86_64.tar.gz -C $HOME/sdl3
       - name: Layout check
