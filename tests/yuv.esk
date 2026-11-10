@@ -315,6 +315,17 @@ Result<int, string> draws(*Gpu gpu) {
     d = GpuYuvDraw{width: 16.0, height: 16.0};
     drawn(gpu, &yuv, 16, 16, WGPUTextureFormat_RGBA8Unorm, &d, &px[0])?;
     check("filtered draw covers the target", !blue(&px[0]) && !blue(&px[(15 * 16 + 15) * 4]));
+    // In a pass with a depth attachment (a background under a 3D scene), as without one.
+    GpuTexture target = gpu.target_with(16, 16, WGPUTextureFormat_RGBA8Unorm)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(16, 16)?;
+    defer depth.release();
+    d = GpuYuvDraw{x: 2.0, y: 3.0, width: 5.0, height: 7.0, nearest: true};
+    GpuPass dpass = gpu.pass(target.view, GpuColor{0.0, 0.0, 1.0, 1.0}, &depth);
+    yuv.draw(&dpass, &d);
+    check("draw in a pass with depth", dpass.end().ok);
+    target.read(&px[0])?;
+    check("depth pass picture", picture_off(&px[0], 16, 2, 3, 5, 7, 90, false) <= 1);
     return Ok<int, string>(0);
 }
 

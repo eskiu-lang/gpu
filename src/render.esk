@@ -354,6 +354,9 @@ struct GpuPass {
     List<WGPUBindGroup> groups;
     *GpuEncoder encoder;
     string err;
+    // The depth attachment's format, 0 when the pass has none: a pipeline
+    // drawn in the pass needs the same.
+    WGPUTextureFormat depth_format;
 }
 
 // A texture copy on its way back from the GPU (GpuTexture_read_async).
@@ -1283,6 +1286,7 @@ void _gpu_begin(*GpuPass p, WGPUTextureView target, *GpuPassOptions o) {
         // missing aspect are a validation error.
         WGPUTextureFormat df = o.depth_view != null ? o.depth_view.format : o.depth.format;
         da = WGPURenderPassDepthStencilAttachment{view: o.depth_view != null ? o.depth_view.view : o.depth.view};
+        p.depth_format = df;
         if (df != WGPUTextureFormat_Stencil8) {
             da.depthLoadOp = o.depth_load ? WGPULoadOp_Load : WGPULoadOp_Clear;
             da.depthStoreOp = WGPUStoreOp_Store;

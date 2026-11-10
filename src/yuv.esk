@@ -110,6 +110,8 @@ struct GpuYuv {
     GpuSampler sampler;
     GpuPipeline pipe;
     GpuPipeline rgba_pipe;
+    GpuPipeline depth_pipe;
+    WGPUTextureFormat depth_pipe_format;
     GpuBuffer uniforms;
     GpuBuffer rgba_uniforms;
     GpuTexture rgba;
@@ -202,7 +204,7 @@ Result<GpuYuv, string> Gpu_yuv(*Gpu self, WGPUTextureFormat target_format) {
         return Err<GpuYuv, string>(ub.error);
     }
     y.uniforms = ub.value;
-    Result<GpuPipeline, string> pipe = _gpu_yuv_pipeline(&y, y.target_format, &y.uniforms);
+    Result<GpuPipeline, string> pipe = _gpu_yuv_pipeline(&y, y.target_format, 0, &y.uniforms);
     if (!pipe.ok) {
         GpuYuv_release(&y);
         return Err<GpuYuv, string>(pipe.error);
@@ -211,11 +213,19 @@ Result<GpuYuv, string> Gpu_yuv(*Gpu self, WGPUTextureFormat target_format) {
     return Ok<GpuYuv, string>(y);
 }
 
-// The conversion pipeline for targets of format, its sampler and uniforms bound.
-Result<GpuPipeline, string> _gpu_yuv_pipeline(*GpuYuv self, WGPUTextureFormat format, *GpuBuffer uniforms) {
+// The conversion pipeline for targets of format, its sampler, uniforms and
+// the planes uploaded so far bound. With a depth format it draws in passes
+// with that depth attachment, passing every depth test and writing none.
+Result<GpuPipeline, string> _gpu_yuv_pipeline(*GpuYuv self, WGPUTextureFormat format, WGPUTextureFormat depth, *GpuBuffer uniforms) {
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_yuv_shader, vertex: "vs", fragment: "fs", format: format};
+    if (depth != 0) {
+        d.depth = true;
+        d.depth_format = depth;
+        d.depth_compare = WGPUCompareFunction_Always;
+        d.depth_read_only = true;
+    }
     GpuPipeline p = Gpu_pipeline(&self.gpu, &d)?;
-    for (i in 0..3) GpuPipeline_bind_texture(&p, (uint32)i, &self.blank);
+    for (i in 0..3) GpuPipeline_bind_texture(&p, (uint32)i, self.planes[i].handle != null ? &self.planes[i] : &self.blank);
     GpuPipeline_bind_sampler(&p, 3, &self.sampler);
     GpuPipeline_bind(&p, 4, uniforms);
     return Ok<GpuPipeline, string>(p);
@@ -268,9 +278,15 @@ Result<int, string> _gpu_yuv_slot(*GpuYuv self, int slot, uint32 width, uint32 h
     if (t.handle != null && t.width == width && t.height == height && t.format == format) return Ok<int, string>(0);
     GpuTexture_release(t);
     *t = Gpu_texture(&self.gpu, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    _gpu_yuv_bind(self, slot, t);
+    return Ok<int, string>(0);
+}
+
+// Binds t as plane texture slot in each pipeline made so far.
+void _gpu_yuv_bind(*GpuYuv self, int slot, *GpuTexture t) {
     GpuPipeline_bind_texture(&self.pipe, (uint32)slot, t);
     if (self.rgba_pipe.handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)slot, t);
-    return Ok<int, string>(0);
+    if (self.depth_pipe.handle != null) GpuPipeline_bind_texture(&self.depth_pipe, (uint32)slot, t);
 }
 
 // Room for `bytes` bytes of repacked plane.
@@ -344,8 +360,7 @@ Result<int, string> GpuYuv_upload(*GpuYuv self, *GpuYuvImage image) {
     int used = image.format == GPU_YUV_RGBA ? 1 : (image.format == GPU_YUV_NV12 || image.format == GPU_YUV_NV21 ? 2 : 3);
     for (int i = used; i < 3; i++) {
         GpuTexture_release(&self.planes[i]);
-        GpuPipeline_bind_texture(&self.pipe, (uint32)i, &self.blank);
-        if (self.rgba_pipe.handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)i, &self.blank);
+        _gpu_yuv_bind(self, i, &self.blank);
     }
     self.width = image.width;
     self.height = image.height;
@@ -461,8 +476,22 @@ void GpuYuv_draw(*GpuYuv self, *GpuPass pass, *GpuYuvDraw d) {
     _GpuYuvUniforms u;
     _gpu_yuv_uniforms(self, &u, rotation, d.mirror, kx, ky, d.nearest, self.target_format);
     GpuBuffer_write(&self.uniforms, 0, &u, sizeof(_GpuYuvUniforms));
+    *GpuPipeline pipe = &self.pipe;
+    if (pass.depth_format != 0) {
+        if (self.depth_pipe.handle == null || self.depth_pipe_format != pass.depth_format) {
+            GpuPipeline_release(&self.depth_pipe);
+            Result<GpuPipeline, string> dp = _gpu_yuv_pipeline(self, self.target_format, pass.depth_format, &self.uniforms);
+            if (!dp.ok) {
+                if (pass.err == null) pass.err = dp.error;
+                return;
+            }
+            self.depth_pipe = dp.value;
+            self.depth_pipe_format = pass.depth_format;
+        }
+        pipe = &self.depth_pipe;
+    }
     GpuPass_set_viewport(pass, x, y, w, h);
-    GpuPass_draw(pass, &self.pipe, null, 3, 1);
+    GpuPass_draw(pass, pipe, null, 3, 1);
 }
 
 // Renders the uploaded frame into the GpuYuv's own RGBA8Unorm texture
@@ -476,10 +505,7 @@ Result<*GpuTexture, string> GpuYuv_to_rgba(*GpuYuv self, bool upright) {
     uint32 h = (uint32)GpuYuv_out_height(self, upright);
     if (self.rgba_pipe.handle == null) {
         if (self.rgba_uniforms.handle == null) self.rgba_uniforms = Gpu_uniform(&self.gpu, null, sizeof(_GpuYuvUniforms))?;
-        self.rgba_pipe = _gpu_yuv_pipeline(self, WGPUTextureFormat_RGBA8Unorm, &self.rgba_uniforms)?;
-        for (i in 0..3) {
-            if (self.planes[i].handle != null) GpuPipeline_bind_texture(&self.rgba_pipe, (uint32)i, &self.planes[i]);
-        }
+        self.rgba_pipe = _gpu_yuv_pipeline(self, WGPUTextureFormat_RGBA8Unorm, 0, &self.rgba_uniforms)?;
     }
     if (self.rgba.handle == null || self.rgba.width != w || self.rgba.height != h) {
         GpuTexture_release(&self.rgba);
@@ -503,6 +529,7 @@ void GpuYuv_release(*GpuYuv self) {
     GpuSampler_release(&self.sampler);
     GpuPipeline_release(&self.pipe);
     GpuPipeline_release(&self.rgba_pipe);
+    GpuPipeline_release(&self.depth_pipe);
     GpuBuffer_release(&self.uniforms);
     GpuBuffer_release(&self.rgba_uniforms);
     if (self.scratch != null) free(self.scratch);
