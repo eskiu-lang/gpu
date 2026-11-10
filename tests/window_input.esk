@@ -1,0 +1,264 @@
+// <gpu/window> input with no display and no device: SDL's dummy video driver, a virtual
+// gamepad (SDL's virtual joystick) for the pad events, state, deadzone and rumble, and
+// pushed SDL events for fingers and the mouse as a finger. Links SDL3.
+import <io>;
+import <mem>;
+import <libc>;
+import <gpu/touch>;
+import <gpu/window>;
+
+extern bool SDL_SetHint(string name, string value);
+extern uint32 SDL_AttachVirtualJoystick(*void desc);
+extern bool SDL_DetachVirtualJoystick(uint32 id);
+extern *void SDL_GetJoystickFromID(uint32 id);
+extern bool SDL_SetJoystickVirtualAxis(*void joystick, int axis, int16 value);
+extern bool SDL_SetJoystickVirtualButton(*void joystick, int button, bool down);
+extern bool SDL_PushEvent(*void event);
+
+int fails = 0;
+int rumble_calls = 0;
+uint16 rumble_low = 0;
+uint16 rumble_high = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b) {
+    float d = a - b;
+    return d < 0.001 && d > -0.001;
+}
+
+// The virtual pad's rumble: SDL calls it from SDL_RumbleGamepad.
+bool on_rumble(*void user, uint16 low, uint16 high) {
+    rumble_calls++;
+    rumble_low = low;
+    rumble_high = high;
+    return true;
+}
+
+// The next event. SDL ends each pass of a poll loop at the events it had when the pass
+// began (SDL3's poll sentinel), so an event pushed after that comes from the next call.
+bool take(*Window win, *WindowEvent ev) {
+    return win.poll(ev) || win.poll(ev);
+}
+
+// Takes events until one of this kind comes (and, for WINDOW_PAD_AXIS, of this axis),
+// skipping others, at most 64.
+bool next(*Window win, int kind, int axis, *WindowEvent ev) {
+    for (i in 0..64) {
+        if (!take(win, ev)) return false;
+        if (ev.kind == kind && (kind != WINDOW_PAD_AXIS || ev.axis == axis)) return true;
+    }
+    return false;
+}
+
+void drain(*Window win) {
+    WindowEvent ev;
+    while (win.poll(&ev)) {}
+}
+
+void pad_tests(*Window win) {
+    // SDL_VirtualJoystickDesc (136 bytes): a gamepad with the 15 standard buttons through
+    // the directional pad and the 6 standard axes, in SDL's order, and a rumble callback.
+    uint64[17] desc;
+    *uint8 d = (*uint8)&desc;
+    memset(d, 0, sizeof(desc));
+    *(*uint32)d = 136;
+    *(*uint16)(d + 4) = 1;
+    *(*uint16)(d + 12) = 6;
+    *(*uint16)(d + 14) = 15;
+    *(*string)(d + 40) = "Eskiu virtual pad";
+    *(**void)(d + 88) = (*void)on_rumble;
+    uint32 id = SDL_AttachVirtualJoystick(d);
+    check("attach", id != 0);
+    WindowEvent ev;
+    check("pad added", next(win, WINDOW_PAD_ADDED, 0, &ev) && ev.pad == (int)id);
+    check("pad count", win.pad_count() == 1 && win.pad_id(0) == (int)id && win.pad_id(1) == -1);
+    check("pad name", win.pad_name((int)id) != null && strcmp(win.pad_name((int)id), "Eskiu virtual pad") == 0);
+    check("no such pad name", win.pad_name(12345) == null);
+
+    *void joy = SDL_GetJoystickFromID(id);
+    check("joystick", joy != null);
+    SDL_SetJoystickVirtualButton(joy, PAD_SOUTH, true);
+    SDL_SetJoystickVirtualButton(joy, PAD_DPAD_LEFT, true);
+    check("button down", next(win, WINDOW_PAD_DOWN, 0, &ev) && ev.pad == (int)id &&
+        (ev.button == PAD_SOUTH || ev.button == PAD_DPAD_LEFT));
+    drain(win);
+    PadState st;
+    check("state", win.pad_state((int)id, &st));
+    check("held", st.held(PAD_SOUTH) && st.held(PAD_DPAD_LEFT) && !st.held(PAD_EAST) && !st.held(PAD_START));
+    check("held out of range", !st.held(-1) && !st.held(40));
+    SDL_SetJoystickVirtualButton(joy, PAD_SOUTH, false);
+    check("button up", next(win, WINDOW_PAD_UP, 0, &ev) && ev.button == PAD_SOUTH);
+    drain(win);
+    win.pad_state(PAD_ANY, &st);
+    check("released", !st.held(PAD_SOUTH) && st.held(PAD_DPAD_LEFT));
+
+    // The left stick fully down: y is positive down, as on the screen.
+    SDL_SetJoystickVirtualAxis(joy, PAD_AXIS_LEFT_Y, 32767);
+    check("axis event", next(win, WINDOW_PAD_AXIS, PAD_AXIS_LEFT_Y, &ev) && ev.axis == PAD_AXIS_LEFT_Y && near(ev.value, 1.0));
+    drain(win);
+    check("any", win.pad_state(PAD_ANY, &st));
+    check("stick down", near(st.left_y, 1.0) && near(st.left_x, 0.0));
+
+    // Within the deadzone the stick reads as centered; past it, the rest is stretched.
+    SDL_SetJoystickVirtualAxis(joy, PAD_AXIS_LEFT_Y, 0);
+    SDL_SetJoystickVirtualAxis(joy, PAD_AXIS_LEFT_X, 2000);
+    drain(win);
+    win.pad_state(PAD_ANY, &st);
+    check("deadzone", st.left_x == 0.0 && st.left_y == 0.0);
+    SDL_SetJoystickVirtualAxis(joy, PAD_AXIS_LEFT_X, -16384);
+    drain(win);
+    win.pad_state(PAD_ANY, &st);
+    check("stretched", near(st.left_x, (-16384.0 / 32767.0 + 0.1) / 0.9));
+    win.set_pad_deadzone(0.0);
+    win.pad_state(PAD_ANY, &st);
+    check("no deadzone", near(st.left_x, -16384.0 / 32767.0));
+    win.set_pad_deadzone(0.1);
+
+    // A trigger pulled all the way.
+    SDL_SetJoystickVirtualAxis(joy, PAD_AXIS_RIGHT_TRIGGER, 32767);
+    drain(win);
+    win.pad_state(PAD_ANY, &st);
+    check("trigger", near(st.right_trigger, 1.0) && near(st.left_trigger, 0.0));
+
+    check("rumble", win.pad_rumble(PAD_ANY, 0.5, 1.0, 100) && rumble_calls == 1);
+    check("rumble strength", rumble_low == 32767 && rumble_high == 65535);
+    check("rumble unknown pad", !win.pad_rumble(999, 1.0, 1.0, 100));
+
+    SDL_DetachVirtualJoystick(id);
+    check("pad removed", next(win, WINDOW_PAD_REMOVED, 0, &ev) && ev.pad == (int)id);
+    check("no pads", win.pad_count() == 0 && !win.pad_state(PAD_ANY, &st) && st.buttons == 0);
+    check("removed state", !win.pad_state((int)id, &st));
+}
+
+// Pushes an SDL_TouchFingerEvent.
+void push_finger(uint32 kind, uint64 device, uint64 finger, float x, float y) {
+    uint64[16] raw;
+    *uint8 e = (*uint8)&raw;
+    memset(e, 0, sizeof(raw));
+    *(*uint32)e = kind;
+    *(*uint64)(e + 8) = 2500000000;
+    *(*uint64)(e + 16) = device;
+    *(*uint64)(e + 24) = finger;
+    *(*float)(e + 32) = x;
+    *(*float)(e + 36) = y;
+    SDL_PushEvent(e);
+}
+
+// Pushes an SDL_MouseButtonEvent (0x401 down, 0x402 up) or SDL_MouseMotionEvent (0x400,
+// state the buttons held).
+void push_mouse(uint32 kind, uint32 which, int button, float x, float y) {
+    uint64[16] raw;
+    *uint8 e = (*uint8)&raw;
+    memset(e, 0, sizeof(raw));
+    *(*uint32)e = kind;
+    *(*uint64)(e + 8) = 3000000000;
+    *(*uint32)(e + 20) = which;
+    if (kind == 0x400) {
+        *(*uint32)(e + 24) = button == 0 ? 0 : (uint32)1 << (uint32)(button - 1);
+    } else {
+        e[24] = (uint8)button;
+        e[25] = kind == 0x401 ? 1 : 0;
+    }
+    *(*float)(e + 28) = x;
+    *(*float)(e + 32) = y;
+    SDL_PushEvent(e);
+}
+
+void touch_tests(*Window win) {
+    uint32 w = 0;
+    uint32 h = 0;
+    win.size(&w, &h);
+    GpuTouches touches;
+    defer touches.free();
+    WindowEvent ev;
+    drain(win);
+
+    // Two fingers of a touch screen: small ids from 0, positions in pixels.
+    push_finger(0x700, 7, 1000, 0.5, 0.25);
+    push_finger(0x700, 7, 2000, 0.25, 0.5);
+    check("finger 0", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.id == 0 &&
+        ev.touch.phase == GPU_TOUCH_DOWN);
+    check("finger 0 position", near(ev.touch.x, (float)w * 0.5) && near(ev.touch.y, (float)h * 0.25) &&
+        ev.x == ev.touch.x && ev.y == ev.touch.y);
+    check("finger time", ev.touch.time == 2.5);
+    touches.apply(ev.touch);
+    check("finger 1", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.id == 1);
+    touches.apply(ev.touch);
+    push_finger(0x702, 7, 2000, 0.75, 0.75);
+    check("finger move", take(win, &ev) && ev.touch.id == 1 && ev.touch.phase == GPU_TOUCH_MOVE);
+    touches.apply(ev.touch);
+    check("tracked", touches.count() == 2 && near(touches.find(1).x, (float)w * 0.75));
+
+    // The first finger lifts; a new finger takes its id.
+    push_finger(0x701, 7, 1000, 0.5, 0.25);
+    check("finger up", take(win, &ev) && ev.touch.id == 0 && ev.touch.phase == GPU_TOUCH_UP);
+    touches.apply(ev.touch);
+    push_finger(0x700, 8, 1000, 0.1, 0.1);
+    check("id reused", take(win, &ev) && ev.touch.id == 0 && ev.touch.phase == GPU_TOUCH_DOWN);
+    touches.apply(ev.touch);
+    push_finger(0x703, 7, 2000, 0.75, 0.75);
+    check("finger cancel", take(win, &ev) && ev.touch.id == 1 && ev.touch.phase == GPU_TOUCH_CANCEL);
+    touches.apply(ev.touch);
+    check("one down", touches.count() == 1 && touches.find(0) != null);
+
+    // A move or up for a finger that is not down is dropped.
+    push_finger(0x702, 9, 1, 0.1, 0.1);
+    push_finger(0x701, 9, 1, 0.1, 0.1);
+    check("unknown finger", !take(win, &ev));
+    push_finger(0x701, 8, 1000, 0.1, 0.1);
+    check("last up", take(win, &ev) && ev.touch.id == 0 && ev.touch.phase == GPU_TOUCH_UP);
+    touches.apply(ev.touch);
+    check("none down", touches.count() == 0);
+
+    // The mouse as it is, then as a finger.
+    push_mouse(0x401, 0, 1, 10.0, 20.0);
+    check("mouse down", take(win, &ev) && ev.kind == WINDOW_MOUSE_DOWN && ev.button == 1 && !ev.from_touch);
+    push_mouse(0x402, 0, 1, 10.0, 20.0);
+    check("mouse up", take(win, &ev) && ev.kind == WINDOW_MOUSE_UP);
+
+    win.set_mouse_touch(true);
+    push_mouse(0x400, 0, 0, 5.0, 5.0);
+    check("hover stays mouse", take(win, &ev) && ev.kind == WINDOW_MOUSE_MOVE);
+    push_mouse(0x401, 0, 1, 10.0, 20.0);
+    check("mouse finger down", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.id == 0 &&
+        ev.touch.phase == GPU_TOUCH_DOWN && ev.touch.time == 3.0);
+    float k = ev.touch.x / 10.0;
+    check("mouse finger pixels", k >= 1.0 && near(ev.touch.y, 20.0 * k));
+    push_finger(0x700, 7, 3000, 0.5, 0.5);
+    check("finger beside mouse", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.id == 1);
+    push_mouse(0x400, 0, 1, 30.0, 40.0);
+    check("mouse finger move", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.id == 0 &&
+        ev.touch.phase == GPU_TOUCH_MOVE && near(ev.touch.x, 30.0 * k));
+    push_mouse(0x401, 0, 3, 30.0, 40.0);
+    check("right button stays mouse", take(win, &ev) && ev.kind == WINDOW_MOUSE_DOWN && ev.button == 3);
+    push_mouse(0x402, 0, 1, 30.0, 40.0);
+    check("mouse finger up", take(win, &ev) && ev.kind == WINDOW_TOUCH && ev.touch.phase == GPU_TOUCH_UP);
+
+    // Mouse events made from a finger stay mouse events, marked.
+    push_mouse(0x401, 0xFFFFFFFF, 1, 1.0, 1.0);
+    check("from touch", take(win, &ev) && ev.kind == WINDOW_MOUSE_DOWN && ev.from_touch);
+    win.set_mouse_touch(false);
+    drain(win);
+}
+
+int main() {
+    SDL_SetHint("SDL_VIDEO_DRIVER", "dummy");
+    Result<Window, string> r = window_open("input test", 320, 240);
+    if (!r.ok) {
+        printf("window_open: %s\n", r.error);
+        return 1;
+    }
+    Window win = r.value;
+    drain(&win);
+    pad_tests(&win);
+    touch_tests(&win);
+    win.release();
+    printf("window_input: %d failures\n", fails);
+    return fails == 0 ? 0 : 1;
+}

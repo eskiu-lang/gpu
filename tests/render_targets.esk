@@ -702,8 +702,14 @@ int main() {
     run_case("mips 2D array", gen_mips_rgba8(&gpu, "mips 2D array", 8, 8, 3, false, WGPUTextureFormat_RGBA8Unorm));
     run_case("mips cube", gen_mips_rgba8(&gpu, "mips cube", 8, 8, 0, true, WGPUTextureFormat_RGBA8Unorm));
     run_case("mips RGBA16Float", gen_mips_half(&gpu));
-    run_case("shadow", shadow(&gpu));
-    run_case("srgb_views", srgb_views(&gpu));
+    // WebGL2 (a browser without WebGPU) cannot sample one texture with two samplers in a
+    // shader, nor view a texture in another format.
+    if (gpu.webgl2) {
+        printf("skip shadow and srgb_views (WebGL2)\n");
+    } else {
+        run_case("shadow", shadow(&gpu));
+        run_case("srgb_views", srgb_views(&gpu));
+    }
     printf("render targets: %d failures\n", fails);
     return fails == 0 ? 0 : 1;
 }

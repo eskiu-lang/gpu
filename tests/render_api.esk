@@ -655,17 +655,24 @@ Result<int, string> bind_groups(*Gpu gpu, *uint8 px) {
 Result<int, string> skinning(*Gpu gpu, *uint8 px) {
     string shader =
         "struct V { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };\n"
-        "@group(0) @binding(0) var<storage, read> joints: array<mat4x4<f32>>;\n"
         "@vertex fn vs(@location(0) p: vec3<f32>, @location(1) j: vec4<f32>, @location(2) w: vec4<f32>) -> V {\n"
         "    let skin = joints[u32(j.x)] * w.x + joints[u32(j.y)] * w.y + joints[u32(j.z)] * w.z + joints[u32(j.w)] * w.w;\n"
         "    let q = skin * vec4<f32>(p, 1.0);\n"
         "    return V(vec4<f32>(q.x, q.y * 0.5 - 1.0, 0.0, 1.0), vec4<f32>(1.0, 1.0 - q.y / 2.5, q.y / 2.5, 1.0));\n"
         "}\n"
         "@fragment fn fs(v: V) -> @location(0) vec4<f32> { return v.color; }\n";
+    // WebGL2 has no storage buffers: the joints go in a uniform array there.
+    String wgsl;
+    defer String_free(&wgsl);
+    String_append(&wgsl, gpu.webgl2 ? "@group(0) @binding(0) var<uniform> joints: array<mat4x4<f32>, 4>;\n"
+        : "@group(0) @binding(0) var<storage, read> joints: array<mat4x4<f32>>;\n");
+    String_append(&wgsl, shader);
+    shader = wgsl.data;
     Gltf g = gltf_load("tests/data/skin_anim.gltf")?;
     defer g.free();
     g.nodes.data[2].translation = Vec3{0.0, 1.5, 0.0};
-    GpuJoints joints = gpu.joints(&g, 0)?;
+    Result<GpuJoints, string> made = gpu.webgl2 ? gpu.joints_uniform(&g, 0, 4) : gpu.joints(&g, 0);
+    GpuJoints joints = made?;
     defer joints.release();
     float[32] got;
     joints.buffer.read(&got, sizeof(got))?;
@@ -711,7 +718,8 @@ Result<int, string> skinning(*Gpu gpu, *uint8 px) {
     l.add(WGPUVertexFormat_Float32x4, 28);
     GpuBindLayout bl = gpu.bind_layout();
     defer bl.release();
-    bl.storage(0, WGPUShaderStage_Vertex, true);
+    if (gpu.webgl2) bl.uniform(0, WGPUShaderStage_Vertex);
+    else bl.storage(0, WGPUShaderStage_Vertex, true);
     *GpuBindLayout[1] groups = {&bl};
     GpuPipelineDesc d = GpuPipelineDesc{wgsl: shader, vertex: "vs", fragment: "fs", format: t.format, layout: &l, groups: &groups[0], group_count: 1};
     GpuPipeline pipe = gpu.pipeline(&d)?;
