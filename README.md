@@ -31,7 +31,7 @@ WGSL.
 - **Rendering.** Textures, samplers, depth buffers, vertex, index and uniform buffers,
   render pipelines and passes, to an offscreen texture or a window; several render targets,
   stencil, multisampling, cube and array targets, and shadow maps; in the browser too,
-  through emdawnwebgpu.
+  through emdawnwebgpu, with a WebGL2 backend for browsers without WebGPU.
 - **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
   OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
   based shading, normal maps, alpha modes, skinning, morph targets, animation, image-based
@@ -43,8 +43,8 @@ WGSL.
   in pure Eskiu, and `<gpu/ktx2>` reads KTX2 files; textures can be sRGB, mipmapped (on the
   GPU too), layered, cube maps and BC, ETC2 or ASTC compressed.
 - **Windows, mobile views and input.** `<gpu/window>` opens a desktop window over SDL3 and
-  gives its surface and keyboard/mouse events; `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer`
-  on iOS, `SurfaceView` on Android) inside an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app.
+  gives its surface and its keyboard, mouse, gamepad (with rumble) and touch input;
+  `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer` on iOS, `SurfaceView` on Android) inside an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app.
 - **Errors as `Result`.** Every call that can fail returns one, with the message from the
   WebGPU validation layer; a WGSL error comes with its line and column.
 - **The whole API underneath.** `<gpu/raw>` is all of `webgpu.h` and `wgpu.h`, generated,
@@ -97,7 +97,8 @@ $ eskiuc run twice.esk
 - [Models](docs/models.md): glTF and OBJ, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
 - [Images](docs/image.md): PNG, JPEG, HDR, KTX2, EXIF orientation and limits
 - [Camera and video frames](docs/yuv.md): `<gpu/yuv>`, YUV planes to RGB on the GPU
-- [Web](docs/web.md): the browser through emdawnwebgpu
+- [Web](docs/web.md): the browser through emdawnwebgpu, and WebGL2 where WebGPU is missing
+- [Window input](docs/input.md): keyboard, mouse, gamepads and touch on the desktop
 - [iOS and Android](docs/mobile.md): `GpuView`, the frame loop, touches
 - [Machine learning](docs/ml.md): `<gpu/nn>` inference and `<gpu/train>`
 - [Platforms, modules and contributing](docs/README.md)
@@ -116,4 +117,5 @@ The first build downloads wgpu-native for your platform and checks its SHA-256; 
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Third-party code (naga in the WebGL2 backend, SDL3 in the
+prebuilt archives) is credited in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

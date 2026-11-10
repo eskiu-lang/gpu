@@ -85,7 +85,8 @@ The raw WebGPU API is in `<gpu/raw>` for anything this layer does not cover.
 
 In a browser (wasm32-unknown-emscripten) the API is the same: each wait for the
 GPU suspends the program until the browser's promise settles, which needs a build
-with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md).
+with --link-arg=-sJSPI or --link-arg=-sASYNCIFY (docs/web.md). Without WebGPU the
+device renders through WebGL2 and has no compute.
 
 ### Gpu
 
@@ -106,6 +107,7 @@ struct Gpu {
     bool bc;
     bool etc2;
     bool astc;
+    bool webgl2;
 }
 ```
 
@@ -119,6 +121,8 @@ float32_filterable says whether R32Float, RG32Float and RGBA32Float textures
 may be sampled with linear filtering; bc, etc2 and astc whether textures may
 be in those block-compressed formats (BC on desktop GPUs, ETC2 and ASTC on
 phones and Apple Silicon). gpu_open turns on each one the adapter has.
+webgl2 says the device is the WebGL2 backend, which a browser without
+WebGPU gets (docs/web.md): rendering only, no compute or storage buffers.
 
 ### GpuBuffer
 
@@ -167,7 +171,8 @@ Result<Gpu, string> gpu_open()
 Opens the high-performance adapter and a device with the adapter's full limits and every
 optional feature listed on Gpu that it has. Fails with "no WebGPU instance", "no GPU
 adapter" or "no GPU device" and the driver's message; in a browser also with "no
-WebGPU in this browser".
+WebGPU in this browser". A browser whose WebGPU is missing or gives no adapter gets the
+WebGL2 backend, with Gpu.webgl2 set (docs/web.md).
 
 ### Gpu_release
 
@@ -4355,8 +4360,8 @@ Creates and configures a GpuSurface for the currently mounted GpuView.
 
 ## `<gpu/window>`
 
-Windows and input over SDL3, with a GPU surface to draw into.
-A program that imports it links SDL3; `<gpu>` alone does not.
+Windows and input over SDL3, with a GPU surface to draw into: keyboard,
+mouse, gamepads and touch. A program that imports it links SDL3; `<gpu>` alone does not.
 
 ```eskiu
 Window win = window_open("demo", 800, 600)?;
@@ -4372,10 +4377,17 @@ while (running) {
 }
 ```
 
-In a browser (wasm32-unknown-emscripten) the window is the page's canvas with id
-"canvas": the same program builds for both, and the events come from the page.
+Gamepads come as WINDOW_PAD_* events and as a PadState to read once per frame
+(Window_pad_state); fingers on a touch screen or a pen come as WINDOW_TOUCH events with a
+GpuTouch, as on a mobile GpuView, and Window_set_mouse_touch turns the left mouse button
+into a finger too.
 
-### WINDOW_NONE, WINDOW_QUIT, WINDOW_RESIZE, WINDOW_KEY_DOWN, WINDOW_KEY_UP, WINDOW_MOUSE_MOVE, WINDOW_MOUSE_DOWN, WINDOW_MOUSE_UP, WINDOW_WHEEL
+In a browser (wasm32-unknown-emscripten) the window is the page's canvas with id
+"canvas": the same program builds for both, and the events come from the page. Gamepads
+and fingers are desktop only there: no pad is ever connected and no WINDOW_TOUCH comes,
+except from the mouse with Window_set_mouse_touch.
+
+### WINDOW_NONE, WINDOW_QUIT, WINDOW_RESIZE, WINDOW_KEY_DOWN, WINDOW_KEY_UP, WINDOW_MOUSE_MOVE, WINDOW_MOUSE_DOWN, WINDOW_MOUSE_UP, WINDOW_WHEEL, WINDOW_PAD_ADDED, WINDOW_PAD_REMOVED, WINDOW_PAD_DOWN, WINDOW_PAD_UP, WINDOW_PAD_AXIS, WINDOW_TOUCH
 
 ```eskiu
 const int WINDOW_NONE = 0;
@@ -4387,11 +4399,19 @@ const int WINDOW_MOUSE_MOVE = 5;
 const int WINDOW_MOUSE_DOWN = 6;
 const int WINDOW_MOUSE_UP = 7;
 const int WINDOW_WHEEL = 8;
+const int WINDOW_PAD_ADDED = 9;
+const int WINDOW_PAD_REMOVED = 10;
+const int WINDOW_PAD_DOWN = 11;
+const int WINDOW_PAD_UP = 12;
+const int WINDOW_PAD_AXIS = 13;
+const int WINDOW_TOUCH = 14;
 ```
 
 Event kinds (WindowEvent.kind): none, the user closed the window, the drawable size
-changed, a key went down or up, the mouse moved, a mouse button went down or up, and the
-wheel turned.
+changed, a key went down or up, the mouse moved, a mouse button went down or up, the
+wheel turned, a gamepad was connected or disconnected, a gamepad button went down or up,
+a gamepad axis moved, and a finger (or pen, or the mouse with Window_set_mouse_touch)
+went down, moved, went up or was cancelled.
 
 ### KEY_ESCAPE, KEY_RETURN, KEY_RIGHT, KEY_LEFT, KEY_DOWN, KEY_UP
 
@@ -4405,6 +4425,81 @@ const int KEY_UP = 1073741906;
 ```
 
 Key codes: printable keys are their lowercase ASCII code ('a', ' ', '1').
+
+### PAD_SOUTH, PAD_EAST, PAD_WEST, PAD_NORTH, PAD_BACK, PAD_GUIDE, PAD_START, PAD_LEFT_STICK, PAD_RIGHT_STICK, PAD_LEFT_SHOULDER, PAD_RIGHT_SHOULDER, PAD_DPAD_UP, PAD_DPAD_DOWN, PAD_DPAD_LEFT, PAD_DPAD_RIGHT, PAD_MISC
+
+```eskiu
+const int PAD_SOUTH = 0;
+const int PAD_EAST = 1;
+const int PAD_WEST = 2;
+const int PAD_NORTH = 3;
+const int PAD_BACK = 4;
+const int PAD_GUIDE = 5;
+const int PAD_START = 6;
+const int PAD_LEFT_STICK = 7;
+const int PAD_RIGHT_STICK = 8;
+const int PAD_LEFT_SHOULDER = 9;
+const int PAD_RIGHT_SHOULDER = 10;
+const int PAD_DPAD_UP = 11;
+const int PAD_DPAD_DOWN = 12;
+const int PAD_DPAD_LEFT = 13;
+const int PAD_DPAD_RIGHT = 14;
+const int PAD_MISC = 15;
+```
+
+Gamepad buttons (WindowEvent.button for WINDOW_PAD_DOWN and WINDOW_PAD_UP, and
+PadState_held), in SDL's standard layout: the face buttons by position (south is A on an
+Xbox pad, cross on a PlayStation pad, B on a Nintendo pad), back (select, share), guide
+(the logo button), start (options, menu), the stick clicks, the shoulder buttons (L1 and
+R1), the directional pad, and misc (share, capture, mute) where the pad has one.
+
+### PAD_AXIS_LEFT_X, PAD_AXIS_LEFT_Y, PAD_AXIS_RIGHT_X, PAD_AXIS_RIGHT_Y, PAD_AXIS_LEFT_TRIGGER, PAD_AXIS_RIGHT_TRIGGER
+
+```eskiu
+const int PAD_AXIS_LEFT_X = 0;
+const int PAD_AXIS_LEFT_Y = 1;
+const int PAD_AXIS_RIGHT_X = 2;
+const int PAD_AXIS_RIGHT_Y = 3;
+const int PAD_AXIS_LEFT_TRIGGER = 4;
+const int PAD_AXIS_RIGHT_TRIGGER = 5;
+```
+
+Gamepad axes (WindowEvent.axis for WINDOW_PAD_AXIS): the sticks run from -1 to 1, with x
+positive to the right and y positive down; the triggers (L2 and R2) from 0 to 1.
+
+### PAD_ANY
+
+```eskiu
+const int PAD_ANY = 0;
+```
+
+The pad id that stands for every connected pad in Window_pad_state and Window_pad_rumble
+(a real pad's id is never 0).
+
+### PadState
+
+```eskiu
+struct PadState {
+    uint32 buttons;
+    float left_x;
+    float left_y;
+    float right_x;
+    float right_y;
+    float left_trigger;
+    float right_trigger;
+}
+```
+
+A gamepad as it is now, with the deadzone applied (Window_set_pad_deadzone): buttons has
+bit 1 << PAD_ button set for each button held; the axes are those of PAD_AXIS_.
+
+### PadState_held
+
+```eskiu
+bool PadState_held(*PadState self, int button)
+```
+
+Whether the PAD_ button is held.
 
 ### Window
 
@@ -4432,14 +4527,25 @@ struct WindowEvent {
     float dy;
     uint32 width;
     uint32 height;
+    int pad;
+    int axis;
+    float value;
+    GpuTouch touch;
+    bool from_touch;
 }
 ```
 
 One input event. key and repeat are set for key events, button for mouse
-buttons (1 left, 2 middle, 3 right), x and y for mouse events (pixels) and
-the wheel (scroll amounts), dx and dy for mouse motion, width and height
-(pixels) for WINDOW_RESIZE. In a browser, a key that is neither printable nor
-a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT never comes.
+buttons (1 left, 2 middle, 3 right) and gamepad buttons (a PAD_ constant), x and y for
+mouse and touch events (pixels from the drawable's top left) and the wheel (scroll
+amounts), dx and dy for mouse motion (pixels), width and height (pixels) for
+WINDOW_RESIZE. pad is the gamepad's id for WINDOW_PAD_ events, stable while it stays
+connected; axis and value (from -1 to 1, or 0 to 1 for a trigger, with no deadzone) are
+set for WINDOW_PAD_AXIS. touch is the finger of a WINDOW_TOUCH, to hand to
+GpuTouches_apply. from_touch marks the mouse events the system makes from a finger on a
+touch screen, which come along with its WINDOW_TOUCH events. In a browser, a key that is
+neither printable nor a KEY_ constant is 0x40000000 plus its DOM keyCode, and WINDOW_QUIT
+never comes.
 
 ### window_open
 
@@ -4448,8 +4554,8 @@ Result<Window, string> window_open(string title, int width, int height)
 ```
 
 Opens a resizable, high-density window of width x height points (the drawable size in
-pixels may be larger: Window_size). It starts SDL's video system first. Fails with SDL's
-error message. In a browser it sets the page title and the canvas's CSS size to width x
+pixels may be larger: Window_size). It starts SDL's video and gamepad systems first; the
+pads connected then come as WINDOW_PAD_ADDED events. Fails with SDL's error message. In a browser it sets the page title and the canvas's CSS size to width x
 height (0 x 0 keeps the size the page gives it) and listens to the page's events.
 
 ### Window_release
@@ -4458,8 +4564,8 @@ height (0 x 0 keeps the size the page gives it) and listens to the page's events
 void Window_release(*Window self)
 ```
 
-Destroys the window and shuts SDL down, so a program has one window at a time. Release
-the window's GpuSurface first. In a browser it removes the page's event listeners set
+Destroys the window, closes its gamepads and shuts SDL down, so a program has one window
+at a time. Release the window's GpuSurface first. In a browser it removes the page's event listeners set
 through Emscripten's html5 API.
 
 ### Window_set_title
@@ -4495,6 +4601,77 @@ bool Window_poll(*Window self, *WindowEvent ev)
 
 Takes the next pending event into ev; false when there is none. Events the
 layer does not describe are skipped.
+
+### Window_set_mouse_touch
+
+```eskiu
+void Window_set_mouse_touch(*Window self, bool on)
+```
+
+Turns mouse touch on or off. While it is on, a press of the left mouse button, the
+motion while it is held and its release come as a WINDOW_TOUCH finger instead of mouse
+events, for testing a touch interface on the desktop; the motion with no button held,
+the other buttons and the wheel stay mouse events. Fingers on a touch screen are
+WINDOW_TOUCH events either way.
+
+### Window_set_pad_deadzone
+
+```eskiu
+void Window_set_pad_deadzone(*Window self, float deadzone)
+```
+
+Sets the gamepad deadzone, from 0 to 0.9 (0.1 to start with): Window_pad_state reads a
+stick as centered while it is within this distance of the center, and a trigger as
+released below it, and stretches the rest to the full range. WINDOW_PAD_AXIS values
+have no deadzone.
+
+### Window_pad_count
+
+```eskiu
+int Window_pad_count(*Window self)
+```
+
+The number of connected gamepads.
+
+### Window_pad_id
+
+```eskiu
+int Window_pad_id(*Window self, int index)
+```
+
+The id of the connected gamepad at index (0 to Window_pad_count - 1), in the order they
+were connected, or -1.
+
+### Window_pad_name
+
+```eskiu
+string Window_pad_name(*Window self, int pad)
+```
+
+The gamepad's name ("Xbox Series X Controller", "PS5 Controller"), or null when it is not
+connected.
+
+### Window_pad_state
+
+```eskiu
+bool Window_pad_state(*Window self, int pad, *PadState out)
+```
+
+Reads a gamepad as it is now into out, with the deadzone applied. pad is a pad's id, or
+PAD_ANY for every connected pad together: a button is held when it is held on any pad,
+and each axis is the one farthest from rest. False (and out cleared) when the pad is not
+connected, or with PAD_ANY when none is. The state is that of the last Window_poll.
+
+### Window_pad_rumble
+
+```eskiu
+bool Window_pad_rumble(*Window self, int pad, float low, float high, uint32 ms)
+```
+
+Rumbles a gamepad (or every pad, with PAD_ANY) for ms milliseconds: low is the strength
+of the low-frequency (left) motor and high of the high-frequency (right) one, from 0 to
+1; a new call replaces the last, and 0, 0 stops it. False when no pad that was asked for
+can rumble.
 
 ### Window_surface
 
