@@ -72,6 +72,12 @@ All notable changes to this package are documented in this file. The format is b
   so the triangle, cube and model examples run in a page unchanged. `<gpu/raw>` has a section
   generated from emdawnwebgpu's `webgpu.h` (`tools/gen.py --web`, checked by
   `tools/layout_check.sh --web`). Guide: `docs/web.md`.
+- glTF: `KHR_texture_transform` is applied (offset, rotation and scale per texture, its
+  `texCoord`), `KHR_node_visibility` hides a node and its descendants, and
+  `KHR_animation_pointer` channels drive node visibility and transforms and material factors
+  and texture transforms (`GltfAnimChannel.material`/`slot`, `Gltf.material_version`). Checked
+  against Khronos's TextureTransformMultiTest, NodeVisibilityTest, CubeVisibility and
+  AnimatedColorsCube, and character models that use all three.
 - `<gpu/yuv>`: camera and video frames on the GPU. `Gpu_yuv` and `GpuYuv_upload` put a
   frame's planes in textures as they are (Y as R8, interleaved chroma as RG8, separate U and V
   as R8, uploaded with the frame's row stride; a plane is repacked on the CPU only when no

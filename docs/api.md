@@ -526,13 +526,22 @@ const int GLTF_BLEND = 2;
 
 Alpha modes (GltfMaterial.alpha_mode): opaque, cut out below alpha_cutoff, or blended.
 
-### GLTF_TRANSLATION, GLTF_ROTATION, GLTF_SCALE, GLTF_WEIGHTS
+### GLTF_TRANSLATION, GLTF_ROTATION, GLTF_SCALE, GLTF_WEIGHTS, GLTF_VISIBLE, GLTF_BASE_COLOR, GLTF_EMISSIVE, GLTF_METALLIC, GLTF_ROUGHNESS, GLTF_ALPHA_CUTOFF, GLTF_TEX_OFFSET, GLTF_TEX_ROTATION, GLTF_TEX_SCALE
 
 ```eskiu
 const int GLTF_TRANSLATION = 0;
 const int GLTF_ROTATION = 1;
 const int GLTF_SCALE = 2;
 const int GLTF_WEIGHTS = 3;
+const int GLTF_VISIBLE = 4;
+const int GLTF_BASE_COLOR = 5;
+const int GLTF_EMISSIVE = 6;
+const int GLTF_METALLIC = 7;
+const int GLTF_ROUGHNESS = 8;
+const int GLTF_ALPHA_CUTOFF = 9;
+const int GLTF_TEX_OFFSET = 10;
+const int GLTF_TEX_ROTATION = 11;
+const int GLTF_TEX_SCALE = 12;
 ```
 
 What an animation channel moves (GltfAnimChannel.path): a node's translation, rotation,
@@ -611,10 +620,17 @@ struct GltfTextureRef {
     int texture;
     int texcoord;
     float scale;
+    bool has_transform;
+    Vec2 offset;
+    float rotation;
+    Vec2 tscale;
 }
 ```
 
-A material's use of a texture: texture is an index into Gltf.textures, or -1.
+A material's use of a texture: texture is an index into Gltf.textures, or -1. With
+has_transform (KHR_texture_transform) its coordinates are scaled by tscale, turned by
+rotation (radians) and moved by offset before sampling; texcoord is then the extension's
+texCoord when it gives one.
 
 ### GltfMaterial
 
@@ -634,6 +650,7 @@ struct GltfMaterial {
     float alpha_cutoff;
     bool double_sided;
     bool unlit;
+    float emissive_strength;
 }
 ```
 
@@ -701,6 +718,7 @@ struct GltfNode {
     bool has_matrix;
     Mat4 matrix;
     List<float> weights;
+    bool hidden;
 }
 ```
 
@@ -732,12 +750,19 @@ struct GltfAnimChannel {
     int node;
     int path;
     int sampler;
+    int material;
+    int slot;
 }
 ```
 
 One animated property: node is the node index, path one of GLTF_TRANSLATION,
 GLTF_ROTATION, GLTF_SCALE and GLTF_WEIGHTS, and sampler an index into the animation's
-samplers. Channels with a bad index or an unknown path are dropped on load.
+samplers. A KHR_animation_pointer channel may instead drive a node's visibility
+(GLTF_VISIBLE) or a property of material `material` (GLTF_BASE_COLOR, GLTF_EMISSIVE,
+GLTF_METALLIC, GLTF_ROUGHNESS, GLTF_ALPHA_CUTOFF, or GLTF_TEX_OFFSET, GLTF_TEX_ROTATION
+and GLTF_TEX_SCALE of texture `slot`: 0 base color, 1 metallic-roughness, 2 normal,
+3 occlusion, 4 emissive). Channels with a bad index or an unknown path or pointer are
+dropped on load.
 
 ### GltfAnimSampler
 
@@ -784,12 +809,15 @@ struct Gltf {
     List<GltfSkin> skins;
     List<GltfAnimation> animations;
     List<int> roots;
+    int material_version;
 }
 ```
 
 A loaded glTF model. Every index field refers to these lists; roots are the root nodes
 of the default scene (every parentless node when the file has no scene). Free it with
 free().
+material_version counts the changes Gltf_animate made to materials (animation pointer
+channels), so a renderer knows to write them again.
 
 ### gltf_load
 
@@ -1889,6 +1917,8 @@ struct GpuModel {
     List<int> prim_start;
     List<_GpuDraw> draws;
     *Mat4 world;
+    *bool shown;
+    int material_version;
     Mat4 transform;
     bool encode_srgb;
     *GpuIbl ibl;

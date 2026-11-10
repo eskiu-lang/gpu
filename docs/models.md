@@ -40,8 +40,14 @@ API reference: [`<gpu/gltf>`](api.md#gpugltf), [`<gpu/obj>`](api.md#gpuobj), [`<
 The loader reads meshes (every attribute type, sparse accessors, strips and fans), PBR
 materials with their textures and samplers, the node hierarchy, skins and animations
 (linear, step and cubic spline), from `.glb` files or `.gltf` files with external or
-embedded buffers. `KHR_mesh_quantization`, `KHR_materials_unlit` and
-`KHR_materials_emissive_strength` are supported. The renderer shades with glTF's
+embedded buffers. `KHR_mesh_quantization`, `KHR_materials_unlit`,
+`KHR_materials_emissive_strength`, `KHR_texture_transform` (offset, rotation and scale per
+texture, and its `texCoord`), `KHR_node_visibility` (a hidden node hides its descendants) and
+`KHR_animation_pointer` are supported. An animation pointer can drive a node's translation,
+rotation, scale, weights and visibility, and a material's base color, emissive, metallic,
+roughness and alpha cutoff factors and each texture's offset, rotation and scale; other
+pointers are skipped. `GpuModel_update` writes a material again when an animation changed it
+(`Gltf.material_version`). The renderer shades with glTF's
 metallic-roughness model under one directional light (`model.light`) and a hemisphere
 ambient term. [`examples/model.esk`](examples/model.esk) is a viewer for glTF and OBJ files: drag to orbit, scroll
 to zoom, space pauses the animation.

@@ -131,10 +131,62 @@ void errors() {
     }
 }
 
+// KHR_texture_transform, KHR_node_visibility and KHR_animation_pointer: what the loader reads
+// and what Gltf_animate writes (base color, a texture's offset, a node's visibility).
+void extensions() {
+    string json = "{\"asset\":{\"version\":\"2.0\"},"
+        "\"extensionsUsed\":[\"KHR_texture_transform\",\"KHR_node_visibility\",\"KHR_animation_pointer\"],"
+        "\"extensionsRequired\":[\"KHR_texture_transform\",\"KHR_node_visibility\"],"
+        "\"buffers\":[{\"byteLength\":96,\"uri\":\"data:application/octet-stream;base64,AAAAAAAAAD8AAIA/AACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAAAAAAAAAAACAPwAAgD8AAAAAAAAAAAAAgD8AAIA/AAAAAAAAAAAAAAA/AACAPgAAAD8AAIA+\"}],"
+        "\"bufferViews\":[{\"buffer\":0,\"byteLength\":96}],"
+        "\"accessors\":["
+        "{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\",\"min\":[0],\"max\":[1]},"
+        "{\"bufferView\":0,\"byteOffset\":12,\"componentType\":5126,\"count\":3,\"type\":\"SCALAR\"},"
+        "{\"bufferView\":0,\"byteOffset\":24,\"componentType\":5126,\"count\":3,\"type\":\"VEC4\"},"
+        "{\"bufferView\":0,\"byteOffset\":72,\"componentType\":5126,\"count\":3,\"type\":\"VEC2\"}],"
+        "\"images\":[{\"uri\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=\"}],"
+        "\"textures\":[{\"source\":0}],"
+        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0,"
+        "\"extensions\":{\"KHR_texture_transform\":{\"offset\":[0.1,0.2],\"rotation\":0.5,\"scale\":[2,3],\"texCoord\":1}}}}}],"
+        "\"nodes\":[{\"children\":[1],\"extensions\":{\"KHR_node_visibility\":{\"visible\":false}}},{},{}],"
+        "\"scenes\":[{\"nodes\":[0,2]}],\"scene\":0,"
+        "\"animations\":[{\"samplers\":["
+        "{\"input\":0,\"output\":1,\"interpolation\":\"STEP\"},{\"input\":0,\"output\":2},{\"input\":0,\"output\":3}],"
+        "\"channels\":["
+        "{\"sampler\":0,\"target\":{\"path\":\"pointer\",\"extensions\":{\"KHR_animation_pointer\":{\"pointer\":\"/nodes/2/extensions/KHR_node_visibility/visible\"}}}},"
+        "{\"sampler\":1,\"target\":{\"path\":\"pointer\",\"extensions\":{\"KHR_animation_pointer\":{\"pointer\":\"/materials/0/pbrMetallicRoughness/baseColorFactor\"}}}},"
+        "{\"sampler\":2,\"target\":{\"path\":\"pointer\",\"extensions\":{\"KHR_animation_pointer\":{\"pointer\":\"/materials/0/pbrMetallicRoughness/baseColorTexture/extensions/KHR_texture_transform/offset\"}}}},"
+        "{\"sampler\":0,\"target\":{\"path\":\"pointer\",\"extensions\":{\"KHR_animation_pointer\":{\"pointer\":\"/cameras/0/perspective/yfov\"}}}}]}]}";
+    Result<Gltf, string> r = gltf_parse((*uint8)json, (uint64)strlen(json), null);
+    check("extensions: loads", r.ok);
+    if (!r.ok) {
+        printf("  %s\n", r.error);
+        return;
+    }
+    Gltf g = r.value;
+    defer g.free();
+    GltfTextureRef t = g.materials.data[0].base_color_texture;
+    check("texture transform read", t.has_transform && near(t.offset.x, 0.1) && near(t.offset.y, 0.2)
+          && near(t.rotation, 0.5) && near(t.tscale.x, 2.0) && near(t.tscale.y, 3.0));
+    check("texture transform's texCoord wins", t.texcoord == 1);
+    check("hidden node", g.nodes.data[0].hidden && !g.nodes.data[1].hidden && !g.nodes.data[2].hidden);
+    check("pointer channels kept, unknown pointer dropped", g.animations.data[0].channels.size == 3);
+    int v0 = g.material_version;
+    g.animate(0, 0.25);
+    GltfMaterial* m = &g.materials.data[0];
+    check("base color animated", near(m.base_color.x, 0.5) && near(m.base_color.z, 0.5) && near(m.base_color.w, 1.0));
+    check("texture offset animated", near(m.base_color_texture.offset.x, 0.25) && near(m.base_color_texture.offset.y, 0.125));
+    check("step visibility before its key", !g.nodes.data[2].hidden);
+    check("material version moves", g.material_version > v0);
+    g.animate(0, 0.75);
+    check("step visibility after its key", g.nodes.data[2].hidden);
+}
+
 int main() {
     quad();
     skin();
     errors();
+    extensions();
     printf("gltf: %d failures\n", fails);
     return fails == 0 ? 0 : 1;
 }
