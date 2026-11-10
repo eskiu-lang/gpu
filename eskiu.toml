@@ -5,10 +5,7 @@ main = "examples/compute.esk"
 
 [deps]
 
-# wgpu-native's own release archives, fetched by eskiuc build / run / test / fetch. SDL3
-# (<gpu/window>) comes from the system until a [native.SDL3] table names the archives that
-# tools/sdl3_prebuilt.sh builds and the SDL3 prebuilt workflow publishes (its job summary
-# has the table).
+# wgpu-native's own release archives, fetched by eskiuc build / run / test / fetch.
 [native.wgpu_native]
 macos-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip", sha256 = "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e" }
 macos-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip", sha256 = "8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41" }
@@ -20,3 +17,12 @@ ios-arm64-simulator = { url = "https://github.com/gfx-rs/wgpu-native/releases/do
 ios-x86_64-simulator = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-ios-x86_64-simulator-release.zip", sha256 = "94f67e1b268e8dd31b8e59b32f211ac469f09ed7950fceee52bd84f0623da3d9" }
 android-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-android-aarch64-release.zip", sha256 = "721741f1b05a20c1738166bedf7a5efb2ba4b382da689526d3fc33de22bdd573" }
 android-x86_64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-android-x86_64-release.zip", sha256 = "ef16fc0644bf0e308a39ac4516742da8e22d8c201d3a542cc5baf533d272c491" }
+
+# SDL3 (<gpu/window>), built by tools/sdl3_prebuilt.sh and published by the SDL3 prebuilt
+# workflow as the release sdl3-3.4.18 (its job summary has this table).
+[native.SDL3]
+linux-arm64 = { url = "https://github.com/eskiu-lang/gpu/releases/download/sdl3-3.4.18/sdl3-3.4.18-linux-arm64.tar.gz", sha256 = "3fefebe38c3cb4f8e917cca5bbf18a1bb2d1fe2eda32595674df75ff9eafe74b" }
+linux-x86_64 = { url = "https://github.com/eskiu-lang/gpu/releases/download/sdl3-3.4.18/sdl3-3.4.18-linux-x86_64.tar.gz", sha256 = "4c05b6ac3d5f0848287821185feb8f6c9153980f3a449e8a434c69a17bf423c6" }
+macos-arm64 = { url = "https://github.com/eskiu-lang/gpu/releases/download/sdl3-3.4.18/sdl3-3.4.18-macos-arm64.tar.gz", sha256 = "204411e4b83ad618770d4c44324d3eb5ec9729cef54912f4916efc54d096ef71" }
+macos-x86_64 = { url = "https://github.com/eskiu-lang/gpu/releases/download/sdl3-3.4.18/sdl3-3.4.18-macos-x86_64.tar.gz", sha256 = "094dac1b3f78f010745ce66a468ef522ba1712a8a623ae5587aac754f889bbc2" }
+windows-x86_64 = { url = "https://github.com/eskiu-lang/gpu/releases/download/sdl3-3.4.18/sdl3-3.4.18-windows-x86_64.tar.gz", sha256 = "6a266b43ff7532278161983b5888ee28ed7addf7d575f862883ed15941a60b06" }

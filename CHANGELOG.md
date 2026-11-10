@@ -22,7 +22,8 @@ All notable changes to this package are documented in this file. The format is b
   the deadzone, rumble, touch, and the names of the Rust `gilrs` crate.
 - `tools/sdl3_prebuilt.sh` and the `SDL3 prebuilt` workflow: SDL 3.4.18 archives for macOS
   (arm64, x86-64), Linux (x86-64, arm64) and Windows x86-64, with SDL's zlib license,
-  published as a release of this repository for a `[native.SDL3]` table.
+  published as the release `sdl3-3.4.18` of this repository; `eskiu.toml` names them in a
+  `[native.SDL3]` table, so a build fetches SDL3 with no `-L`.
 - `tests/window_input.esk`: pads through SDL's virtual joystick and fingers through pushed
   events, under SDL's dummy video driver (no display, no device).
 - A WebGL2 backend for browsers without WebGPU (Firefox, Safari before 26, WebKitGTK):

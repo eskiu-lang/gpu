@@ -104,9 +104,9 @@ uses the pure Eskiu modules downloads nothing.
 `tools/sdl3_prebuilt.sh` makes one archive per platform (macOS arm64 and x86-64 and Linux
 x86-64 and arm64 built from SDL's release source, Windows x86-64 from SDL's own MinGW build;
 each with `lib/`, the headers and SDL's zlib license), and the `SDL3 prebuilt` workflow
-publishes them as a release of this repository. Once `eskiu.toml` names them in a
-`[native.SDL3]` table, a build that links SDL3 downloads and checks the one for its platform
-like wgpu-native, with no `-L`. Until then, and on any platform the table leaves out, SDL3
-comes from your system: `brew install sdl3` on macOS, the SDL3 development package or
+publishes them as the release `sdl3-3.4.18` of this repository. `eskiu.toml` names them in a
+`[native.SDL3]` table, so a build that links SDL3 downloads and checks the one for its
+platform like wgpu-native, with no `-L`. On a platform the table leaves out, SDL3 comes from
+your system: `brew install sdl3` on macOS, the SDL3 development package or
 [libsdl.org](https://libsdl.org) elsewhere, with its directory given to a build that opens a
 window, as in `eskiuc build -L/opt/homebrew/lib`.

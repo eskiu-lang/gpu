@@ -113,7 +113,7 @@ eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.5.0
 eskiuc build
 ```
 
-The first build downloads wgpu-native for your platform and checks its SHA-256; `<gpu/window>` also needs SDL3 on the desktop. See [installation details](docs/README.md#installation-details).
+The first build downloads wgpu-native for your platform and checks its SHA-256, and SDL3 for `<gpu/window>` on the desktop. See [installation details](docs/README.md#installation-details).
 
 ## License
 
