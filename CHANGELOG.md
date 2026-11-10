@@ -3,6 +3,63 @@
 All notable changes to this package are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Gamepads in `<gpu/window>`: `window_open` starts SDL's gamepad system and opens each pad
+  as it is connected. `WINDOW_PAD_ADDED`, `WINDOW_PAD_REMOVED`, `WINDOW_PAD_DOWN`,
+  `WINDOW_PAD_UP` and `WINDOW_PAD_AXIS` events (`WindowEvent.pad`, `axis`, `value`); SDL's
+  standard layout as `PAD_` buttons and `PAD_AXIS_` axes; `Window_pad_state` (one pad, or
+  `PAD_ANY` for all of them together) into a `PadState` with `held`, with a radial stick
+  deadzone (`Window_set_pad_deadzone`); `Window_pad_count`, `Window_pad_id`,
+  `Window_pad_name` and `Window_pad_rumble`.
+- Touch in `<gpu/window>`: fingers and pens come as `WINDOW_TOUCH` events with a `GpuTouch`
+  (`WindowEvent.touch`: small reused ids, pixels, seconds), as on a mobile `GpuView`, for a
+  `GpuTouches`. `Window_set_mouse_touch` turns the left mouse button into a finger; mouse
+  events the system makes from a finger have `WindowEvent.from_touch` set.
+- `docs/input.md`: events, the gamepad layout against Xbox, PlayStation and Switch pads,
+  the deadzone, rumble, touch, and the names of the Rust `gilrs` crate.
+- `tools/sdl3_prebuilt.sh` and the `SDL3 prebuilt` workflow: SDL 3.4.18 archives for macOS
+  (arm64, x86-64), Linux (x86-64, arm64) and Windows x86-64, with SDL's zlib license,
+  published as a release of this repository for a `[native.SDL3]` table.
+- `tests/window_input.esk`: pads through SDL's virtual joystick and fingers through pushed
+  events, under SDL's dummy video driver (no display, no device).
+- A WebGL2 backend for browsers without WebGPU (Firefox, Safari before 26, WebKitGTK):
+  `gpu_open` asks the browser's WebGPU first and falls back to it when `navigator.gpu` is
+  missing or gives no adapter, and `Gpu.webgl2` says so. `<gpu/render>`, `<gpu/model>`,
+  `<gpu/ibl>` and `<gpu/yuv>` run on it unchanged, WGSL included, with the same pixels as the
+  browser's WebGPU on the same GPU; compute, storage buffers and the other limits are listed
+  in `docs/web.md`. It is the WebGPU JavaScript API over WebGL2 (`web/webgl2.js`, embedded in
+  `src/webgl2.esk` by `tools/gen_webgl2.py`) with `web/gpu-naga.wasm` translating WGSL to
+  GLSL ES 3.00 (built from `tools/naga-wasm` by `tools/naga_wasm.sh`). `Module.gpuBackend`
+  picks a backend and `Module.gpuNagaUrl` places the translator.
+- `tools/web_run.mjs`: runs a program built for the web in headless Chrome, Chromium or Brave,
+  with WebGPU on, off or without an adapter, and returns its exit code; `--shot` saves the
+  canvas.
+- `tools/render_scenes.esk` and `tools/compare_scenes.py`: the same scenes rendered on two
+  backends, compared pixel by pixel.
+- `THIRD_PARTY_NOTICES.md`: the licenses of naga and the crates built into
+  `web/gpu-naga.wasm`, and of SDL3 in the prebuilt archives.
+
+### Changed
+
+- `window_open` asks for a Metal view only under SDL's Cocoa driver, so the window also opens
+  under the offscreen and dummy drivers on macOS.
+- CI builds SDL3 with `tools/sdl3_prebuilt.sh` on Linux and installs it on Windows for the
+  window test.
+- `GpuModel` keeps joints in a uniform array (256 per skin) and morph targets in an
+  RGBA32Float texture on WebGL2; on WebGPU it still uses storage buffers.
+- The IBL prefilter shader computes its mip count and bit reversal itself (no
+  `textureNumLevels` or `reverseBits`, which GLSL ES 3.00 lacks); the results are the same.
+- `tests/render_api.esk` uses `Gpu_joints_uniform` and `tests/render_targets.esk` skips its
+  two-sampler and sRGB-view cases when the device is WebGL2.
+
+### Fixed
+
+- Mouse positions and motion in `WindowEvent` are pixels of the drawable, as documented, on a
+  high-density display too (they were SDL's points).
+
 ## [0.5.0] - 2026-11-07
 
 ### Added
