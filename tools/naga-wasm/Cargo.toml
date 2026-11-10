@@ -1,0 +1,21 @@
+[package]
+name = "gpu-naga"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+naga = { version = "30.0.1", default-features = false, features = ["wgsl-in", "glsl-out"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
