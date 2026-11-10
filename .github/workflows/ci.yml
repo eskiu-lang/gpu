@@ -21,16 +21,22 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers libvulkan1 unzip
           curl -fsSL -o wgpu.zip https://github.com/gfx-rs/wgpu-native/releases/download/$WGPU_VERSION/wgpu-linux-x86_64-release.zip
           unzip -q wgpu.zip -d $HOME/wgpu
+      - name: SDL3 from source, with tools/sdl3_prebuilt.sh (tests/window_input.esk)
+        run: |
+          sudo apt-get install -y cmake ninja-build libx11-dev libxext-dev libudev-dev
+          tools/sdl3_prebuilt.sh linux-x86_64 $HOME/sdl3
+          tar -xzf $HOME/sdl3/sdl3-*-linux-x86_64.tar.gz -C $HOME/sdl3
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $HOME/wgpu/include/webgpu $HOME/wgpu/lib
       - name: Tests
-        run: eskiuc test
+        run: LD_LIBRARY_PATH=$HOME/sdl3/lib eskiuc test -L$HOME/sdl3/lib
       - name: API reference is current
         run: python3 -I tools/gen_api.py --check
 
   web:
     # Emscripten with the emdawnwebgpu port: the layout check, the examples built for a
-    # browser, and the compute example under node (no WebGPU there, so it reports that).
+    # browser, the compute example under node (no WebGPU there, so it reports that), and
+    # the render tests on the WebGL2 backend in headless Chrome.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -65,6 +71,18 @@ jobs:
             echo "$run: $out"
             test "$out" = "error: no WebGPU in this browser"
           done
+      - name: WebGL2 backend in Chrome
+        # WebGPU off and navigator.gpu removed, as in Firefox; SwiftShader renders WebGL2 on
+        # the CPU. The tests compare against the same golden images as on WebGPU.
+        run: |
+          source $HOME/emsdk/emsdk_env.sh
+          export CHROME=$(command -v google-chrome)
+          for t in render_offscreen render_api render_stencil render_targets texture_options model_render morph; do
+            eskiuc tests/$t.esk --target wasm32-unknown-emscripten -o build/web/$t.js \
+              --link-arg=--use-port=emdawnwebgpu --link-arg=-sASYNCIFY --link-arg=-sEXIT_RUNTIME=1 \
+              --link-arg=-sALLOW_MEMORY_GROWTH=1 --link-arg=--preload-file=tests/data@tests/data
+            node tools/web_run.mjs build/web/$t.js --no-webgpu --swiftshader
+          done
 
   macos:
     runs-on: macos-15
@@ -76,7 +94,7 @@ jobs:
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $(brew --prefix wgpu-native)/include $(brew --prefix)/lib
       - name: Tests
-        run: eskiuc test
+        run: eskiuc test -L$(brew --prefix)/lib
       - name: Examples build
         run: |
           mkdir -p build
@@ -93,7 +111,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          install: mingw-w64-x86_64-gcc unzip diffutils
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-sdl3 unzip diffutils
       - name: Install Eskiu and wgpu-native
         run: |
           curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
