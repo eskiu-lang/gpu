@@ -77,7 +77,8 @@ All notable changes to this package are documented in this file. The format is b
   as R8, uploaded with the frame's row stride; a plane is repacked on the CPU only when no
   texture format reads it in place), `GpuYuv_draw` converts to RGB in a shader (BT.601 or
   BT.709, full or limited range; an sRGB target stores the same bytes) into a rectangle of a
-  pass, stretched, contained or covering it, turned upright by the frame's rotation and
+  pass (one with a depth attachment too, as a background under a 3D scene: it passes every
+  depth test and writes no depth), stretched, contained or covering it, turned upright by the frame's rotation and
   optionally mirrored, and `GpuYuv_to_rgba` renders it into an RGBA8 texture. `GpuYuvImage`
   has the layout of ui-camera's `CameraFrame` and video's `VideoFrame` (NV12, NV21, I420,
   three planes with any pixel stride, RGBA). Guide: `docs/yuv.md`.

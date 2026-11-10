@@ -91,7 +91,9 @@ encoding stores the same bytes.
 `Gpu_yuv(gpu, target_format)` makes a `GpuYuv` for targets of one format (a surface's, or
 `RGBA8Unorm` when 0). `GpuYuv_draw(pass, &d)` draws the last uploaded frame into a pass on such
 a target, in the rectangle `x`, `y`, `width`, `height` of `GpuYuvDraw` (pixels from the top
-left, inside the target):
+left, inside the target). The pass may have a depth attachment: the picture then passes every
+depth test and writes no depth, so a camera background drawn first stays under the 3D scene
+drawn after it in the same pass.
 
 | `fit` | What it does |
 |---|---|
