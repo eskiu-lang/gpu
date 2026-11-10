@@ -117,6 +117,8 @@ struct GpuModel {
     List<int> prim_start;
     List<_GpuDraw> draws;
     *Mat4 world;
+    *bool shown;
+    int material_version;
     Mat4 transform;
     bool encode_srgb;
     *GpuIbl ibl;
@@ -158,7 +160,8 @@ string _gpu_model_shader =
     "struct Frame { view_proj: mat4x4<f32>, eye: vec4<f32>, light_dir: vec4<f32>, light_color: vec4<f32>, ambient: vec4<f32>,\n"
     "    light_vp: mat4x4<f32>, shadow: vec4<f32>, ibl: vec4<f32> };\n"
     "struct Draw { model: mat4x4<f32>, normal: mat4x4<f32>, flags: vec4<f32> };\n"
-    "struct Material { base: vec4<f32>, emissive: vec4<f32>, params: vec4<f32>, tc: vec4<f32>, misc: vec4<f32> };\n"
+    "struct Material { base: vec4<f32>, emissive: vec4<f32>, params: vec4<f32>, tc: vec4<f32>, misc: vec4<f32>,\n"
+    "    tf: array<vec4<f32>, 10> };\n"
     "@group(0) @binding(0) var<uniform> frame: Frame;\n"
     "@group(0) @binding(1) var<uniform> draw: Draw;\n"
     "@group(0) @binding(2) var<uniform> mat: Material;\n"
@@ -234,6 +237,12 @@ string _gpu_model_shader =
     "}\n"
     "const PI = 3.14159265;\n"
     "fn pick(v: V, which: f32) -> vec2<f32> { return select(v.uv0, v.uv1, which > 0.5); }\n"
+    "fn tuv(v: V, which: f32, k: u32) -> vec2<f32> {\n"
+    "    let uv = pick(v, which);\n"
+    "    let m = mat.tf[k * 2u];\n"
+    "    let o = mat.tf[k * 2u + 1u];\n"
+    "    return vec2(m.x * uv.x + m.y * uv.y + o.x, m.z * uv.x + m.w * uv.y + o.y);\n"
+    "}\n"
     "fn to_srgb(c: vec3<f32>) -> vec3<f32> {\n"
     "    let lo = c * 12.92;\n"
     "    let hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;\n"
@@ -255,12 +264,12 @@ string _gpu_model_shader =
     "    return lit / 9.0;\n"
     "}\n"
     "@fragment fn fs(v: V, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {\n"
-    "    let base_s = textureSample(base_tex, base_samp, pick(v, mat.tc.x));\n"
-    "    let mr_s = textureSample(mr_tex, mr_samp, pick(v, mat.tc.y));\n"
-    "    let n_s = textureSample(normal_tex, normal_samp, pick(v, mat.tc.z)).xyz;\n"
-    "    let occ_s = textureSample(occ_tex, occ_samp, pick(v, mat.tc.w)).r;\n"
-    "    let em_s = textureSample(em_tex, em_samp, pick(v, mat.misc.z)).rgb;\n"
-    "    let uv = pick(v, mat.tc.z);\n"
+    "    let base_s = textureSample(base_tex, base_samp, tuv(v, mat.tc.x, 0u));\n"
+    "    let mr_s = textureSample(mr_tex, mr_samp, tuv(v, mat.tc.y, 1u));\n"
+    "    let n_s = textureSample(normal_tex, normal_samp, tuv(v, mat.tc.z, 2u)).xyz;\n"
+    "    let occ_s = textureSample(occ_tex, occ_samp, tuv(v, mat.tc.w, 3u)).r;\n"
+    "    let em_s = textureSample(em_tex, em_samp, tuv(v, mat.misc.z, 4u)).rgb;\n"
+    "    let uv = tuv(v, mat.tc.z, 2u);\n"
     "    let dp1 = dpdx(v.world);\n"
     "    let dp2 = dpdy(v.world);\n"
     "    let duv1 = dpdx(uv);\n"
@@ -484,6 +493,64 @@ Result<int, string> _gpu_model_pipelines(*GpuModel self, WGPUTextureFormat forma
     return Ok<int, string>(0);
 }
 
+// A material's uniform (60 floats): its factors, each texture's UV set, alpha mode and
+// unlit flag, then each texture's KHR_texture_transform as two vec4s, (a, b, c, d) and
+// (tx, ty): u' = a u + b v + tx, v' = c u + d v + ty (T * R * S, as virocore applies it).
+void _gpu_model_material_floats(*GltfMaterial gm, *float u) {
+    GltfTextureRef[5] refs = {gm.base_color_texture, gm.metallic_roughness_texture, gm.normal_texture,
+        gm.occlusion_texture, gm.emissive_texture};
+    float normal_scale = refs[2].texture >= 0 ? refs[2].scale : 0.0;
+    float occlusion = refs[3].texture >= 0 ? refs[3].scale : 0.0;
+    float[20] head = {gm.base_color.x, gm.base_color.y, gm.base_color.z, gm.base_color.w,
+        gm.emissive.x, gm.emissive.y, gm.emissive.z, gm.alpha_cutoff,
+        gm.metallic, gm.roughness, normal_scale, occlusion,
+        (float)refs[0].texcoord, (float)refs[1].texcoord, (float)refs[2].texcoord, (float)refs[3].texcoord,
+        (float)gm.alpha_mode, gm.unlit ? 1.0 : 0.0, (float)refs[4].texcoord, 0.0};
+    for (k in 0..20) u[k] = head[k];
+    for (k in 0..5) {
+        *float f = u + 20 + k * 8;
+        GltfTextureRef r = refs[k];
+        float c = 1.0;
+        float sn = 0.0;
+        float sx = 1.0;
+        float sy = 1.0;
+        float ox = 0.0;
+        float oy = 0.0;
+        if (r.has_transform) {
+            c = (float)cos((double)r.rotation);
+            sn = (float)sin((double)r.rotation);
+            sx = r.tscale.x;
+            sy = r.tscale.y;
+            ox = r.offset.x;
+            oy = r.offset.y;
+        }
+        f[0] = c * sx;
+        f[1] = sn * sy;
+        f[2] = -sn * sx;
+        f[3] = c * sy;
+        f[4] = ox;
+        f[5] = oy;
+        f[6] = 0.0;
+        f[7] = 0.0;
+    }
+}
+
+// Which nodes draw: a node hidden by KHR_node_visibility hides its descendants too.
+void _gpu_model_visibility(*GpuModel self) {
+    *Gltf g = self.data;
+    for (i in 0..g.nodes.size) {
+        bool on = true;
+        int n = i;
+        int guard = 0;
+        while (n >= 0 && n < g.nodes.size && guard < 4096) {
+            if (g.nodes.data[n].hidden) { on = false; break; }
+            n = g.nodes.data[n].parent;
+            guard++;
+        }
+        self.shown[i] = on;
+    }
+}
+
 // Uploads data's meshes, materials and textures and builds the pipelines for color targets
 // of format (an sRGB format or not: the shader encodes sRGB itself when it is not). The
 // pipelines test against a Depth24Plus depth texture (Gpu_depth). Point and line
@@ -549,13 +616,8 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
                 if (tx.sampler >= 0) mat.samp[k] = tx.sampler + 1;
             }
         }
-        float normal_scale = refs[2].texture >= 0 ? refs[2].scale : 0.0;
-        float occlusion = refs[3].texture >= 0 ? refs[3].scale : 0.0;
-        float[20] u = {gm.base_color.x, gm.base_color.y, gm.base_color.z, gm.base_color.w,
-            gm.emissive.x, gm.emissive.y, gm.emissive.z, gm.alpha_cutoff,
-            gm.metallic, gm.roughness, normal_scale, occlusion,
-            (float)refs[0].texcoord, (float)refs[1].texcoord, (float)refs[2].texcoord, (float)refs[3].texcoord,
-            (float)gm.alpha_mode, gm.unlit ? 1.0 : 0.0, (float)refs[4].texcoord, 0.0};
+        float[60] u;
+        _gpu_model_material_floats(&gm, &u[0]);
         Result<GpuBuffer, string> ub = Gpu_uniform(self, &u, sizeof(u));
         if (!ub.ok) {
             GpuModel_release(&m);
@@ -651,6 +713,8 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
         }
     }
     m.world = alloc<Mat4>(data.nodes.size + 1);
+    m.shown = alloc<bool>(data.nodes.size + 1);
+    m.material_version = data.material_version;
     GpuModel_update(&m, ident);
     return Ok<GpuModel, string>(m);
 }
@@ -661,6 +725,17 @@ Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat form
 void GpuModel_update(*GpuModel self, Mat4 transform) {
     self.transform = transform;
     Gltf_world(self.data, self.world);
+    _gpu_model_visibility(self);
+    if (self.material_version != self.data.material_version) {
+        // Animation pointer channels changed materials: write their uniforms again.
+        self.material_version = self.data.material_version;
+        for (i in 0..self.data.materials.size) {
+            if (i >= self.materials.size) break;
+            float[60] mu;
+            _gpu_model_material_floats(&self.data.materials.data[i], &mu[0]);
+            self.materials.data[i].uniforms.write(0, &mu, sizeof(mu));
+        }
+    }
     *Mat4 jm = null;
     int jcap = 0;
     for (i in 0..self.draws.size) {
@@ -817,7 +892,7 @@ void _gpu_model_shadow_draws(*GpuModel self, *GpuPass pass) {
     GpuPipeline* pipe = &self.shadow_pipeline;
     for (i in 0..self.draws.size) {
         _GpuDraw* d = &self.draws.data[i];
-        if (self.materials.data[d.material].blend) continue;
+        if (self.materials.data[d.material].blend || !self.shown[d.node]) continue;
         _GpuPrim* pr = &self.prims.data[d.prim];
         pipe.bind(0, &self.frame);
         pipe.bind(1, &d.uniforms);
@@ -909,6 +984,7 @@ void GpuModel_draw(*GpuModel self, *GpuPass pass, *GpuCamera camera) {
     defer List_free(&blended);
     for (i in 0..self.draws.size) {
         _GpuDraw* d = &self.draws.data[i];
+        if (!self.shown[d.node]) continue;
         if (self.materials.data[d.material].blend) {
             Vec3 c = (self.transform * self.world[d.node]).point(Vec3{0.0, 0.0, 0.0});
             d.depth = (camera.view.point(c)).z;
@@ -992,6 +1068,8 @@ void GpuModel_release(*GpuModel self) {
     List_free(&self.draws);
     if (self.world != null) free(self.world);
     self.world = null;
+    if (self.shown != null) free(self.shown);
+    self.shown = null;
 }
 
 // A skin's joint matrices in a GPU buffer, for skinning in your own shader:
