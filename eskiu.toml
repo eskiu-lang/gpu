@@ -5,6 +5,11 @@ main = "examples/compute.esk"
 
 [deps]
 
+# Files a web build needs next to the page (Eskiu 0.15.1 or newer): the WebGL2 backend's
+# WGSL to GLSL translator, copied beside the output of a wasm32-unknown-emscripten build.
+[web]
+assets = ["web/gpu-naga.wasm"]
+
 # wgpu-native's own release archives, fetched by eskiuc build / run / test / fetch.
 [native.wgpu_native]
 macos-arm64 = { url = "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip", sha256 = "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e" }

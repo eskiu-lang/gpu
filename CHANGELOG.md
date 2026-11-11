@@ -7,6 +7,9 @@ All notable changes to this package are documented in this file. The format is b
 
 ### Added
 
+- `eskiu.toml` lists `web/gpu-naga.wasm` in `[web] assets`, so a web build with Eskiu 0.15.1
+  or newer copies it beside the page. The package now needs Eskiu 0.15.1: older compilers
+  reject the `[web]` table.
 - Gamepads in `<gpu/window>`: `window_open` starts SDL's gamepad system and opens each pad
   as it is connected. `WINDOW_PAD_ADDED`, `WINDOW_PAD_REMOVED`, `WINDOW_PAD_DOWN`,
   `WINDOW_PAD_UP` and `WINDOW_PAD_AXIS` events (`WindowEvent.pad`, `axis`, `value`); SDL's

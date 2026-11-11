@@ -106,7 +106,7 @@ $ eskiuc run twice.esk
 
 ## Install
 
-In an Eskiu package (Eskiu 0.14 or newer, for the iOS and Android archives):
+In an Eskiu package (Eskiu 0.15.1 or newer: older compilers reject the `[web]` table):
 
 ```bash
 eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.6.0

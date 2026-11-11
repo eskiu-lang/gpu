@@ -130,7 +130,9 @@ backend instead and `Gpu.webgl2` is true. The same `<gpu/render>` calls, WGSL sh
 The backend needs one more file next to the page: `web/gpu-naga.wasm` from this package
 (about 820 KB), which turns WGSL into GLSL ES 3.00. It is fetched only when the backend is
 used, from `gpu-naga.wasm` beside the page unless the page sets another place before the
-program's script:
+program's script. With Eskiu 0.15.1 or newer, a web build of an app that depends on gpu
+copies it beside the output (`build/app.html` gets `build/gpu-naga.wasm`), from the
+package's `[web] assets`; with an older compiler, copy it by hand. To serve it elsewhere:
 
 ```html
 <script>
