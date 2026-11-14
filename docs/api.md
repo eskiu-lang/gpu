@@ -3089,7 +3089,29 @@ layers must be the Metal texture's; layers > 1 is a 2D array (one layer per eye)
 RenderAttachment. It calls wgpuDeviceCreateTextureFromMetal, which upstream wgpu-native
 lacks: a program that uses it links wgpu-native from eskiu-lang/wgpu-native's eskiu branch
 (its eskiu/build_apple.sh builds visionOS, iOS and macOS). eskiu-scene's
-examples/visionos draws a scene into a visionOS immersive space this way.
+examples/xr/visionos draws a scene into a visionOS immersive space this way.
+
+### Gpu_vulkan_handles
+
+```eskiu
+Result<WGPUVulkanHandles, string> Gpu_vulkan_handles(*Gpu self)
+```
+
+Android, Linux and Windows. The device's Vulkan instance, physical device, device, queue
+family and queue index, for an OpenXR session to bind to (XrGraphicsBindingVulkanKHR); an
+error when the device is not on the Vulkan backend. Like Gpu_texture_from_metal it needs
+wgpu-native from eskiu-lang/wgpu-native's eskiu branch (eskiu/build_android.sh).
+
+### Gpu_texture_from_vulkan
+
+```eskiu
+Result<GpuTexture, string> Gpu_texture_from_vulkan(*Gpu self, uint64 vk_image, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage)
+```
+
+Android, Linux and Windows. A GpuTexture over a VkImage made outside wgpu, such as an OpenXR
+swapchain image; the image stays the caller's. width, height, format and layers must be the
+image's; usage 0 is RenderAttachment. eskiu-scene's examples/xr/quest draws into Quest's
+swapchains this way.
 
 ### Gpu_depth_texture
 
