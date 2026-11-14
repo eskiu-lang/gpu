@@ -3076,6 +3076,21 @@ Result<GpuTexture, string> Gpu_texture_with(*Gpu self, *GpuTextureDesc d)
 A texture with layers, a cube, mip levels or extra view formats (see
 GpuTextureDesc). Its view covers all of it: 2D, 2D array or cube.
 
+### Gpu_texture_from_metal
+
+```eskiu
+Result<GpuTexture, string> Gpu_texture_from_metal(*Gpu self, *void metal_texture, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage)
+```
+
+Apple platforms only. A GpuTexture over a Metal texture made outside wgpu (an
+id<MTLTexture>, borrowed: wgpu retains it): the drawables a system hands over each frame,
+such as CompositorServices' color and depth textures on visionOS. width, height, format and
+layers must be the Metal texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is
+RenderAttachment. It calls wgpuDeviceCreateTextureFromMetal, which upstream wgpu-native
+lacks: a program that uses it links wgpu-native from eskiu-lang/wgpu-native's eskiu branch
+(its eskiu/build_apple.sh builds visionOS, iOS and macOS). eskiu-scene's
+examples/visionos draws a scene into a visionOS immersive space this way.
+
 ### Gpu_depth_texture
 
 ```eskiu

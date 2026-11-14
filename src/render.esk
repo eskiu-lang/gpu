@@ -470,6 +470,40 @@ Result<GpuTexture, string> Gpu_texture_with(*Gpu self, *GpuTextureDesc d) {
     return Ok<GpuTexture, string>(tex);
 }
 
+#ifdef __APPLE__
+// wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu) adds this call; the
+// upstream libraries lack it, so a program that uses Gpu_texture_from_metal links that build.
+extern WGPUTexture wgpuDeviceCreateTextureFromMetal(WGPUDevice device, *void metal_texture, *WGPUTextureDescriptor descriptor);
+
+// A GpuTexture over a Metal texture made outside wgpu (an id<MTLTexture>, borrowed: wgpu
+// retains it): the drawables a system hands over each frame, such as CompositorServices'
+// color and depth textures on visionOS. width, height, format and layers must be the Metal
+// texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is RenderAttachment.
+Result<GpuTexture, string> Gpu_texture_from_metal(*Gpu self, *void metal_texture, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage) {
+    if (metal_texture == null) return Err<GpuTexture, string>(_gpu_fail("texture_from_metal: no texture", null));
+    uint32 n = layers != 0 ? layers : (uint32)1;
+    WGPUTextureUsage u = usage != 0 ? usage : WGPUTextureUsage_RenderAttachment;
+    WGPUTextureViewDimension dim = n > 1 ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: u, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{width, height, n}, format: format, mipLevelCount: 1, sampleCount: 1};
+    WGPUTexture t = wgpuDeviceCreateTextureFromMetal(self.device, metal_texture, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: 1,
+            arrayLayerCount: n, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture_from_metal");
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, 1, 1, n, dim, u};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture_from_metal", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+#endif
+
 // A depth texture that shaders can sample (texture_depth_2d, or
 // texture_depth_2d_array when layers > 1) and compare against
 // (GpuSamplerOptions.compare): a shadow map. format is Depth32Float when 0.
