@@ -151,7 +151,7 @@ module are in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 ### How it works
 
 The backend is the part of the WebGPU JavaScript API that `<gpu/render>` uses, written over
-WebGL2 (`web/webgl2.js`; `gpu_open` evaluates it in the page, so no build flag adds it):
+WebGL2 (`web/webgl2/*.js`; `gpu_open` evaluates it in the page, so no build flag adds it):
 emdawnwebgpu calls it as it would call the browser's WebGPU. At pipeline creation each entry
 point becomes GLSL, naga reports which uniform block and sampler stands for each
 `@group`/`@binding`, and at each draw the bind groups set on the pass fill those uniform

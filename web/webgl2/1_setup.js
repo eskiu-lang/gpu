@@ -1,4 +1,4 @@
-// webgl2.js: the subset of the WebGPU JavaScript API that <gpu/render> uses, over WebGL2.
+// webgl2/1_setup.js: the subset of the WebGPU JavaScript API that <gpu/render> uses, over WebGL2.
 //
 // gpu_open installs it in a browser (src/webgl2.esk embeds this file) and asks the browser's
 // WebGPU first: when navigator.gpu is missing or gives no adapter, requestAdapter answers
