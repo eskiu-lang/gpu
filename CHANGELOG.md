@@ -3,6 +3,20 @@
 All notable changes to this package are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `<gpu/vrx>`: ViroReact's `.vrx` models (FBX files converted by Viro's ViroFBX tool) into a
+  `Gltf`, so `<gpu/model>` and `<scene>` draw and animate them: `vrx_load`, `vrx_parse`, and
+  `model_load` for a `.vrx` name. Nodes, interleaved geometry with an index list per
+  material, Viro's lighting models as metallic-roughness materials (separate roughness and
+  metalness maps joined into one texture), skins with Viro's bind matrices, skeletal and
+  keyframe animations merged by name. `docs/models.md` describes the mapping.
+- `tests/vrx.esk` with `tests/data/quad.vrx` from `tools/gen_test_vrx.py`, and
+  `tests/data/object_star_anim.vrx` from ViroReact's sample app (MIT, Viro Media and the
+  Viro Community).
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

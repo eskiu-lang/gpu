@@ -24,7 +24,7 @@ Guides and reference for gpu. The [README](../README.md) has the overview.
 | WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/yuv>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | yes (the browser's WebGPU; rendering also on WebGL2) |
 | `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | yes (the page's canvas) |
 | `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
-| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
+| `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/vrx>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
 
 On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
 `gpu_ui_surface(&gpu)`) or directly into a `CAMetalLayer` (`gpu.surface_metal(layer)`) or
@@ -52,6 +52,7 @@ fingers at once) is in [docs/mobile.md](mobile.md).
 | `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2` |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
+| `<gpu/vrx>` | `vrx_load`, `vrx_parse`: ViroReact `.vrx` models (FBX converted by ViroFBX) into a `Gltf` |
 | `<gpu/ibl>` | `Gpu_ibl`, `GpuIbl`: environment, irradiance and prefiltered specular cubes and the BRDF table from an HDR image; `Gpu_brdf_lut` |
 | `<gpu/model>` | `model_load`, `Gpu_model`, `GpuModel` (`update`, `draw`, `camera`), `GpuCamera`, `GpuLight`, `GpuJoints` (joint matrices for your own skinning shader) |
 | `<gpu/math>` | `Vec2`, `Vec3`, `Vec4` and `Quat` with arithmetic operators, `Mat4` (perspective, ortho, look at, translate, rotate, scale, `mat4_trs`), slerp |

@@ -33,7 +33,8 @@ WGSL.
   stencil, multisampling, cube and array targets, and shadow maps; in the browser too,
   through emdawnwebgpu, with a WebGL2 backend for browsers without WebGPU.
 - **3D models.** `<gpu/gltf>` loads glTF 2.0 (`.gltf` and `.glb`), `<gpu/obj>` loads Wavefront
-  OBJ with its MTL materials and textures, and `<gpu/model>` draws either with physically
+  OBJ with its MTL materials and textures, `<gpu/vrx>` loads ViroReact's `.vrx` models, and
+  `<gpu/model>` draws any of them with physically
   based shading, normal maps, alpha modes, skinning, morph targets, animation, image-based
   lighting and shadows.
 - **Machine learning.** `<gpu/nn>` runs transformer inference (Llama 2 7B at 45 tokens per
@@ -94,7 +95,7 @@ $ eskiuc run twice.esk
 ## Documentation
 
 - [Rendering](docs/rendering.md): windows, textures, passes, stencil, multisampling, render targets, cube maps, mipmaps, shadow maps, compressed textures
-- [Models](docs/models.md): glTF and OBJ, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
+- [Models](docs/models.md): glTF, OBJ and `.vrx`, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
 - [Images](docs/image.md): PNG, JPEG, HDR, KTX2, EXIF orientation and limits
 - [Camera and video frames](docs/yuv.md): `<gpu/yuv>`, YUV planes to RGB on the GPU
 - [Web](docs/web.md): the browser through emdawnwebgpu, and WebGL2 where WebGPU is missing
