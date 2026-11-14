@@ -81,5 +81,6 @@ name over its whole hierarchy, and the rest pose is the first frame of the first
 animation. A bone that names itself (or a cycle) as its parent is a root.
 
 Morph targets are in [morph.md](morph.md), image-based lighting in [ibl.md](ibl.md) and
-shadows in [shadows.md](shadows.md). Not supported yet: Draco and meshopt compression, and
-KTX2 textures.
+shadows in [shadows.md](shadows.md). An image that is a KTX file (a `.vrx` model's `.ktx`
+textures) goes up as it is, in its own format and levels. Not supported yet: Draco and
+meshopt compression, and glTF's `KHR_texture_basisu`.

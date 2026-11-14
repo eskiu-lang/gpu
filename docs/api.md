@@ -1325,8 +1325,11 @@ zstd, zlib) and Basis UASTC data (vkFormat 0) are rejected: transcoding
 them is out of scope. 3D textures are rejected too. The parser is pure
 Eskiu and needs no GPU; Gpu_ktx2 in `<gpu/render>` uploads the result.
 
+KTX 1 files (ViroReact's and older Android textures: ETC1, ETC2, ASTC, BC) are read
+into the same Ktx2 by ktx1_decode; ktx_load and ktx_decode take either version.
+
 ```eskiu
-Ktx2 k = ktx2_load("albedo.ktx2")?;
+Ktx2 k = ktx2_load("albedo.ktx2")?;   // or ktx_load for a .ktx or a .ktx2
 defer k.free();
 GpuTexture tex = gpu.ktx2(&k)?;
 ```
@@ -1416,6 +1419,43 @@ void Ktx2_free(*Ktx2 self)
 ```
 
 Frees the image data and the level index; a second call does nothing.
+
+### ktx1_decode
+
+```eskiu
+Result<Ktx2, string> ktx1_decode(*uint8 data, uint64 len)
+```
+
+Parses a KTX 1 file held in memory into a Ktx2 (the same fields, the levels packed one
+after another), so Gpu_ktx2 uploads it: ViroReact's and older Android textures (ETC1,
+ETC2, ASTC). 2D textures, arrays and cube maps with their mip levels; 3D textures and the
+formats WebGPU has no equivalent for (RGB8, luminance) are rejected, and so are
+big-endian files of multi-byte texels.
+
+### ktx_is_ktx
+
+```eskiu
+bool ktx_is_ktx(*uint8 data, uint64 len)
+```
+
+Whether the bytes start like a KTX file of either version.
+
+### ktx_decode
+
+```eskiu
+Result<Ktx2, string> ktx_decode(*uint8 data, uint64 len)
+```
+
+Parses a KTX 1 or KTX 2 file held in memory (ktx1_decode or ktx2_decode, by its
+identifier).
+
+### ktx_load
+
+```eskiu
+Result<Ktx2, string> ktx_load(string path)
+```
+
+Reads a KTX 1 or KTX 2 file and parses it.
 
 
 ## `<gpu/math>`
@@ -4385,8 +4425,8 @@ and metalness (separate textures in the file, joined into glTF's metallic-roughn
 texture: roughness in green, metalness in blue). The diffuse color and texture are the
 base color, transparency below 1 blends, the normal and ambient occlusion maps carry over,
 and the specular, reflective and emission maps are dropped, as Viro's loader drops them.
-Textures are read relative to the file's directory; a missing one leaves the material
-untextured.
+Textures (PNG, JPEG, or KTX as Viro's Android projects ship them) are read relative to
+the file's directory; a missing one leaves the material untextured.
 
 A skinned geometry gets the skeleton as joint nodes under its own node, with the inverse
 bind matrices Viro computes (each bone's bind transform times the geometry's), so the

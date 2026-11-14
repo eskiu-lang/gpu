@@ -41,7 +41,7 @@ WGSL.
   second on an M4 Pro, from GGUF, safetensors or llama2.c files) and `<gpu/train>` trains
   networks with automatic differentiation and Adam.
 - **Images.** `<gpu/image>` decodes PNG, JPEG (baseline and progressive) and Radiance `.hdr`
-  in pure Eskiu, and `<gpu/ktx2>` reads KTX2 files; textures can be sRGB, mipmapped (on the
+  in pure Eskiu, and `<gpu/ktx2>` reads KTX2 and KTX 1 files; textures can be sRGB, mipmapped (on the
   GPU too), layered, cube maps and BC, ETC2 or ASTC compressed.
 - **Windows, mobile views and input.** `<gpu/window>` opens a desktop window over SDL3 and
   gives its surface and its keyboard, mouse, gamepad (with rumble) and touch input;
@@ -96,7 +96,7 @@ $ eskiuc run twice.esk
 
 - [Rendering](docs/rendering.md): windows, textures, passes, stencil, multisampling, render targets, cube maps, mipmaps, shadow maps, compressed textures
 - [Models](docs/models.md): glTF, OBJ and `.vrx`, materials, skinning and animation; [morph targets](docs/morph.md), [image-based lighting](docs/ibl.md), [shadows](docs/shadows.md)
-- [Images](docs/image.md): PNG, JPEG, HDR, KTX2, EXIF orientation and limits
+- [Images](docs/image.md): PNG, JPEG, HDR, KTX2 and KTX 1, EXIF orientation and limits
 - [Camera and video frames](docs/yuv.md): `<gpu/yuv>`, YUV planes to RGB on the GPU
 - [Web](docs/web.md): the browser through emdawnwebgpu, and WebGL2 where WebGPU is missing
 - [Window input](docs/input.md): keyboard, mouse, gamepads and touch on the desktop

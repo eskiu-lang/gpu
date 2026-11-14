@@ -13,6 +13,10 @@ All notable changes to this package are documented in this file. The format is b
   material, Viro's lighting models as metallic-roughness materials (separate roughness and
   metalness maps joined into one texture), skins with Viro's bind matrices, skeletal and
   keyframe animations merged by name. `docs/models.md` describes the mapping.
+- KTX 1 files in `<gpu/ktx2>`: `ktx1_decode` reads one into a `Ktx2` (OpenGL internal
+  formats mapped to Vulkan ones: RGBA8, R8, RG8, float formats, ETC1 as ETC2 RGB8, ETC2/EAC,
+  BC1 to BC5, BC7, ASTC), so `Gpu_ktx2` uploads it; `ktx_load` and `ktx_decode` take either
+  version and `ktx_is_ktx` tells a KTX file. `<gpu/model>` uploads a KTX image as it is.
 - `tests/vrx.esk` with `tests/data/quad.vrx` from `tools/gen_test_vrx.py`, and
   `tests/data/object_star_anim.vrx` from ViroReact's sample app (MIT, Viro Media and the
   Viro Community).

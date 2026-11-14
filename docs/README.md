@@ -49,7 +49,7 @@ fingers at once) is in [docs/mobile.md](mobile.md).
 | `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8; `hdr_load`, `hdr_decode`: Radiance `.hdr` to floats (`HdrBitmap`) |
 | `<gpu/yuv>` | `Gpu_yuv`, `GpuYuv` (`upload`, `draw`, `to_rgba`): camera and video frames (NV12, NV21, I420, three-plane YUV, RGBA) to RGB in a shader, BT.601 and BT.709, full and limited range, turned upright |
-| `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2` |
+| `<gpu/ktx2>` | `ktx2_load`, `ktx2_decode`: KTX2 files (compressed and uncompressed, arrays, cube maps, mip levels; no Basis supercompression), uploaded by `Gpu_ktx2`; `ktx1_decode`, `ktx_load`, `ktx_decode` for KTX 1 too |
 | `<gpu/gltf>` | `gltf_load`, `Gltf` (meshes, materials, textures, nodes, skins, animations), `animate`, `world`, `bounds` |
 | `<gpu/obj>` | `obj_load`, `obj_parse`: OBJ and MTL into a `Gltf` |
 | `<gpu/vrx>` | `vrx_load`, `vrx_parse`: ViroReact `.vrx` models (FBX converted by ViroFBX) into a `Gltf` |

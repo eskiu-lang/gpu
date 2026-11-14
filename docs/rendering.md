@@ -294,8 +294,14 @@ RG11B10 and RGB9E5). `gpu.ktx2(&file)` uploads it; a file that asks for its mip 
 made gets them from `generate_mips`. Basis Universal data (ETC1S or UASTC, which need
 transcoding) and zstd or zlib supercompression are not supported: such files return an `Err`.
 
+KTX 1 files, which ViroReact projects and older Android apps ship (ETC1, ETC2, ASTC, BC),
+read into the same `Ktx2` with `ktx1_decode`; `ktx_load` and `ktx_decode` take either
+version by its identifier. ETC1 is read as ETC2 RGB8, which decodes it; a cube map's faces
+lose their 4-byte padding; formats WebGPU has no equivalent for (RGB8, luminance) and 3D
+textures are an `Err`.
+
 ```eskiu
-Ktx2 k = ktx2_load("ground.ktx2")?;
+Ktx2 k = ktx2_load("ground.ktx2")?;   // ktx_load("ground.ktx") for a KTX 1 file
 defer k.free();
 GpuTexture ground = gpu.ktx2(&k)?;
 ```
