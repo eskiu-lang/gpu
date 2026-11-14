@@ -78,7 +78,7 @@ adapter it ran on. The tests and the layout check run with:
 eskiuc test -L/opt/homebrew/lib                              # SDL3 for tests/window_input.esk
 tools/gen.py $(brew --prefix wgpu-native)/include            # regenerates src/raw.esk
 python3 -I tools/gen_test_models.py                          # regenerates the glTF test models
-python3 -I tools/gen_webgl2.py                               # regenerates src/webgl2.esk from web/webgl2.js
+python3 -I tools/gen_webgl2.py                               # regenerates src/webgl2.esk from web/webgl2/*.js
 tools/naga_wasm.sh                                           # rebuilds web/gpu-naga.wasm (Rust)
 tools/layout_check.sh $(brew --prefix wgpu-native)/include /opt/homebrew/lib
 ```

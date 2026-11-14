@@ -1,4 +1,4 @@
-// gpu-naga: WGSL to GLSL ES 3.00 for the WebGL2 backend of the gpu package (web/webgl2.js).
+// gpu-naga: WGSL to GLSL ES 3.00 for the WebGL2 backend of the gpu package (web/webgl2/).
 //
 // A plain wasm32-unknown-unknown module with a C ABI and no imports:
 //
