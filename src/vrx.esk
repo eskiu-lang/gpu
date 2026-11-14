@@ -20,8 +20,8 @@
 // texture: roughness in green, metalness in blue). The diffuse color and texture are the
 // base color, transparency below 1 blends, the normal and ambient occlusion maps carry over,
 // and the specular, reflective and emission maps are dropped, as Viro's loader drops them.
-// Textures are read relative to the file's directory; a missing one leaves the material
-// untextured.
+// Textures (PNG, JPEG, or KTX as Viro's Android projects ship them) are read relative to
+// the file's directory; a missing one leaves the material untextured.
 //
 // A skinned geometry gets the skeleton as joint nodes under its own node, with the inverse
 // bind matrices Viro computes (each bone's bind transform times the geometry's), so the
@@ -44,6 +44,7 @@ import <gpu/math>;
 import <gpu/gltf>;
 import <gpu/inflate>;
 import <gpu/image>;
+import <gpu/ktx2>;
 
 // A protobuf reader over [p, end).
 struct _Pb {
@@ -329,7 +330,7 @@ int _vrx_image(*_Vrx v, string name) {
     defer String_free(&ext);
     path_extension(&ext, name);
     bool jpeg = ext.data != null && (strcasecmp(ext.data, ".jpg") == 0 || strcasecmp(ext.data, ".jpeg") == 0);
-    String_append(&img.mime, jpeg ? "image/jpeg" : "image/png");
+    String_append(&img.mime, ktx_is_ktx(data, (uint64)n) ? "image/ktx" : jpeg ? "image/jpeg" : "image/png");
     img.data = data;
     img.len = (uint64)n;
     img.owned = true;

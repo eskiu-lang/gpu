@@ -35,6 +35,7 @@ import <gpu/core>;
 import <gpu/render>;
 import <gpu/math>;
 import <gpu/gltf>;
+import <gpu/ktx2>;
 import <gpu/obj>;
 import <gpu/vrx>;
 import <gpu/image>;
@@ -416,6 +417,19 @@ int _gpu_model_texture(*GpuModel self, int image, bool srgb, int fallback) {
     }
     GltfImage* img = &self.data.images.data[image];
     if (img.data == null || img.len == 0) return fallback;
+    if (ktx_is_ktx(img.data, img.len)) {
+        // a KTX texture goes up as it is, in the file's own format and levels
+        Result<Ktx2, string> kd = ktx_decode(img.data, img.len);
+        if (!kd.ok) return fallback;
+        Ktx2 k = kd.value;
+        Result<GpuTexture, string> kt = Gpu_ktx2(&self.gpu, &k);
+        Ktx2_free(&k);
+        if (!kt.ok) return fallback;
+        List_push(&self.textures, kt.value);
+        int kslot = self.textures.size - 1;
+        List_push(&self.texture_keys, _GpuTexKey{image, srgb, kslot});
+        return kslot;
+    }
     Result<Bitmap, string> dec = image_decode(img.data, img.len);
     if (!dec.ok) return fallback;
     Bitmap pic = dec.value;
