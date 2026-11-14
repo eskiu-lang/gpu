@@ -8,7 +8,10 @@
 // them is out of scope. 3D textures are rejected too. The parser is pure
 // Eskiu and needs no GPU; Gpu_ktx2 in <gpu/render> uploads the result.
 //
-//     Ktx2 k = ktx2_load("albedo.ktx2")?;
+// KTX 1 files (ViroReact's and older Android textures: ETC1, ETC2, ASTC, BC) are read
+// into the same Ktx2 by ktx1_decode; ktx_load and ktx_decode take either version.
+//
+//     Ktx2 k = ktx2_load("albedo.ktx2")?;   // or ktx_load for a .ktx or a .ktx2
 //     defer k.free();
 //     GpuTexture tex = gpu.ktx2(&k)?;
 
@@ -160,4 +163,135 @@ void Ktx2_free(*Ktx2 self) {
     List_free(&self.level_index);
     self.data = null;
     self.size = 0;
+}
+
+// OpenGL internal formats of KTX 1 files and the Vulkan formats they are (in pairs):
+// uncompressed RGBA8 (and its sRGB form), R8, RG8, the 16- and 32-bit float formats,
+// ETC1 (read as ETC2 RGB8, which decodes it), ETC2/EAC, BC1 to BC5, BC7, and ASTC (UNORM
+// and sRGB, every block size).
+uint32[90] _KTX1_FORMATS = {0x8058, 37, 0x8C43, 43, 0x8229, 9, 0x822B, 16, 0x822D, 76, 0x822F, 83,
+    0x881A, 97, 0x822E, 100, 0x8814, 109, 0x8D64, 147, 0x9274, 147, 0x9275, 148, 0x9276, 149, 0x9277, 150,
+    0x9278, 151, 0x9279, 152, 0x9270, 153, 0x9271, 154, 0x9272, 155, 0x9273, 156, 0x83F0, 131, 0x8C4C, 132,
+    0x83F1, 133, 0x8C4D, 134, 0x83F2, 135, 0x8C4E, 136, 0x83F3, 137, 0x8C4F, 138, 0x8DBB, 139, 0x8DBC, 140,
+    0x8DBD, 141, 0x8DBE, 142, 0x8E8C, 145, 0x8E8D, 146};
+
+// The Vulkan format of a KTX 1 file's OpenGL formats, 0 when this reader does not take it.
+uint32 _ktx1_vk(uint32 internal, uint32 format, uint32 type) {
+    for (i in 0..45) {
+        if (_KTX1_FORMATS[i * 2] == internal) return _KTX1_FORMATS[i * 2 + 1];
+    }
+    // ASTC: GL_COMPRESSED_RGBA_ASTC_4x4_KHR and on, then the sRGB forms, in Vulkan's order
+    if (internal >= 0x93B0 && internal <= 0x93BD) return 157 + (internal - 0x93B0) * 2;
+    if (internal >= 0x93D0 && internal <= 0x93DD) return 158 + (internal - 0x93D0) * 2;
+    // an unsized GL_RGBA of unsigned bytes
+    if (internal == 0x1908 && format == 0x1908 && type == 0x1401) return 37;
+    return 0;
+}
+
+uint32 _ktx1_u32(*uint8 p, bool big) {
+    if (big) return (uint32)p[3] | ((uint32)p[2] << 8) | ((uint32)p[1] << 16) | ((uint32)p[0] << 24);
+    return _ktx2_u32(p);
+}
+
+// Parses a KTX 1 file held in memory into a Ktx2 (the same fields, the levels packed one
+// after another), so Gpu_ktx2 uploads it: ViroReact's and older Android textures (ETC1,
+// ETC2, ASTC). 2D textures, arrays and cube maps with their mip levels; 3D textures and the
+// formats WebGPU has no equivalent for (RGB8, luminance) are rejected, and so are
+// big-endian files of multi-byte texels.
+Result<Ktx2, string> ktx1_decode(*uint8 data, uint64 len) {
+    uint8[12] magic = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    if (data == null || len < 64 || memcmp((*void)data, (*void)&magic[0], 12) != 0) return Err<Ktx2, string>("ktx: not a KTX 1 file");
+    uint32 endian = _ktx2_u32(data + 12);
+    if (endian != 0x04030201 && endian != 0x01020304) return Err<Ktx2, string>("ktx: bad endianness mark");
+    bool big = endian == 0x01020304;
+    uint32 type = _ktx1_u32(data + 16, big);
+    uint32 type_size = _ktx1_u32(data + 20, big);
+    uint32 format = _ktx1_u32(data + 24, big);
+    uint32 internal = _ktx1_u32(data + 28, big);
+    Ktx2 k;
+    k.width = _ktx1_u32(data + 36, big);
+    k.height = _ktx1_u32(data + 40, big);
+    uint32 depth = _ktx1_u32(data + 44, big);
+    uint32 arrays = _ktx1_u32(data + 48, big);
+    k.faces = _ktx1_u32(data + 52, big);
+    k.levels = _ktx1_u32(data + 56, big);
+    uint64 kv = (uint64)_ktx1_u32(data + 60, big);
+    if (big && type_size > 1) return Err<Ktx2, string>("ktx: big-endian multi-byte texels are not supported");
+    if (depth > 1) return Err<Ktx2, string>("ktx: 3D textures are not supported");
+    if (k.width == 0 || k.height == 0) return Err<Ktx2, string>("ktx: 1D textures are not supported");
+    if (k.faces != 1 && k.faces != 6) return Err<Ktx2, string>("ktx: bad face count");
+    if (k.faces == 6 && k.width != k.height) return Err<Ktx2, string>("ktx: cube faces are not square");
+    k.vk_format = _ktx1_vk(internal, format, type);
+    if (k.vk_format == 0 || !ktx2_block(k.vk_format, &k.block_width, &k.block_height, &k.block_bytes)) {
+        return Err<Ktx2, string>("ktx: unsupported glInternalFormat");
+    }
+    k.layers = arrays == 0 ? (uint32)1 : arrays;
+    k.want_mips = k.levels == 0;
+    if (k.levels == 0) k.levels = 1;
+    uint32 most = 1;
+    uint32 m = k.width > k.height ? k.width : k.height;
+    while (m > 1) {
+        m = m / 2;
+        most++;
+    }
+    if (k.levels > most) return Err<Ktx2, string>("ktx: more levels than the size allows");
+    if (k.layers > 2048) return Err<Ktx2, string>("ktx: too many array layers");
+    if (kv > len - 64) return Err<Ktx2, string>("ktx: truncated key/value data");
+    // the packed size first, then the copy
+    uint64 total = 0;
+    for (i in 0..k.levels) total += Ktx2_image_bytes(&k, i) * k.layers * k.faces;
+    if (total > len) return Err<Ktx2, string>("ktx: the levels are larger than the file");
+    k.data = alloc<uint8>((int64)total + 1);
+    k.size = total;
+    uint64 at = 64 + kv;
+    uint64 out = 0;
+    bool cube = arrays == 0 && k.faces == 6;
+    for (i in 0..k.levels) {
+        uint64 image = Ktx2_image_bytes(&k, i);
+        uint64 need = image * k.layers * k.faces;
+        if (at + 4 > len) {
+            Ktx2_free(&k);
+            return Err<Ktx2, string>("ktx: truncated level");
+        }
+        uint64 size = (uint64)_ktx1_u32(data + at, big);
+        at += 4;
+        // a cube map's size is one face's, each face padded to 4 bytes
+        uint64 step = cube ? (size + 3) / 4 * 4 : size;
+        uint64 span = cube ? step * 6 : size;
+        if (size < (cube ? image : need) || at > len || span > len - at) {
+            Ktx2_free(&k);
+            return Err<Ktx2, string>("ktx: level data out of the file or too short");
+        }
+        List_push(&k.level_index, Ktx2Level{out, need});
+        if (cube) {
+            for (f in 0..6) memcpy((*void)(k.data + out + (uint64)f * image), (*void)(data + at + (uint64)f * step), (int64)image);
+        } else {
+            memcpy((*void)(k.data + out), (*void)(data + at), (int64)need);
+        }
+        out += need;
+        at += (span + 3) / 4 * 4;
+    }
+    return Ok<Ktx2, string>(k);
+}
+
+// Whether the bytes start like a KTX file of either version.
+bool ktx_is_ktx(*uint8 data, uint64 len) {
+    return data != null && len >= 12 && data[0] == 0xAB && data[1] == 0x4B && data[2] == 0x54 && data[3] == 0x58
+        && data[4] == 0x20 && data[7] == 0xBB;
+}
+
+// Parses a KTX 1 or KTX 2 file held in memory (ktx1_decode or ktx2_decode, by its
+// identifier).
+Result<Ktx2, string> ktx_decode(*uint8 data, uint64 len) {
+    if (data != null && len >= 12 && data[5] == 0x31) return ktx1_decode(data, len);
+    return ktx2_decode(data, len);
+}
+
+// Reads a KTX 1 or KTX 2 file and parses it.
+Result<Ktx2, string> ktx_load(string path) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<Ktx2, string>("ktx: cannot read file");
+    defer free((*void)data);
+    return ktx_decode(data, (uint64)n);
 }
