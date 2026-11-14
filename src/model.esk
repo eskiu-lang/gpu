@@ -36,6 +36,7 @@ import <gpu/render>;
 import <gpu/math>;
 import <gpu/gltf>;
 import <gpu/obj>;
+import <gpu/vrx>;
 import <gpu/image>;
 import <gpu/ibl>;
 
@@ -372,12 +373,15 @@ string _gpu_model_wgsl(*Gpu g) {
     return s.data;
 }
 
-// Loads a model file: Wavefront OBJ when the name ends in .obj (any case),
-// glTF (.gltf or .glb) otherwise.
+// Loads a model file: Wavefront OBJ when the name ends in .obj, a ViroReact model when it
+// ends in .vrx (any case), glTF (.gltf or .glb) otherwise.
 Result<Gltf, string> model_load(string path) {
     int n = (int)strlen(path);
     if (n > 4 && path[n - 4] == '.' && (path[n - 3] | 32) == 'o' && (path[n - 2] | 32) == 'b' && (path[n - 1] | 32) == 'j') {
         return obj_load(path);
+    }
+    if (n > 4 && path[n - 4] == '.' && (path[n - 3] | 32) == 'v' && (path[n - 2] | 32) == 'r' && (path[n - 1] | 32) == 'x') {
+        return vrx_load(path);
     }
     return gltf_load(path);
 }
