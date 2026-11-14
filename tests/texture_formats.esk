@@ -1,6 +1,7 @@
-// Texture data in other formats: KTX2 files (<gpu/ktx2>) uploaded with
+// Texture data in other formats: KTX2 and KTX 1 files (<gpu/ktx2>) uploaded with
 // Gpu_ktx2 (RGBA8 with mip levels, a cube, an sRGB array, RGBA16Float, mip
-// levels the file asks for, the errors of files this reader does not take),
+// levels the file asks for, the errors of files this reader does not take; KTX 1 RGBA8
+// levels, an R8 cube whose 3x3 faces are padded to 4 bytes, ETC1 and big-endian headers),
 // block-compressed BC1, ETC2 and ASTC textures where the device has them
 // (sampled back through textureLoad, including BC1 mip levels smaller than a
 // block), and Radiance .hdr decoding (flat, run-length and old-style runs,
@@ -501,6 +502,92 @@ void run_case(string name, Result<int, string> r) {
     }
 }
 
+// A KTX 1 file: header (little-endian, or big-endian), then each level's size and data,
+// a cube map's faces each padded to 4 bytes.
+void K1_build(List<uint8>* out, uint32 internal, uint32 type_size, uint32 w, uint32 h, uint32 faces, uint32 levels,
+    *uint8 data, *uint64 sizes, bool big) {
+    uint8[12] magic = {0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A};
+    for (i in 0..12) List_push(out, magic[i]);
+    uint32[13] h1 = {0x04030201, 0x1401, type_size, 0, internal, 0, w, h, 0, 0, faces, levels, 4};
+    for (i in 0..13) {
+        uint32 v = h1[i];
+        if (big) {
+            for (b in 0..4) List_push(out, (uint8)((v >> ((3 - b) * 8)) & 255));
+        } else {
+            put32(out, v);
+        }
+    }
+    // four bytes of key/value data
+    for (i in 0..4) List_push(out, 0);
+    uint64 at = 0;
+    for (l in 0..levels) {
+        uint64 n = sizes[l];
+        if (big) {
+            for (b in 0..4) List_push(out, (uint8)((n >> (uint64)((3 - b) * 8)) & 255));
+        } else {
+            put32(out, (uint32)n);
+        }
+        for (f in 0..faces) {
+            for (i in 0..n) List_push(out, data[at + i]);
+            at += n;
+            uint64 pad = (4 - n % 4) % 4;
+            for (i in 0..pad) List_push(out, 0xEE);
+        }
+    }
+}
+
+Result<int, string> ktx1(*Gpu gpu) {
+    // RGBA8, 4x4 with 3 levels
+    uint8[84] img;
+    ramp(&img[0], 84, 3);
+    uint64[3] sizes = {64, 16, 4};
+    List<uint8> file;
+    defer List_free(&file);
+    K1_build(&file, 0x8058, 1, 4, 4, 1, 3, &img[0], &sizes[0], false);
+    Ktx2 k = ktx_decode(file.data, (uint64)file.size)?;
+    defer k.free();
+    check("ktx1 header", k.vk_format == 37 && k.width == 4 && k.levels == 3 && k.faces == 1 && k.layers == 1);
+    GpuTexture t = gpu.ktx2(&k)?;
+    defer t.release();
+    uint8[64] got;
+    uint64 at = 0;
+    for (m in 0..3) {
+        t.read_level(0, (uint32)m, &got[0])?;
+        check("ktx1 RGBA8 level", memcmp((*void)&img[at], (*void)&got[0], (int64)sizes[m]) == 0);
+        at += sizes[m];
+    }
+    // an R8 cube of 3x3 faces: 9 bytes each, padded to 12
+    uint8[54] faces;
+    for (i in 0..54) faces[i] = (uint8)(i * 3 + 1);
+    uint64[1] fs = {9};
+    List<uint8> cf;
+    defer List_free(&cf);
+    K1_build(&cf, 0x8229, 1, 3, 3, 6, 1, &faces[0], &fs[0], false);
+    Ktx2 c = ktx_decode(cf.data, (uint64)cf.size)?;
+    defer c.free();
+    check("ktx1 cube header", c.vk_format == 9 && c.faces == 6 && c.size == 54);
+    check("ktx1 cube padding skipped", memcmp((*void)c.data, (*void)&faces[0], 54) == 0);
+    GpuTexture cube = gpu.ktx2(&c)?;
+    defer cube.release();
+    check("ktx1 cube texture", cube.dimension == WGPUTextureViewDimension_Cube && cube.layers == 6);
+    // ETC1 reads as ETC2 RGB8; a big-endian file of byte texels reads too
+    uint8[8] block;
+    uint64[1] bs = {8};
+    List<uint8> ef;
+    defer List_free(&ef);
+    K1_build(&ef, 0x8D64, 1, 4, 4, 1, 1, &block[0], &bs[0], true);
+    Result<Ktx2, string> e = ktx1_decode(ef.data, (uint64)ef.size);
+    check("ktx1 ETC1, big-endian", e.ok && e.value.vk_format == 147 && e.value.width == 4 && e.value.level_index.data[0].length == 8);
+    if (e.ok) e.value.free();
+    List<uint8> bad;
+    defer List_free(&bad);
+    K1_build(&bad, 0x8051, 1, 4, 4, 1, 1, &img[0], &sizes[0], false);
+    check("ktx1 RGB8 is rejected", !ktx_decode(bad.data, (uint64)bad.size).ok);
+    check("ktx1 truncated", !ktx_decode(file.data, (uint64)file.size - 10).ok);
+    check("not ktx", !ktx_is_ktx(&img[0], 84) && ktx_is_ktx(file.data, (uint64)file.size));
+    return Ok<int, string>(0);
+}
+
 int main() {
     ktx2_errors();
     Result<Gpu, string> opened = gpu_open();
@@ -511,6 +598,7 @@ int main() {
     Gpu gpu = opened.value;
     defer gpu.release();
     run_case("ktx2", ktx2_rgba8(&gpu));
+    run_case("ktx1", ktx1(&gpu));
     run_case("compressed", compressed_formats(&gpu));
     run_case("hdr", hdr(&gpu));
     printf("texture formats: %d failures\n", fails);
