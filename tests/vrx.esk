@@ -1,0 +1,159 @@
+// .vrx loading: tests/data/quad.vrx (made by tools/gen_test_vrx.py) checks the node
+// transform, the strip and index sizes, the materials (the joined metallic-roughness
+// texture, Constant, transparency, an RGBA diffuse texture), the skeleton (a bone that is
+// its own parent becomes a root) and the merged "move" animation; tests/data/
+// object_star_anim.vrx, from ViroReact's sample app (MIT), is a real file: a skinned star
+// with two animations, drawn offscreen in its texture's orange. Corrupted protobufs must
+// load or fail without crashing.
+import <io>;
+import <mem>;
+import <libc>;
+import <fs>;
+import <gpu>;
+import <gpu/math>;
+import <gpu/gltf>;
+import <gpu/image>;
+import <gpu/model>;
+import <gpu/vrx>;
+
+int fails = 0;
+
+void check(string what, bool ok) {
+    if (!ok) {
+        printf("FAIL %s\n", what);
+        fails++;
+    }
+}
+
+bool near(float a, float b) {
+    return fabs((double)(a - b)) < 0.001;
+}
+
+// Joint j's matrix in its mesh node's space at time t of animation 0.
+Mat4 joint_at(*Gltf g, int mesh_node, int j, float t) {
+    Gltf_animate(g, 0, t);
+    *Mat4 world = alloc<Mat4>(g.nodes.size);
+    Gltf_world(g, world);
+    *GltfSkin s = &g.skins.data[g.nodes.data[mesh_node].skin];
+    *Mat4 jm = alloc<Mat4>(s.joints.size);
+    Gltf_joint_matrices(g, g.nodes.data[mesh_node].skin, world, jm);
+    Mat4 r = world[mesh_node].inverse() * jm[j];
+    free(world);
+    free(jm);
+    return r;
+}
+
+Result<int, string> run() {
+    Gltf g = vrx_load("tests/data/quad.vrx")?;
+    defer g.free();
+    check("two roots", g.roots.size == 2);
+    int quad = g.roots.data[0];
+    *GltfNode qn = &g.nodes.data[quad];
+    check("name and position", strcmp(qn.name.data, "quad") == 0 && near(qn.translation.z, 3.0));
+    check("90 degrees about Y", near(qn.rotation.y, 0.70710678) && near(qn.rotation.w, 0.70710678));
+    check("one mesh of two primitives", qn.mesh == 0 && g.meshes.data[0].primitives.size == 2);
+    *GltfPrimitive strip = &g.meshes.data[0].primitives.data[0];
+    check("the strip is two triangles over 4 vertices", strip.index_count == 6 && strip.vertex_count == 4);
+    check("strip winding", strip.indices[0] == 0 && strip.indices[1] == 1 && strip.indices[2] == 2
+        && strip.indices[3] == 2 && strip.indices[4] == 1 && strip.indices[5] == 3);
+    check("positions, coordinates, normals", near(strip.positions[3], 1.0) && near(strip.uvs[1], 1.0) && near(strip.normals[2], 1.0));
+    *GltfPrimitive tri = &g.meshes.data[0].primitives.data[1];
+    check("32-bit indices, compacted", tri.index_count == 3 && tri.vertex_count == 3 && tri.material == 1);
+
+    *GltfMaterial pbr = &g.materials.data[0];
+    check("diffuse color", near(pbr.base_color.x, 0.5));
+    check("an RGBA diffuse texture blends", pbr.base_color_texture.texture >= 0 && pbr.alpha_mode == GLTF_BLEND);
+    check("roughness from its map, metalness from its color", near(pbr.roughness, 1.0) && near(pbr.metallic, 0.25));
+    int mr = pbr.metallic_roughness_texture.texture;
+    check("a joined metallic-roughness texture", mr >= 0);
+    if (mr >= 0) {
+        *GltfImage img = &g.images.data[g.textures.data[mr].image];
+        Bitmap b = image_decode(img.data, img.len)?;
+        check("roughness in green, no metal map is 255 in blue", b.width == 2 && b.rgba[1] == 10 && b.rgba[13] == 40 && b.rgba[2] == 255);
+        Bitmap_free(&b);
+    }
+    *GltfMaterial flat = &g.materials.data[1];
+    check("Constant is unlit, transparency blends", flat.unlit && flat.alpha_mode == GLTF_BLEND && near(flat.base_color.w, 0.5));
+
+    check("one skin of two joints", qn.skin == 0 && g.skins.data[0].joints.size == 2);
+    int j0 = g.skins.data[0].joints.data[0];
+    int j1 = g.skins.data[0].joints.data[1];
+    check("a bone that is its own parent hangs from the mesh node", g.nodes.data[j0].parent == quad && g.nodes.data[j1].parent == j0);
+    check("weights", near(strip.weights[0], 0.5) && near(strip.weights[1], 0.5) && strip.joints[1] == 1);
+    check("one animation for both", g.animations.size == 1 && strcmp(g.animations.data[0].name.data, "move") == 0
+        && near(g.animations.data[0].duration, 2.0));
+    // Viro's legacy skin matrix is inverse(bind) T bind; T moves up 1, then 2
+    Mat4 m = joint_at(&g, quad, 1, 0.0);
+    check("bone 1 at the start", near(m.m[13], 1.0) && near(m.m[12], 0.0));
+    m = joint_at(&g, quad, 1, 1.0);
+    check("bone 1 halfway", near(m.m[13], 1.5));
+    check("the node's keyframes", near(g.nodes.data[quad].translation.z, 4.0));
+    check("a missing file is an error", !vrx_load("tests/data/missing.vrx").ok);
+    check("not zlib is an error", !vrx_parse((*uint8)"plain text", 10, null).ok);
+
+    // corrupted protobufs
+    int64 n = 0;
+    *uint8 file = fs_read_all("tests/data/quad.vrx", &n);
+    defer free(file);
+    uint64 rn = 0;
+    *uint8 raw = _vrx_inflate(file, (uint64)n, &rn)?;
+    defer free(raw);
+    *uint8 copy = alloc<uint8>((int64)rn);
+    defer free(copy);
+    uint32 seed = 4242;
+    for (round in 0..1500) {
+        memcpy(copy, raw, (int64)rn);
+        for (k in 0..3) {
+            seed = seed * 1103515245 + 12345;
+            int64 at = (int64)(seed >> 8) % (int64)rn;
+            seed = seed * 1103515245 + 12345;
+            copy[at] = (uint8)(seed >> 16);
+        }
+        Result<Gltf, string> r = _vrx_parse_pb(copy, round < 10 ? rn - (uint64)round * 7 : rn, "tests/data");
+        if (r.ok) r.value.free();
+    }
+
+    Gltf star = vrx_load("tests/data/object_star_anim.vrx")?;
+    defer star.free();
+    check("the star: 348 vertices", star.meshes.size == 1 && star.meshes.data[0].primitives.data[0].vertex_count == 348);
+    check("the star: its skeleton", star.skins.size == 1 && star.skins.data[0].joints.size == 3);
+    check("the star: two animations", star.animations.size == 2 && strcmp(star.animations.data[1].name.data, "02_spin") == 0
+        && star.animations.data[1].duration > 7.4 && star.animations.data[1].duration < 7.5);
+    *GltfMaterial sm = &star.materials.data[0];
+    check("the star: Phong shininess as roughness", near(sm.roughness, (float)sqrt(2.0 / (6.31179094 + 2.0))));
+    check("the star: its texture", sm.base_color_texture.texture >= 0 && star.images.size == 1);
+    *GltfSampler samp = &star.samplers.data[star.textures.data[sm.base_color_texture.texture].sampler];
+    check("the star: repeat, linear mipmaps", samp.wrap_s == 10497 && samp.min_filter == 9987);
+
+    Gpu gpu = gpu_open()?;
+    defer gpu.release();
+    GpuTexture target = gpu.target(64, 64)?;
+    defer target.release();
+    GpuTexture depth = gpu.depth(64, 64)?;
+    defer depth.release();
+    GpuModel model = gpu.model(&star, target.format)?;
+    defer model.release();
+    model.update(mat4_identity());
+    GpuCamera cam = gpu_camera(Vec3{0.0, 0.0, 3.0}, Vec3{0.0, 0.0, 0.0}, 0.8, 1.0, 0.1, 10.0);
+    GpuPass pass = gpu.pass(target.view, GpuColor{0.0, 0.0, 0.0, 1.0}, &depth);
+    model.draw(&pass, &cam);
+    pass.end()?;
+    *uint8 px = alloc<uint8>(64 * 64 * 4);
+    defer free(px);
+    target.read(px)?;
+    *uint8 c = px + (32 * 64 + 32) * 4;
+    printf("star center %d %d %d\n", (int)c[0], (int)c[1], (int)c[2]);
+    check("the star is drawn in orange", c[0] > c[1] && c[1] > c[2] && c[0] > 80);
+    check("nothing in the corner", px[0] == 0 && px[1] == 0);
+    return Ok<int, string>(fails);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    printf("vrx: %d failures\n", r.value);
+    return r.value == 0 ? 0 : 1;
+}
