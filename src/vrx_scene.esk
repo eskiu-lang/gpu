@@ -1,0 +1,308 @@
+// vrx_scene.esk: rigs, nodes and the scene (part of vrx.esk, which imports it in order after the ones before it)
+
+// A rig of node's parent and transform with these bind matrices and animations, -1 when
+// there is none.
+int _vrx_find_rig(*_Vrx v, int node, *Mat4 bind, *List<_Pb> anims, *List<_Pb> keys) {
+    *GltfNode n = &v.g.nodes.data[node];
+    for (i in 0..v.rigs.size) {
+        *_VrxRig r = &v.rigs.data[i];
+        if (r.parent != n.parent || r.anims.size != anims.size || r.keys.size != keys.size) continue;
+        Vec3 dt = r.t - n.translation;
+        Vec3 ds = r.s - n.scale;
+        float dr = fabsf(r.r.x - n.rotation.x) + fabsf(r.r.y - n.rotation.y) + fabsf(r.r.z - n.rotation.z) + fabsf(r.r.w - n.rotation.w);
+        if (dt.length() > 1e-6 || ds.length() > 1e-6 || dr > 1e-6) continue;
+        bool same = true;
+        for (j in 0..v.bones.size) {
+            for (k in 0..16) {
+                if (fabsf(r.bind[j].m[k] - bind[j].m[k]) > 1e-5) same = false;
+            }
+        }
+        for (a in 0..anims.size) {
+            if (!_vrx_same_bytes(r.anims.data[a], anims.data[a])) same = false;
+        }
+        for (a in 0..keys.size) {
+            if (!_vrx_same_bytes(r.keys.data[a], keys.data[a])) same = false;
+        }
+        if (same) return i;
+    }
+    return -1;
+}
+
+void _vrx_add_skin(*_Vrx v, int node, int joint0, *Mat4 bind) {
+    int nb = v.bones.size;
+    GltfSkin sk;
+    sk.skeleton = -1;
+    sk.inverse_bind = alloc<float>((int64)nb * 16 + 1);
+    for (j in 0..nb) {
+        List_push(&sk.joints, joint0 + j);
+        for (k in 0..16) sk.inverse_bind[j * 16 + k] = bind[j].m[k];
+    }
+    List_push(&v.g.skins, sk);
+    v.g.nodes.data[node].skin = v.g.skins.size - 1;
+}
+
+// Skins the mesh of node with the skeleton: joint nodes under node, the inverse bind
+// matrices, the rest pose, and the skeletal animations. A sibling with the same transform,
+// bind matrices, skeletal and keyframe animations (keys) shares the joints.
+void _vrx_skin(*_Vrx v, _Pb skin, int node, *List<_Pb> anims, *List<_Pb> keys) {
+    int nb = v.bones.size;
+    Mat4 geo_bind = mat4_identity();
+    *Mat4 bind = alloc<Mat4>((int64)nb + 1);
+    for (j in 0..nb) bind[j] = mat4_identity();
+    int bi = 0;
+    int f = 0;
+    int w = 0;
+    _Pb s = skin;
+    List<Mat4> bone_space;
+    defer List_free(&bone_space);
+    while (_pb_next(&s, &f, &w)) {
+        if (f == 1 && w == 2) _vrx_matrix(_pb_bytes(&s), &geo_bind);
+        else if (f == 2 && w == 2) {
+            Mat4 m = mat4_identity();
+            _vrx_matrix(_pb_bytes(&s), &m);
+            List_push(&bone_space, m);
+        } else _pb_skip(&s, w);
+    }
+    for (j in 0..nb) {
+        Mat4 bs = j < bone_space.size ? bone_space.data[j] : mat4_identity();
+        bind[j] = bs * geo_bind;
+    }
+    int shared = _vrx_find_rig(v, node, bind, anims, keys);
+    if (shared >= 0) {
+        _vrx_add_skin(v, node, v.rigs.data[shared].joint0, bind);
+        free(bind);
+        return;
+    }
+    // the rest pose: undeformed, then the first frame of the first animation
+    *Mat4 model = alloc<Mat4>((int64)nb + 1);
+    *Mat4 local = alloc<Mat4>((int64)nb + 1);
+    for (j in 0..nb) model[j] = bind[j].inverse();
+    if (anims.size > 0) {
+        _Pb a = anims.data[0];
+        while (_pb_next(&a, &f, &w)) {
+            if (f == 2 && w == 2) {
+                float t = 0.0;
+                _vrx_frame(v, _pb_bytes(&a), bind, model, &t);
+                break;
+            }
+            _pb_skip(&a, w);
+        }
+    }
+    _vrx_locals(v, model, local);
+    int joint0 = v.g.nodes.size;
+    for (j in 0..nb) {
+        GltfNode n;
+        String_append(&n.name, v.bones.data[j].name.data != null ? v.bones.data[j].name.data : "");
+        n.mesh = -1;
+        n.skin = -1;
+        _vrx_decompose(local[j], &n.translation, &n.rotation, &n.scale);
+        int p = v.bones.data[j].parent;
+        n.parent = p >= 0 && p < nb ? joint0 + p : node;
+        List_push(&v.g.nodes, n);
+    }
+    for (j in 0..nb) List_push(&v.g.nodes.data[v.g.nodes.data[joint0 + j].parent].children, joint0 + j);
+    _vrx_add_skin(v, node, joint0, bind);
+    for (i in 0..anims.size) _vrx_skeletal(v, anims.data[i], joint0, bind, model, i);
+    free(model);
+    free(local);
+    // the joints live under node, so a sibling reusing them needs node's transform
+    *GltfNode n = &v.g.nodes.data[node];
+    _VrxRig r = _VrxRig{parent: n.parent, t: n.translation, r: n.rotation, s: n.scale, joint0: joint0, bind: bind};
+    for (i in 0..anims.size) List_push(&r.anims, anims.data[i]);
+    for (i in 0..keys.size) List_push(&r.keys, keys.data[i]);
+    List_push(&v.rigs, r);
+}
+
+// The rotation of Euler angles in degrees, as ViroReact applies them (X, then Y, then Z).
+Quat _vrx_euler(float x, float y, float z) {
+    float k = 3.14159265358979 / 180.0;
+    Quat qx = quat_axis_angle(Vec3{1.0, 0.0, 0.0}, x * k);
+    Quat qy = quat_axis_angle(Vec3{0.0, 1.0, 0.0}, y * k);
+    Quat qz = quat_axis_angle(Vec3{0.0, 0.0, 1.0}, z * k);
+    return qz * qy * qx;
+}
+
+// A viro.Node under parent (-1 for a root); returns its node index.
+int _vrx_node(*_Vrx v, _Pb b, int parent) {
+    GltfNode n;
+    n.mesh = -1;
+    n.skin = -1;
+    n.parent = parent;
+    n.translation = Vec3{0.0, 0.0, 0.0};
+    n.scale = Vec3{1.0, 1.0, 1.0};
+    n.rotation = quat_identity();
+    List<float> pos;
+    defer List_free(&pos);
+    List<float> rot;
+    defer List_free(&rot);
+    List<float> scale;
+    defer List_free(&scale);
+    _Pb geo = _Pb{null, null};
+    List<_Pb> skel;
+    defer List_free(&skel);
+    List<_Pb> keys;
+    defer List_free(&keys);
+    List<_Pb> subs;
+    defer List_free(&subs);
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 1) _pb_string(&b, w, &n.name);
+        else if (f == 2) _pb_floats(&b, w, &pos);
+        else if (f == 3) _pb_floats(&b, w, &scale);
+        else if (f == 4) _pb_floats(&b, w, &rot);
+        else if (f == 7 && w == 2) geo = _pb_bytes(&b);
+        else if (f == 9 && w == 2) List_push(&skel, _pb_bytes(&b));
+        else if (f == 10 && w == 2) List_push(&keys, _pb_bytes(&b));
+        else if (f == 13 && w == 2) List_push(&subs, _pb_bytes(&b));
+        else _pb_skip(&b, w);
+    }
+    if (pos.size >= 3) n.translation = Vec3{pos.data[0], pos.data[1], pos.data[2]};
+    if (scale.size >= 3) n.scale = Vec3{scale.data[0], scale.data[1], scale.data[2]};
+    if (rot.size >= 3) n.rotation = _vrx_euler(rot.data[0], rot.data[1], rot.data[2]);
+    List_push(&v.g.nodes, n);
+    int id = v.g.nodes.size - 1;
+    if (parent >= 0) List_push(&v.g.nodes.data[parent].children, id);
+    else List_push(&v.g.roots, id);
+    if (geo.p != null) {
+        _Pb skin = _Pb{null, null};
+        _Pb g = geo;
+        while (_pb_next(&g, &f, &w)) {
+            if (f == 6 && w == 2) skin = _pb_bytes(&g);
+            else _pb_skip(&g, w);
+        }
+        bool skinned = skin.p != null && v.bones.size > 0;
+        int mesh = _vrx_geometry(v, geo, skinned ? &skin : null);
+        v.g.nodes.data[id].mesh = mesh;
+        if (mesh >= 0 && skinned) _vrx_skin(v, skin, id, &skel, &keys);
+    }
+    for (i in 0..keys.size) _vrx_keyframes(v, keys.data[i], id, i);
+    for (i in 0..subs.size) _vrx_node(v, subs.data[i], id);
+    return id;
+}
+
+void _vrx_skeleton(*_Vrx v, _Pb b) {
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f != 1 || w != 2) {
+            _pb_skip(&b, w);
+            continue;
+        }
+        _Pb bone = _pb_bytes(&b);
+        _VrxBone vb = _VrxBone{parent: -1};
+        while (_pb_next(&bone, &f, &w)) {
+            if (f == 1) _pb_string(&bone, w, &vb.name);
+            else if (f == 2) vb.parent = (int)_pb_int(&bone, w);
+            else _pb_skip(&bone, w);
+        }
+        List_push(&v.bones, vb);
+    }
+    // a parent out of range, the bone itself or a cycle makes a root (files have bones
+    // that name themselves as their parent; Viro's legacy frames never walk up to them)
+    int nb = v.bones.size;
+    *bool cut = alloc<bool>((int64)nb + 1);
+    for (j in 0..nb) {
+        int p = v.bones.data[j].parent;
+        if (p >= nb) cut[j] = true;
+        for (steps in 0..nb) {
+            if (p < 0 || p >= nb) break;
+            if (p == j) {
+                cut[j] = true;
+                break;
+            }
+            p = v.bones.data[p].parent;
+        }
+    }
+    for (j in 0..nb) {
+        if (cut[j]) v.bones.data[j].parent = -1;
+    }
+    free(cut);
+}
+
+void _vrx_cleanup(*_Vrx v) {
+    String_free(&v.dir);
+    for (i in 0..v.rigs.size) {
+        free(v.rigs.data[i].bind);
+        List_free(&v.rigs.data[i].anims);
+        List_free(&v.rigs.data[i].keys);
+    }
+    List_free(&v.rigs);
+    for (i in 0..v.bones.size) String_free(&v.bones.data[i].name);
+    List_free(&v.bones);
+    for (i in 0..v.image_paths.size) String_free(&v.image_paths.data[i]);
+    List_free(&v.image_paths);
+    for (i in 0..v.joined.size) {
+        String_free(&v.joined.data[i].rough);
+        String_free(&v.joined.data[i].metal);
+    }
+    List_free(&v.joined);
+}
+
+// Inflates a zlib stream of unknown size.
+Result<*uint8, string> _vrx_inflate(*uint8 data, uint64 len, *uint64 out_len) {
+    uint64 cap = len * 8 + 4096;
+    while (true) {
+        *uint8 out = alloc<uint8>((int64)cap);
+        Result<uint64, string> r = inflate_zlib(data, len, out, cap);
+        if (r.ok) {
+            *out_len = r.value;
+            return Ok<*uint8, string>(out);
+        }
+        free(out);
+        if (strcmp(r.error, "inflate: too much data") != 0 || cap > (uint64)1 << 32) {
+            return Err<*uint8, string>(_vrx_fail("", r.error));
+        }
+        cap = cap * 4;
+    }
+    return Err<*uint8, string>(_vrx_fail("inflate failed", null));
+}
+
+// Builds the Gltf from the inflated protobuf.
+Result<Gltf, string> _vrx_parse_pb(*uint8 raw, uint64 n, string base_dir) {
+    _Vrx v;
+    if (base_dir != null) String_append(&v.dir, base_dir);
+    _Pb root = _Pb{raw, raw + (int64)n};
+    // the skeleton first: the root nodes' skins refer to it
+    _Pb b = root;
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 8 && w == 2) _vrx_skeleton(&v, _pb_bytes(&b));
+        else _pb_skip(&b, w);
+    }
+    b = root;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 13 && w == 2) _vrx_node(&v, _pb_bytes(&b), -1);
+        else _pb_skip(&b, w);
+    }
+    _vrx_cleanup(&v);
+    if (v.g.meshes.size == 0) {
+        Gltf_free(&v.g);
+        return Err<Gltf, string>(_vrx_fail("the file has no geometry", null));
+    }
+    return Ok<Gltf, string>(v.g);
+}
+
+// Parses a .vrx file held in memory. Its textures are read relative to base_dir (null for
+// the current directory).
+Result<Gltf, string> vrx_parse(*uint8 data, uint64 len, string base_dir) {
+    if (len < 2 || (data[0] & 0x0F) != 8) return Err<Gltf, string>(_vrx_fail("not a zlib-compressed .vrx file", null));
+    uint64 n = 0;
+    *uint8 raw = _vrx_inflate(data, len, &n)?;
+    defer free(raw);
+    return _vrx_parse_pb(raw, n, base_dir);
+}
+
+// Reads a .vrx file and parses it with vrx_parse, reading its textures relative to the
+// file's directory. Errors start with "vrx: ". The caller frees the result with free().
+Result<Gltf, string> vrx_load(string path) {
+    int64 n = 0;
+    *uint8 data = fs_read_all(path, &n);
+    if (data == null) return Err<Gltf, string>(_vrx_fail("cannot read ", path));
+    defer free(data);
+    String dir;
+    defer String_free(&dir);
+    path_dirname(&dir, path);
+    return vrx_parse(data, (uint64)n, dir.data);
+}

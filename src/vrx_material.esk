@@ -1,0 +1,532 @@
+// vrx_material.esk: materials, animations and node transforms (part of vrx.esk, which imports it in order after the ones before it)
+
+// A viro.Node.Geometry.Material as a glTF material; returns its index.
+int _vrx_material(*_Vrx v, _Pb b) {
+    GltfTextureRef none = GltfTextureRef{-1, 0, 1.0};
+    GltfMaterial m = GltfMaterial{base_color: Vec4{1.0, 1.0, 1.0, 1.0}, metallic: 0.0, roughness: 0.5,
+        base_color_texture: none, metallic_roughness_texture: none, normal_texture: none,
+        occlusion_texture: none, emissive_texture: none, alpha_cutoff: 0.5};
+    float shininess = 2.0;
+    float transparency = 1.0;
+    int model = 2;
+    _VrxVisual diffuse;
+    _VrxVisual normal;
+    _VrxVisual rough;
+    _VrxVisual metal;
+    _VrxVisual ao;
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 1) _pb_string(&b, w, &m.name);
+        else if (f == 2) shininess = _pb_float(&b, w);
+        else if (f == 4) transparency = _pb_float(&b, w);
+        else if (f == 5) model = (int)_pb_int(&b, w);
+        else if (f == 11 && w == 2) diffuse = _vrx_visual(_pb_bytes(&b));
+        else if (f == 13 && w == 2) normal = _vrx_visual(_pb_bytes(&b));
+        else if (f == 17 && w == 2) rough = _vrx_visual(_pb_bytes(&b));
+        else if (f == 18 && w == 2) metal = _vrx_visual(_pb_bytes(&b));
+        else if (f == 19 && w == 2) ao = _vrx_visual(_pb_bytes(&b));
+        else _pb_skip(&b, w);
+    }
+    if (diffuse.has && diffuse.color.size >= 3) {
+        m.base_color = Vec4{diffuse.color.data[0], diffuse.color.data[1], diffuse.color.data[2], 1.0};
+    }
+    m.base_color_texture.texture = _vrx_texture(v, &diffuse);
+    m.normal_texture.texture = _vrx_texture(v, &normal);
+    m.occlusion_texture.texture = _vrx_texture(v, &ao);
+    if (model == 0) {
+        m.unlit = true;
+    } else if (model == 1) {
+        m.roughness = 1.0;
+    } else if (model == 4) {
+        m.roughness = rough.has && rough.color.size > 0 && !_vrx_textured(&rough) ? rough.color.data[0] : 1.0;
+        m.metallic = metal.has && metal.color.size > 0 && !_vrx_textured(&metal) ? metal.color.data[0] : 0.0;
+        if (_vrx_textured(&rough) || _vrx_textured(&metal)) {
+            int t = _vrx_joined(v, &rough, &metal);
+            if (t >= 0) {
+                m.metallic_roughness_texture.texture = t;
+                if (_vrx_textured(&metal)) m.metallic = 1.0;
+                if (_vrx_textured(&rough)) m.roughness = 1.0;
+            }
+        }
+    } else {
+        // Blinn-Phong's exponent as the roughness of a comparable highlight
+        float s = shininess < 0.0 ? 0.0 : shininess;
+        m.roughness = (float)sqrt(2.0 / ((double)s + 2.0));
+    }
+    if (transparency < 1.0) {
+        m.base_color.w = transparency;
+        m.alpha_mode = GLTF_BLEND;
+    }
+    if (_vrx_has_alpha(v, m.base_color_texture.texture)) m.alpha_mode = GLTF_BLEND;
+    _vrx_visual_free(&diffuse);
+    _vrx_visual_free(&normal);
+    _vrx_visual_free(&rough);
+    _vrx_visual_free(&metal);
+    _vrx_visual_free(&ao);
+    List_push(&v.g.materials, m);
+    return v.g.materials.size - 1;
+}
+
+// The element's indices as a triangle, line or point list (a strip is unrolled into
+// triangles); *mode is the glTF mode.
+void _vrx_indices(_Pb e, *List<uint32> out, *int mode) {
+    _Pb data = _Pb{null, null};
+    int prim = 0;
+    int count = 0;
+    int bpi = 4;
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&e, &f, &w)) {
+        if (f == 1 && w == 2) data = _pb_bytes(&e);
+        else if (f == 2) prim = (int)_pb_int(&e, w);
+        else if (f == 3) count = (int)_pb_int(&e, w);
+        else if (f == 4) bpi = (int)_pb_int(&e, w);
+        else _pb_skip(&e, w);
+    }
+    if (bpi != 1 && bpi != 2 && bpi != 4) bpi = 4;
+    int64 n = data.p == null ? 0 : (data.end - data.p) / (int64)bpi;
+    List<uint32> raw;
+    defer List_free(&raw);
+    for (i in 0..n) {
+        *uint8 p = data.p + i * (int64)bpi;
+        uint32 x = bpi == 1 ? (uint32)p[0] : bpi == 2 ? (uint32)p[0] | (uint32)p[1] << 8
+            : (uint32)p[0] | (uint32)p[1] << 8 | (uint32)p[2] << 16 | (uint32)p[3] << 24;
+        List_push(&raw, x);
+    }
+    *mode = GLTF_TRIANGLES;
+    if (prim == 1) {
+        for (i in 2..raw.size) {
+            uint32 a = raw.data[i - 2];
+            uint32 b2 = raw.data[i - 1];
+            uint32 c = raw.data[i];
+            if (a == b2 || b2 == c || a == c) continue;
+            if ((i & 1) == 0) {
+                List_push(out, a);
+                List_push(out, b2);
+            } else {
+                List_push(out, b2);
+                List_push(out, a);
+            }
+            List_push(out, c);
+        }
+        return;
+    }
+    int want = prim == 2 ? count * 2 : prim == 3 ? count : count * 3;
+    if (prim == 2) *mode = GLTF_LINES;
+    if (prim == 3) *mode = GLTF_POINTS;
+    if (want <= 0 || want > raw.size) want = raw.size;
+    if (*mode == GLTF_TRIANGLES) want = want / 3 * 3;
+    for (i in 0..want) List_push(out, raw.data[i]);
+}
+
+// The node's geometry as a mesh; returns the mesh index. skin, when not null, holds the
+// bone indices and weights of the vertices.
+int _vrx_geometry(*_Vrx v, _Pb b, *_Pb skin) {
+    _Pb buf = _Pb{null, null};
+    List<_VrxSource> sources;
+    defer List_free(&sources);
+    List<_Pb> elements;
+    defer List_free(&elements);
+    GltfMesh mesh;
+    int mat_base = v.g.materials.size;
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 1) _pb_string(&b, w, &mesh.name);
+        else if (f == 2 && w == 2) buf = _pb_bytes(&b);
+        else if (f == 3 && w == 2) List_push(&sources, _vrx_source(_pb_bytes(&b)));
+        else if (f == 4 && w == 2) List_push(&elements, _pb_bytes(&b));
+        else if (f == 5 && w == 2) _vrx_material(v, _pb_bytes(&b));
+        else _pb_skip(&b, w);
+    }
+    int nmat = v.g.materials.size - mat_base;
+    int[5] by;
+    for (k in 0..5) by[k] = -1;
+    int vcount = 0;
+    for (i in 0..sources.size) {
+        int sem = sources.data[i].semantic;
+        if (sem >= 0 && sem < 5 && by[sem] < 0) by[sem] = i;
+        if (sem == _VRX_VERTEX && sources.data[i].count > vcount) vcount = sources.data[i].count;
+    }
+    if (by[_VRX_VERTEX] >= 0) {
+        // no more vertices than the buffer holds
+        *_VrxSource ps = &sources.data[by[_VRX_VERTEX]];
+        _Pb d = ps.own ? ps.data : buf;
+        int64 bytes = d.p == null ? 0 : d.end - d.p;
+        int64 most = ps.stride > 0 ? bytes / (int64)ps.stride + 1 : 1;
+        if ((int64)vcount > most) vcount = (int)most;
+    }
+    if (vcount < 0) vcount = 0;
+    _VrxSource bi = _VrxSource{comps: 0};
+    _VrxSource bw = _VrxSource{comps: 0};
+    if (skin != null) {
+        _Pb s = *skin;
+        while (_pb_next(&s, &f, &w)) {
+            if (f == 3 && w == 2) bi = _vrx_source(_pb_bytes(&s));
+            else if (f == 4 && w == 2) bw = _vrx_source(_pb_bytes(&s));
+            else _pb_skip(&s, w);
+        }
+    }
+    bool skinned = skin != null && bi.comps > 0 && bw.comps > 0;
+    *int remap = alloc<int>((int64)vcount + 1);
+    for (e in 0..elements.size) {
+        List<uint32> idx;
+        int mode = GLTF_TRIANGLES;
+        _vrx_indices(elements.data[e], &idx, &mode);
+        if (idx.size == 0 || by[_VRX_VERTEX] < 0) {
+            List_free(&idx);
+            continue;
+        }
+        for (i in 0..vcount) remap[i] = -1;
+        List<int> used;
+        defer List_free(&used);
+        for (i in 0..idx.size) {
+            uint32 x = idx.data[i];
+            if ((int64)x >= (int64)vcount) x = 0;
+            if (remap[x] < 0) {
+                remap[x] = used.size;
+                List_push(&used, (int)x);
+            }
+            idx.data[i] = (uint32)remap[x];
+        }
+        GltfPrimitive p;
+        p.mode = mode;
+        p.material = nmat > 0 ? mat_base + e % nmat : -1;
+        p.vertex_count = (uint32)used.size;
+        p.index_count = (uint32)idx.size;
+        p.indices = idx.data;
+        int nv = used.size;
+        p.positions = alloc<float>((int64)nv * 3 + 1);
+        if (by[_VRX_NORMAL] >= 0) p.normals = alloc<float>((int64)nv * 3 + 1);
+        if (by[_VRX_TEXCOORD] >= 0) p.uvs = alloc<float>((int64)nv * 2 + 1);
+        if (by[_VRX_TANGENT] >= 0) p.tangents = alloc<float>((int64)nv * 4 + 1);
+        if (by[_VRX_COLOR] >= 0) p.colors = alloc<float>((int64)nv * 4 + 1);
+        if (skinned) {
+            p.joints = alloc<uint32>((int64)nv * 4 + 1);
+            p.weights = alloc<float>((int64)nv * 4 + 1);
+        }
+        for (k in 0..nv) {
+            int src = used.data[k];
+            *_VrxSource s = &sources.data[by[_VRX_VERTEX]];
+            for (c in 0..3) p.positions[k * 3 + c] = _vrx_comp(s, buf, src, c);
+            if (p.normals != null) {
+                s = &sources.data[by[_VRX_NORMAL]];
+                for (c in 0..3) p.normals[k * 3 + c] = _vrx_comp(s, buf, src, c);
+            }
+            if (p.uvs != null) {
+                s = &sources.data[by[_VRX_TEXCOORD]];
+                for (c in 0..2) p.uvs[k * 2 + c] = _vrx_comp(s, buf, src, c);
+            }
+            if (p.tangents != null) {
+                s = &sources.data[by[_VRX_TANGENT]];
+                for (c in 0..4) p.tangents[k * 4 + c] = _vrx_comp(s, buf, src, c);
+                if (s.comps < 4) p.tangents[k * 4 + 3] = 1.0;
+            }
+            if (p.colors != null) {
+                s = &sources.data[by[_VRX_COLOR]];
+                for (c in 0..4) p.colors[k * 4 + c] = c < s.comps ? _vrx_comp(s, buf, src, c) : 1.0;
+            }
+            if (skinned) {
+                float sum = 0.0;
+                for (c in 0..4) {
+                    float j = _vrx_comp(&bi, buf, src, c);
+                    float wt = _vrx_comp(&bw, buf, src, c);
+                    // a weight on a bone the skeleton does not have, or a negative one, drops
+                    if (j < 0.0 || j >= (float)v.bones.size || !(wt > 0.0)) {
+                        j = 0.0;
+                        wt = 0.0;
+                    }
+                    p.joints[k * 4 + c] = (uint32)j;
+                    p.weights[k * 4 + c] = wt;
+                    sum += wt;
+                }
+                if (sum > 0.0) {
+                    for (c in 0..4) p.weights[k * 4 + c] = p.weights[k * 4 + c] / sum;
+                } else {
+                    p.weights[k * 4] = 1.0;
+                }
+            }
+        }
+        p.min = Vec3{p.positions[0], p.positions[1], p.positions[2]};
+        p.max = p.min;
+        for (k in 0..nv) {
+            Vec3 q = Vec3{p.positions[k * 3], p.positions[k * 3 + 1], p.positions[k * 3 + 2]};
+            p.min = Vec3{q.x < p.min.x ? q.x : p.min.x, q.y < p.min.y ? q.y : p.min.y, q.z < p.min.z ? q.z : p.min.z};
+            p.max = Vec3{q.x > p.max.x ? q.x : p.max.x, q.y > p.max.y ? q.y : p.max.y, q.z > p.max.z ? q.z : p.max.z};
+        }
+        List_push(&mesh.primitives, p);
+    }
+    free(remap);
+    if (mesh.primitives.size == 0) {
+        String_free(&mesh.name);
+        return -1;
+    }
+    List_push(&v.g.meshes, mesh);
+    return v.g.meshes.size - 1;
+}
+
+// A matrix as translation, rotation and scale (a negative determinant flips the X scale).
+void _vrx_decompose(Mat4 m, *Vec3 t, *Quat r, *Vec3 s) {
+    *t = Vec3{m.m[12], m.m[13], m.m[14]};
+    Vec3 c0 = Vec3{m.m[0], m.m[1], m.m[2]};
+    Vec3 c1 = Vec3{m.m[4], m.m[5], m.m[6]};
+    Vec3 c2 = Vec3{m.m[8], m.m[9], m.m[10]};
+    float sx = c0.length();
+    float sy = c1.length();
+    float sz = c2.length();
+    if (c0.dot(c1.cross(c2)) < 0.0) sx = -sx;
+    *s = Vec3{sx, sy, sz};
+    if (sx != 0.0) c0 = c0 / sx;
+    if (sy != 0.0) c1 = c1 / sy;
+    if (sz != 0.0) c2 = c2 / sz;
+    // rows of the rotation: r[row][col] with columns c0, c1, c2
+    float m00 = c0.x;
+    float m10 = c0.y;
+    float m20 = c0.z;
+    float m01 = c1.x;
+    float m11 = c1.y;
+    float m21 = c1.z;
+    float m02 = c2.x;
+    float m12 = c2.y;
+    float m22 = c2.z;
+    float tr = m00 + m11 + m22;
+    Quat q;
+    if (tr > 0.0) {
+        float k = (float)sqrt((double)(tr + 1.0)) * 2.0;
+        q = Quat{(m21 - m12) / k, (m02 - m20) / k, (m10 - m01) / k, 0.25 * k};
+    } else if (m00 > m11 && m00 > m22) {
+        float k = (float)sqrt((double)(1.0 + m00 - m11 - m22)) * 2.0;
+        q = Quat{0.25 * k, (m01 + m10) / k, (m02 + m20) / k, (m21 - m12) / k};
+    } else if (m11 > m22) {
+        float k = (float)sqrt((double)(1.0 + m11 - m00 - m22)) * 2.0;
+        q = Quat{(m01 + m10) / k, 0.25 * k, (m12 + m21) / k, (m02 - m20) / k};
+    } else {
+        float k = (float)sqrt((double)(1.0 + m22 - m00 - m11)) * 2.0;
+        q = Quat{(m02 + m20) / k, (m12 + m21) / k, 0.25 * k, (m10 - m01) / k};
+    }
+    *r = q.normalize();
+}
+
+// The animation called name (made when there is none).
+int _vrx_animation(*_Vrx v, *String name) {
+    for (i in 0..v.g.animations.size) {
+        if (strcmp(v.g.animations.data[i].name.data, name.data) == 0) return i;
+    }
+    GltfAnimation a;
+    String_append(&a.name, name.data);
+    List_push(&v.g.animations, a);
+    return v.g.animations.size - 1;
+}
+
+// Adds a linear channel driving path of node with count keys.
+void _vrx_channel(*_Vrx v, int anim, int node, int path, *float times, *float values, int count, int width) {
+    *GltfAnimation a = &v.g.animations.data[anim];
+    GltfAnimSampler s = GltfAnimSampler{count: (uint32)count, width: width, interpolation: GLTF_LINEAR, value_count: (uint32)count};
+    s.times = alloc<float>((int64)count + 1);
+    s.values = alloc<float>((int64)count * (int64)width + 1);
+    memcpy(s.times, times, (int64)count * 4);
+    memcpy(s.values, values, (int64)count * (int64)width * 4);
+    List_push(&a.samplers, s);
+    List_push(&a.channels, GltfAnimChannel{node: node, path: path, sampler: a.samplers.size - 1, material: -1, slot: 0});
+    if (count > 0 && times[count - 1] > a.duration) a.duration = times[count - 1];
+}
+
+// The animation's name, or prefix and its index when it has none.
+void _vrx_anim_name(*String name, string prefix, int i) {
+    if (name.len > 0) return;
+    String_append(name, prefix);
+    String_appendf(name, "%d", i);
+}
+
+// A keyframe animation of node.
+void _vrx_keyframes(*_Vrx v, _Pb b, int node, int index) {
+    String name;
+    defer String_free(&name);
+    float duration = 0.0;
+    List<float> times;
+    defer List_free(&times);
+    List<float> tv;
+    defer List_free(&tv);
+    List<float> rv;
+    defer List_free(&rv);
+    List<float> sv;
+    defer List_free(&sv);
+    bool ht = false;
+    bool hr = false;
+    bool hs = false;
+    int f = 0;
+    int w = 0;
+    List<_Pb> frames;
+    defer List_free(&frames);
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 1) _pb_string(&b, w, &name);
+        else if (f == 2 && w == 2) List_push(&frames, _pb_bytes(&b));
+        else if (f == 3) duration = _pb_float(&b, w);
+        else _pb_skip(&b, w);
+    }
+    for (k in 0..frames.size) {
+        _Pb fr = frames.data[k];
+        float time = 0.0;
+        List<float> t;
+        List<float> r;
+        List<float> s;
+        while (_pb_next(&fr, &f, &w)) {
+            if (f == 1) time = _pb_float(&fr, w);
+            else if (f == 2) _pb_floats(&fr, w, &t);
+            else if (f == 3) _pb_floats(&fr, w, &r);
+            else if (f == 4) _pb_floats(&fr, w, &s);
+            else _pb_skip(&fr, w);
+        }
+        List_push(&times, time * duration / 1000.0);
+        if (t.size >= 3) ht = true;
+        if (r.size >= 4) hr = true;
+        if (s.size >= 3) hs = true;
+        for (c in 0..3) List_push(&tv, c < t.size ? t.data[c] : 0.0);
+        Quat q = r.size >= 4 ? Quat{r.data[0], r.data[1], r.data[2], r.data[3]} : quat_identity();
+        if (k > 0) {
+            int at = (k - 1) * 4;
+            if (q.x * rv.data[at] + q.y * rv.data[at + 1] + q.z * rv.data[at + 2] + q.w * rv.data[at + 3] < 0.0) {
+                q = Quat{-q.x, -q.y, -q.z, -q.w};
+            }
+        }
+        List_push(&rv, q.x);
+        List_push(&rv, q.y);
+        List_push(&rv, q.z);
+        List_push(&rv, q.w);
+        for (c in 0..3) List_push(&sv, c < s.size ? s.data[c] : 1.0);
+        List_free(&t);
+        List_free(&r);
+        List_free(&s);
+    }
+    if (frames.size == 0 || !(ht || hr || hs)) return;
+    _vrx_anim_name(&name, "fbx_kf_animation_", index);
+    int a = _vrx_animation(v, &name);
+    if (ht) _vrx_channel(v, a, node, GLTF_TRANSLATION, times.data, tv.data, frames.size, 3);
+    if (hr) _vrx_channel(v, a, node, GLTF_ROTATION, times.data, rv.data, frames.size, 4);
+    if (hs) _vrx_channel(v, a, node, GLTF_SCALE, times.data, sv.data, frames.size, 3);
+}
+
+// The bones' local transforms from their model-space ones.
+void _vrx_locals(*_Vrx v, *Mat4 model, *Mat4 local) {
+    for (j in 0..v.bones.size) {
+        int p = v.bones.data[j].parent;
+        local[j] = p >= 0 && p < v.bones.size ? model[p].inverse() * model[j] : model[j];
+    }
+}
+
+// Applies a skeletal animation frame to model (the bones' model-space transforms): a
+// legacy frame (no local transforms) holds T with Viro's skin matrix inverse(bind) T bind,
+// a newer one the bone's model-space transform.
+void _vrx_frame(*_Vrx v, _Pb fr, *Mat4 bind, *Mat4 model, *float time) {
+    List<int> idx;
+    defer List_free(&idx);
+    List<Mat4> mats;
+    defer List_free(&mats);
+    bool local = false;
+    int f = 0;
+    int w = 0;
+    *time = 0.0;
+    while (_pb_next(&fr, &f, &w)) {
+        if (f == 1) *time = _pb_float(&fr, w);
+        else if (f == 2) _pb_ints(&fr, w, &idx);
+        else if (f == 3 && w == 2) {
+            Mat4 m = mat4_identity();
+            _vrx_matrix(_pb_bytes(&fr), &m);
+            List_push(&mats, m);
+        } else if (f == 4) {
+            local = true;
+            _pb_skip(&fr, w);
+        } else _pb_skip(&fr, w);
+    }
+    for (i in 0..idx.size) {
+        int j = idx.data[i];
+        if (j < 0 || j >= v.bones.size || i >= mats.size) continue;
+        model[j] = local ? mats.data[i] : bind[j].inverse() * mats.data[i];
+    }
+}
+
+// A skeletal animation over the joints joint0.. (one per bone).
+void _vrx_skeletal(*_Vrx v, _Pb b, int joint0, *Mat4 bind, *Mat4 rest, int index) {
+    String name;
+    defer String_free(&name);
+    float duration = 0.0;
+    List<_Pb> frames;
+    defer List_free(&frames);
+    int f = 0;
+    int w = 0;
+    while (_pb_next(&b, &f, &w)) {
+        if (f == 1) _pb_string(&b, w, &name);
+        else if (f == 2 && w == 2) List_push(&frames, _pb_bytes(&b));
+        else if (f == 3) duration = _pb_float(&b, w);
+        else _pb_skip(&b, w);
+    }
+    int nb = v.bones.size;
+    int nf = frames.size;
+    // keys for every bone at every frame: a file asking for more than 64M is not a model
+    if (nf == 0 || nb == 0 || (int64)nb * (int64)nf > 67108864) return;
+    *Mat4 model = alloc<Mat4>((int64)nb);
+    *Mat4 local = alloc<Mat4>((int64)nb);
+    *bool moved = alloc<bool>((int64)nb);
+    *float times = alloc<float>((int64)nf);
+    *float tv = alloc<float>((int64)nb * (int64)nf * 3);
+    *float rv = alloc<float>((int64)nb * (int64)nf * 4);
+    *float sv = alloc<float>((int64)nb * (int64)nf * 3);
+    for (j in 0..nb) model[j] = rest[j];
+    for (k in 0..nf) {
+        float t = 0.0;
+        _vrx_frame(v, frames.data[k], bind, model, &t);
+        times[k] = t * duration / 1000.0;
+        _vrx_locals(v, model, local);
+        for (j in 0..nb) {
+            Vec3 tr = Vec3{0.0, 0.0, 0.0};
+            Quat q = quat_identity();
+            Vec3 sc = Vec3{1.0, 1.0, 1.0};
+            _vrx_decompose(local[j], &tr, &q, &sc);
+            int64 at = (int64)j * (int64)nf + (int64)k;
+            if (k > 0) {
+                *float pq = rv + (at - 1) * 4;
+                if (q.x * pq[0] + q.y * pq[1] + q.z * pq[2] + q.w * pq[3] < 0.0) q = Quat{-q.x, -q.y, -q.z, -q.w};
+                *float pt = tv + (at - 1) * 3;
+                *float ps = sv + (at - 1) * 3;
+                if (fabsf(pt[0] - tr.x) + fabsf(pt[1] - tr.y) + fabsf(pt[2] - tr.z) > 1e-6
+                    || fabsf(pq[0] - q.x) + fabsf(pq[1] - q.y) + fabsf(pq[2] - q.z) + fabsf(pq[3] - q.w) > 1e-6
+                    || fabsf(ps[0] - sc.x) + fabsf(ps[1] - sc.y) + fabsf(ps[2] - sc.z) > 1e-6) {
+                    moved[j] = true;
+                }
+            }
+            tv[at * 3] = tr.x;
+            tv[at * 3 + 1] = tr.y;
+            tv[at * 3 + 2] = tr.z;
+            rv[at * 4] = q.x;
+            rv[at * 4 + 1] = q.y;
+            rv[at * 4 + 2] = q.z;
+            rv[at * 4 + 3] = q.w;
+            sv[at * 3] = sc.x;
+            sv[at * 3 + 1] = sc.y;
+            sv[at * 3 + 2] = sc.z;
+        }
+    }
+    _vrx_anim_name(&name, "fbx_skel_animation_", index);
+    int a = _vrx_animation(v, &name);
+    for (j in 0..nb) {
+        // a bone that holds still keeps one key, so the animation still poses it
+        int n = moved[j] ? nf : 1;
+        int64 at = (int64)j * (int64)nf;
+        _vrx_channel(v, a, joint0 + j, GLTF_TRANSLATION, times, tv + at * 3, n, 3);
+        _vrx_channel(v, a, joint0 + j, GLTF_ROTATION, times, rv + at * 4, n, 4);
+        _vrx_channel(v, a, joint0 + j, GLTF_SCALE, times, sv + at * 3, n, 3);
+    }
+    free(model);
+    free(local);
+    free(moved);
+    free(times);
+    free(tv);
+    free(rv);
+    free(sv);
+}
+
+bool _vrx_same_bytes(_Pb a, _Pb b) {
+    int64 n = a.end - a.p;
+    return n == b.end - b.p && (n == 0 || memcmp(a.p, b.p, n) == 0);
+}

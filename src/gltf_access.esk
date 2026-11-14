@@ -1,0 +1,661 @@
+// gltf_access.esk: accessors, primitives and materials (part of gltf.esk, which imports it in order after the ones before it)
+
+int _gltf_csize(int ctype) {
+    if (ctype == 5120 || ctype == 5121) return 1;
+    if (ctype == 5122 || ctype == 5123) return 2;
+    if (ctype == 5125 || ctype == 5126) return 4;
+    return 0;
+}
+
+string _gltf_read_accessors(*Gltf g, *JsonValue root) {
+    *JsonValue arr = _gj_arr(root, "accessors");
+    if (arr == null) return null;
+    for (*JsonValue a = arr.child; a != null; a = a.next) {
+        _GltfAccessor acc;
+        acc.view = _gj_int(a, "bufferView", -1);
+        acc.offset = (uint64)_gj_num(a, "byteOffset", 0.0);
+        acc.ctype = _gj_int(a, "componentType", 0);
+        double count = _gj_num(a, "count", 0.0);
+        acc.ncomp = _gltf_ncomp(_gj_str(a, "type"));
+        acc.normalized = _gj_bool(a, "normalized", false);
+        if (_gltf_csize(acc.ctype) == 0 || acc.ncomp == 0) return _gltf_fail("an accessor has an unknown type", null);
+        if (count < 0.0 || count > 268435456.0) return _gltf_fail("an accessor's count is out of range", null);
+        acc.count = (uint32)count;
+        if (acc.view >= g._views.size) return _gltf_fail("an accessor names a missing buffer view", null);
+        if (acc.ncomp <= 3) {
+            int nmin = _gj_floats(a, "min", &acc.min[0], 3);
+            int nmax = _gj_floats(a, "max", &acc.max[0], 3);
+            acc.has_minmax = nmin == acc.ncomp && nmax == acc.ncomp;
+        }
+        if (acc.view >= 0) {
+            _GltfView* v = &g._views.data[acc.view];
+            uint64 esize = (uint64)_gltf_csize(acc.ctype) * acc.ncomp;
+            uint64 stride = v.stride != 0 ? (uint64)v.stride : esize;
+            if (acc.count > 0) {
+                uint64 need = acc.offset + (uint64)(acc.count - 1) * stride + esize;
+                if (acc.offset > v.length || need > v.length) return _gltf_fail("an accessor reads past its buffer view", null);
+            }
+        }
+        *JsonValue sp = _gj(a, "sparse");
+        if (sp != null) {
+            *JsonValue si = _gj(sp, "indices");
+            *JsonValue sv = _gj(sp, "values");
+            double sc = _gj_num(sp, "count", 0.0);
+            if (si == null || sv == null || sc < 0.0 || sc > (double)acc.count) return _gltf_fail("a sparse accessor is not valid", null);
+            acc.sparse_count = (uint32)sc;
+            acc.sparse_index_view = _gj_int(si, "bufferView", -1);
+            acc.sparse_index_offset = (uint64)_gj_num(si, "byteOffset", 0.0);
+            acc.sparse_index_ctype = _gj_int(si, "componentType", 0);
+            acc.sparse_value_view = _gj_int(sv, "bufferView", -1);
+            acc.sparse_value_offset = (uint64)_gj_num(sv, "byteOffset", 0.0);
+            int isz = _gltf_csize(acc.sparse_index_ctype);
+            if (acc.sparse_index_view < 0 || acc.sparse_index_view >= g._views.size || acc.sparse_value_view < 0
+                || acc.sparse_value_view >= g._views.size || isz == 0 || acc.sparse_index_ctype == 5126) {
+                return _gltf_fail("a sparse accessor is not valid", null);
+            }
+            uint64 ineed = acc.sparse_index_offset + (uint64)acc.sparse_count * isz;
+            uint64 vneed = acc.sparse_value_offset + (uint64)acc.sparse_count * _gltf_csize(acc.ctype) * acc.ncomp;
+            if (ineed > g._views.data[acc.sparse_index_view].length || vneed > g._views.data[acc.sparse_value_view].length) {
+                return _gltf_fail("a sparse accessor reads past its buffer view", null);
+            }
+        }
+        List_push(&g._accessors, acc);
+    }
+    return null;
+}
+
+*uint8 _gltf_view_ptr(*Gltf g, int view) {
+    _GltfView* v = &g._views.data[view];
+    return g._buffers.data[v.buffer].data + v.offset;
+}
+
+float _gltf_comp(*uint8 p, int ctype, bool normalized) {
+    if (ctype == 5126) {
+        float f = 0.0;
+        memcpy(&f, p, 4);
+        return f;
+    }
+    if (ctype == 5121) return normalized ? (float)p[0] / 255.0 : (float)p[0];
+    if (ctype == 5120) {
+        float v = (float)(int8)p[0];
+        if (!normalized) return v;
+        return v / 127.0 < -1.0 ? -1.0 : v / 127.0;
+    }
+    if (ctype == 5123) {
+        float v = (float)((uint32)p[0] | (uint32)p[1] << 8);
+        return normalized ? v / 65535.0 : v;
+    }
+    if (ctype == 5122) {
+        float v = (float)(int16)((uint32)p[0] | (uint32)p[1] << 8);
+        if (!normalized) return v;
+        return v / 32767.0 < -1.0 ? -1.0 : v / 32767.0;
+    }
+    return (float)_gltf_u32(p);
+}
+
+uint32 _gltf_uint(*uint8 p, int ctype) {
+    if (ctype == 5121) return (uint32)p[0];
+    if (ctype == 5123) return (uint32)p[0] | (uint32)p[1] << 8;
+    if (ctype == 5125) return _gltf_u32(p);
+    return 0;
+}
+
+// The accessor as count * width floats (width may differ from its component
+// count: missing components are 0, extra ones dropped), or null on a bad index.
+*float _gltf_floats(*Gltf g, int index, int width) {
+    if (index < 0 || index >= g._accessors.size) return null;
+    _GltfAccessor* a = &g._accessors.data[index];
+    *float out = alloc<float>((int64)a.count * width + 1);
+    int n = a.ncomp < width ? a.ncomp : width;
+    int csize = _gltf_csize(a.ctype);
+    if (a.view >= 0) {
+        uint64 esize = (uint64)csize * a.ncomp;
+        uint64 stride = g._views.data[a.view].stride != 0 ? (uint64)g._views.data[a.view].stride : esize;
+        *uint8 base = _gltf_view_ptr(g, a.view) + a.offset;
+        for (i in 0..a.count) {
+            *uint8 e = base + (uint64)i * stride;
+            for (k in 0..n) out[(int64)i * width + k] = _gltf_comp(e + k * csize, a.ctype, a.normalized);
+        }
+    }
+    if (a.sparse_count > 0) {
+        *uint8 ip = _gltf_view_ptr(g, a.sparse_index_view) + a.sparse_index_offset;
+        *uint8 vp = _gltf_view_ptr(g, a.sparse_value_view) + a.sparse_value_offset;
+        int isz = _gltf_csize(a.sparse_index_ctype);
+        for (s in 0..a.sparse_count) {
+            uint32 at = _gltf_uint(ip + (uint64)s * isz, a.sparse_index_ctype);
+            if (at >= a.count) continue;
+            *uint8 e = vp + (uint64)s * csize * a.ncomp;
+            for (k in 0..n) out[(int64)at * width + k] = _gltf_comp(e + k * csize, a.ctype, a.normalized);
+        }
+    }
+    return out;
+}
+
+// The accessor's integer components as count * width uint32 values.
+*uint32 _gltf_uints(*Gltf g, int index, int width) {
+    if (index < 0 || index >= g._accessors.size) return null;
+    _GltfAccessor* a = &g._accessors.data[index];
+    if (a.ctype == 5126 || a.ctype == 5120 || a.ctype == 5122) return null;
+    *uint32 out = alloc<uint32>((int64)a.count * width + 1);
+    int n = a.ncomp < width ? a.ncomp : width;
+    int csize = _gltf_csize(a.ctype);
+    if (a.view >= 0) {
+        uint64 esize = (uint64)csize * a.ncomp;
+        uint64 stride = g._views.data[a.view].stride != 0 ? (uint64)g._views.data[a.view].stride : esize;
+        *uint8 base = _gltf_view_ptr(g, a.view) + a.offset;
+        for (i in 0..a.count) {
+            *uint8 e = base + (uint64)i * stride;
+            for (k in 0..n) out[(int64)i * width + k] = _gltf_uint(e + k * csize, a.ctype);
+        }
+    }
+    if (a.sparse_count > 0) {
+        *uint8 ip = _gltf_view_ptr(g, a.sparse_index_view) + a.sparse_index_offset;
+        *uint8 vp = _gltf_view_ptr(g, a.sparse_value_view) + a.sparse_value_offset;
+        int isz = _gltf_csize(a.sparse_index_ctype);
+        for (s in 0..a.sparse_count) {
+            uint32 at = _gltf_uint(ip + (uint64)s * isz, a.sparse_index_ctype);
+            if (at >= a.count) continue;
+            *uint8 e = vp + (uint64)s * csize * a.ncomp;
+            for (k in 0..n) out[(int64)at * width + k] = _gltf_uint(e + k * csize, a.ctype);
+        }
+    }
+    return out;
+}
+
+uint32 _gltf_count(*Gltf g, int index) {
+    if (index < 0 || index >= g._accessors.size) return 0;
+    return g._accessors.data[index].count;
+}
+
+// Turns strip (5) and fan (6) indices into a triangle list.
+void _gltf_to_list(*GltfPrimitive p, int mode) {
+    uint32 n = p.index_count;
+    if (n < 3) {
+        p.index_count = 0;
+        p.mode = GLTF_TRIANGLES;
+        return;
+    }
+    *uint32 out = alloc<uint32>((int64)(n - 2) * 3);
+    for (i in 0..n - 2) {
+        uint32 a = p.indices[0];
+        uint32 b = p.indices[i + 1];
+        uint32 c = p.indices[i + 2];
+        if (mode == 5) {
+            a = p.indices[i];
+            if (i % 2 == 1) {
+                b = p.indices[i + 2];
+                c = p.indices[i + 1];
+            }
+        }
+        out[(int64)i * 3] = a;
+        out[(int64)i * 3 + 1] = b;
+        out[(int64)i * 3 + 2] = c;
+    }
+    free(p.indices);
+    p.indices = out;
+    p.index_count = (n - 2) * 3;
+    p.mode = GLTF_TRIANGLES;
+}
+
+string _gltf_read_meshes(*Gltf g, *JsonValue root) {
+    *JsonValue arr = _gj_arr(root, "meshes");
+    if (arr == null) return null;
+    for (*JsonValue m = arr.child; m != null; m = m.next) {
+        GltfMesh mesh;
+        _gj_name(m, &mesh.name);
+        List_push(&g.meshes, mesh);
+        GltfMesh* gm = &g.meshes.data[g.meshes.size - 1];
+        *JsonValue prims = _gj_arr(m, "primitives");
+        if (prims == null) continue;
+        for (*JsonValue pj = prims.child; pj != null; pj = pj.next) {
+            *JsonValue ext = _gj(pj, "extensions");
+            if (_gj(ext, "KHR_draco_mesh_compression") != null && _gj(_gj(pj, "attributes"), "POSITION") == null) {
+                return _gltf_fail("Draco compression is not supported", null);
+            }
+            GltfPrimitive p;
+            p.mode = _gj_int(pj, "mode", 4);
+            p.material = _gj_int(pj, "material", -1);
+            if (p.material >= g.materials.size) p.material = -1;
+            *JsonValue at = _gj(pj, "attributes");
+            int pos = _gj_int(at, "POSITION", -1);
+            if (pos < 0 || pos >= g._accessors.size) return _gltf_fail("a primitive has no POSITION", null);
+            p.vertex_count = _gltf_count(g, pos);
+            p.positions = _gltf_floats(g, pos, 3);
+            _GltfAccessor* pa = &g._accessors.data[pos];
+            if (pa.has_minmax) {
+                p.min = Vec3{pa.min[0], pa.min[1], pa.min[2]};
+                p.max = Vec3{pa.max[0], pa.max[1], pa.max[2]};
+            } else if (p.vertex_count > 0) {
+                p.min = Vec3{p.positions[0], p.positions[1], p.positions[2]};
+                p.max = p.min;
+                for (i in 0..p.vertex_count) {
+                    Vec3 v = Vec3{p.positions[i * 3], p.positions[i * 3 + 1], p.positions[i * 3 + 2]};
+                    p.min = Vec3{v.x < p.min.x ? v.x : p.min.x, v.y < p.min.y ? v.y : p.min.y, v.z < p.min.z ? v.z : p.min.z};
+                    p.max = Vec3{v.x > p.max.x ? v.x : p.max.x, v.y > p.max.y ? v.y : p.max.y, v.z > p.max.z ? v.z : p.max.z};
+                }
+            }
+            int[8] attrs;
+            string[8] names = {"NORMAL", "TEXCOORD_0", "TEXCOORD_1", "TANGENT", "COLOR_0", "WEIGHTS_0", "JOINTS_0", ""};
+            for (k in 0..7) {
+                int ai = _gj_int(at, names[k], -1);
+                if (ai >= 0 && (ai >= g._accessors.size || _gltf_count(g, ai) != p.vertex_count)) {
+                    return _gltf_fail("an attribute's count differs from POSITION's: ", names[k]);
+                }
+                attrs[k] = ai;
+            }
+            if (attrs[0] >= 0) p.normals = _gltf_floats(g, attrs[0], 3);
+            if (attrs[1] >= 0) p.uvs = _gltf_floats(g, attrs[1], 2);
+            if (attrs[2] >= 0) p.uvs1 = _gltf_floats(g, attrs[2], 2);
+            if (attrs[3] >= 0) p.tangents = _gltf_floats(g, attrs[3], 4);
+            if (attrs[4] >= 0) {
+                p.colors = _gltf_floats(g, attrs[4], 4);
+                if (g._accessors.data[attrs[4]].ncomp == 3) {
+                    for (i in 0..p.vertex_count) p.colors[i * 4 + 3] = 1.0;
+                }
+            }
+            if (attrs[5] >= 0) p.weights = _gltf_floats(g, attrs[5], 4);
+            if (attrs[6] >= 0) {
+                p.joints = _gltf_uints(g, attrs[6], 4);
+                if (p.joints == null) return _gltf_fail("JOINTS_0 must be unsigned integers", null);
+            }
+            int ii = _gj_int(pj, "indices", -1);
+            if (ii >= 0) {
+                p.indices = _gltf_uints(g, ii, 1);
+                if (p.indices == null) return _gltf_fail("indices must be unsigned integers", null);
+                p.index_count = _gltf_count(g, ii);
+                for (i in 0..p.index_count) {
+                    if (p.indices[i] >= p.vertex_count) return _gltf_fail("an index is out of range", null);
+                }
+            } else {
+                p.index_count = p.vertex_count;
+                p.indices = alloc<uint32>((int64)p.vertex_count + 1);
+                for (i in 0..p.vertex_count) p.indices[i] = i;
+            }
+            string terr = _gltf_read_targets(g, pj, &p);
+            if (terr != null) {
+                List_push(&gm.primitives, p);
+                return terr;
+            }
+            if (p.target_count > gm.weights.size) List_resize(&gm.weights, p.target_count);
+            if (p.mode == 5 || p.mode == 6) _gltf_to_list(&p, p.mode);
+            List_push(&gm.primitives, p);
+        }
+        *JsonValue wj = _gj_arr(m, "weights");
+        if (wj != null) {
+            int k = 0;
+            for (*JsonValue c = wj.child; c != null; c = c.next) {
+                if (k >= gm.weights.size) List_resize(&gm.weights, k + 1);
+                if (c.kind == JNumber) gm.weights.data[k] = (float)c.num;
+                k++;
+            }
+        }
+    }
+    return null;
+}
+
+// Reads a primitive's morph targets: each one's POSITION, NORMAL and TANGENT
+// deltas (three floats per vertex).
+string _gltf_read_targets(*Gltf g, *JsonValue pj, *GltfPrimitive p) {
+    *JsonValue targets = _gj_arr(pj, "targets");
+    if (targets == null) return null;
+    int n = 0;
+    for (*JsonValue t = targets.child; t != null; t = t.next) n++;
+    if (n == 0) return null;
+    string[3] names = {"POSITION", "NORMAL", "TANGENT"};
+    int64 per = (int64)p.vertex_count * 3;
+    p.target_count = n;
+    int ti = 0;
+    for (*JsonValue t = targets.child; t != null; t = t.next) {
+        for (k in 0..3) {
+            int ai = _gj_int(t, names[k], -1);
+            if (ai < 0) continue;
+            if (ai >= g._accessors.size || _gltf_count(g, ai) != p.vertex_count) {
+                return _gltf_fail("a morph target's count differs from POSITION's: ", names[k]);
+            }
+            *float* dst = &p.target_positions;
+            if (k == 1) dst = &p.target_normals;
+            if (k == 2) dst = &p.target_tangents;
+            if (*dst == null) *dst = alloc<float>(per * n + 1);
+            *float src = _gltf_floats(g, ai, 3);
+            if (src == null) continue;
+            memcpy(*dst + per * ti, src, per * 4);
+            free(src);
+        }
+        ti++;
+    }
+    return null;
+}
+
+void _gltf_texref(*JsonValue obj, string key, GltfTextureRef* out, int ntex) {
+    *out = GltfTextureRef{-1, 0, 1.0};
+    *JsonValue t = _gj(obj, key);
+    if (t == null) return;
+    int i = _gj_int(t, "index", -1);
+    if (i < 0 || i >= ntex) return;
+    out.texture = i;
+    out.texcoord = _gj_int(t, "texCoord", 0);
+    out.scale = (float)_gj_num(t, "scale", _gj_num(t, "strength", 1.0));
+    *JsonValue tt = _gj(_gj(t, "extensions"), "KHR_texture_transform");
+    if (tt == null) return;
+    out.has_transform = true;
+    out.tscale = Vec2{1.0, 1.0};
+    *JsonValue off = _gj_arr(tt, "offset");
+    if (off != null && off.child != null && off.child.next != null) {
+        out.offset = Vec2{(float)_gj_numv(off.child, 0.0), (float)_gj_numv(off.child.next, 0.0)};
+    }
+    *JsonValue sc = _gj_arr(tt, "scale");
+    if (sc != null && sc.child != null && sc.child.next != null) {
+        out.tscale = Vec2{(float)_gj_numv(sc.child, 1.0), (float)_gj_numv(sc.child.next, 1.0)};
+    }
+    out.rotation = (float)_gj_num(tt, "rotation", 0.0);
+    out.texcoord = _gj_int(tt, "texCoord", out.texcoord);
+}
+
+void _gltf_read_materials(*Gltf g, *JsonValue root, int ntex) {
+    *JsonValue arr = _gj_arr(root, "materials");
+    if (arr == null) return;
+    for (*JsonValue m = arr.child; m != null; m = m.next) {
+        GltfMaterial mat;
+        _gj_name(m, &mat.name);
+        *JsonValue pbr = _gj(m, "pbrMetallicRoughness");
+        float[4] bc = {1.0, 1.0, 1.0, 1.0};
+        _gj_floats(pbr, "baseColorFactor", &bc[0], 4);
+        mat.base_color = Vec4{bc[0], bc[1], bc[2], bc[3]};
+        mat.metallic = (float)_gj_num(pbr, "metallicFactor", 1.0);
+        mat.roughness = (float)_gj_num(pbr, "roughnessFactor", 1.0);
+        _gltf_texref(pbr, "baseColorTexture", &mat.base_color_texture, ntex);
+        _gltf_texref(pbr, "metallicRoughnessTexture", &mat.metallic_roughness_texture, ntex);
+        _gltf_texref(m, "normalTexture", &mat.normal_texture, ntex);
+        _gltf_texref(m, "occlusionTexture", &mat.occlusion_texture, ntex);
+        _gltf_texref(m, "emissiveTexture", &mat.emissive_texture, ntex);
+        float[3] em = {0.0, 0.0, 0.0};
+        _gj_floats(m, "emissiveFactor", &em[0], 3);
+        float strength = (float)_gj_num(_gj(_gj(m, "extensions"), "KHR_materials_emissive_strength"), "emissiveStrength", 1.0);
+        mat.emissive = Vec3{em[0] * strength, em[1] * strength, em[2] * strength};
+        mat.emissive_strength = strength;
+        string mode = _gj_str(m, "alphaMode");
+        mat.alpha_mode = GLTF_OPAQUE;
+        if (mode != null && strcmp(mode, "MASK") == 0) mat.alpha_mode = GLTF_MASK;
+        if (mode != null && strcmp(mode, "BLEND") == 0) mat.alpha_mode = GLTF_BLEND;
+        mat.alpha_cutoff = (float)_gj_num(m, "alphaCutoff", 0.5);
+        mat.double_sided = _gj_bool(m, "doubleSided", false);
+        mat.unlit = _gj(_gj(m, "extensions"), "KHR_materials_unlit") != null;
+        List_push(&g.materials, mat);
+    }
+}
+
+string _gltf_read_images(*Gltf g, *JsonValue root, string base_dir) {
+    *JsonValue arr = _gj_arr(root, "images");
+    if (arr == null) return null;
+    for (*JsonValue im = arr.child; im != null; im = im.next) {
+        GltfImage img;
+        _gj_name(im, &img.name);
+        string mime = _gj_str(im, "mimeType");
+        if (mime != null) String_append(&img.mime, mime);
+        string uri = _gj_str(im, "uri");
+        int view = _gj_int(im, "bufferView", -1);
+        if (view >= 0) {
+            if (view >= g._views.size) return _gltf_fail("an image names a missing buffer view", null);
+            img.data = _gltf_view_ptr(g, view);
+            img.len = g._views.data[view].length;
+        } else if (uri != null && strncmp(uri, "data:", 5) == 0) {
+            img.data = _gltf_data_uri(uri, &img.len);
+            img.owned = img.data != null;
+            if (mime == null && strncmp(uri, "data:image/", 11) == 0) {
+                *char semi = strchr(uri, ';');
+                if (semi != null) {
+                    for (*char c = (*char)uri + 5; c < semi; c = c + 1) String_appendf(&img.mime, "%c", *c);
+                }
+            }
+        } else if (uri != null) {
+            img.data = _gltf_read_uri(base_dir, uri, &img.len);
+            img.owned = img.data != null;
+        }
+        List_push(&g.images, img);
+    }
+    return null;
+}
+
+void _gltf_read_textures(*Gltf g, *JsonValue root) {
+    *JsonValue sarr = _gj_arr(root, "samplers");
+    if (sarr != null) {
+        for (*JsonValue s = sarr.child; s != null; s = s.next) {
+            List_push(&g.samplers, GltfSampler{_gj_int(s, "magFilter", 0), _gj_int(s, "minFilter", 0),
+                _gj_int(s, "wrapS", 10497), _gj_int(s, "wrapT", 10497)});
+        }
+    }
+    *JsonValue arr = _gj_arr(root, "textures");
+    if (arr == null) return;
+    for (*JsonValue t = arr.child; t != null; t = t.next) {
+        int src = _gj_int(t, "source", -1);
+        *JsonValue ext = _gj(t, "extensions");
+        if (src < 0) src = _gj_int(_gj(ext, "KHR_texture_basisu"), "source", -1);
+        if (src < 0) src = _gj_int(_gj(ext, "EXT_texture_webp"), "source", -1);
+        int smp = _gj_int(t, "sampler", -1);
+        if (src >= g.images.size) src = -1;
+        if (smp >= g.samplers.size) smp = -1;
+        List_push(&g.textures, GltfTexture{src, smp});
+    }
+}
+
+string _gltf_read_nodes(*Gltf g, *JsonValue root) {
+    *JsonValue arr = _gj_arr(root, "nodes");
+    if (arr == null) return null;
+    for (*JsonValue n = arr.child; n != null; n = n.next) {
+        GltfNode node;
+        _gj_name(n, &node.name);
+        node.mesh = _gj_int(n, "mesh", -1);
+        if (node.mesh >= g.meshes.size) node.mesh = -1;
+        node.skin = _gj_int(n, "skin", -1);
+        node.parent = -1;
+        float[4] t = {0.0, 0.0, 0.0, 0.0};
+        float[4] r = {0.0, 0.0, 0.0, 1.0};
+        float[4] s = {1.0, 1.0, 1.0, 0.0};
+        _gj_floats(n, "translation", &t[0], 3);
+        _gj_floats(n, "rotation", &r[0], 4);
+        _gj_floats(n, "scale", &s[0], 3);
+        node.translation = Vec3{t[0], t[1], t[2]};
+        node.rotation = Quat{r[0], r[1], r[2], r[3]};
+        node.scale = Vec3{s[0], s[1], s[2]};
+        if (_gj_floats(n, "matrix", &node.matrix.m[0], 16) == 16) node.has_matrix = true;
+        node.hidden = !_gj_bool(_gj(_gj(n, "extensions"), "KHR_node_visibility"), "visible", true);
+        if (node.mesh >= 0) {
+            List<float>* mw = &g.meshes.data[node.mesh].weights;
+            List_resize(&node.weights, mw.size);
+            for (k in 0..mw.size) node.weights.data[k] = mw.data[k];
+            *JsonValue wj = _gj_arr(n, "weights");
+            if (wj != null) {
+                int k = 0;
+                for (*JsonValue c = wj.child; c != null && k < node.weights.size; c = c.next) {
+                    if (c.kind == JNumber) node.weights.data[k] = (float)c.num;
+                    k++;
+                }
+            }
+        }
+        *JsonValue ch = _gj_arr(n, "children");
+        if (ch != null) {
+            for (*JsonValue c = ch.child; c != null; c = c.next) {
+                if (c.kind == JNumber) List_push(&node.children, (int)c.num);
+            }
+        }
+        List_push(&g.nodes, node);
+    }
+    for (i in 0..g.nodes.size) {
+        GltfNode* node = &g.nodes.data[i];
+        if (node.skin >= 0 && node.skin >= _gltf_count_array(root, "skins")) node.skin = -1;
+        for (k in 0..node.children.size) {
+            int c = node.children.data[k];
+            if (c < 0 || c >= g.nodes.size || c == i || g.nodes.data[c].parent >= 0) {
+                return _gltf_fail("the node hierarchy is not a tree", null);
+            }
+            g.nodes.data[c].parent = i;
+        }
+    }
+    int scene = _gj_int(root, "scene", 0);
+    *JsonValue scenes = _gj_arr(root, "scenes");
+    *JsonValue sc = null;
+    if (scenes != null) {
+        int k = 0;
+        for (*JsonValue s = scenes.child; s != null; s = s.next) {
+            if (k == scene) sc = s;
+            k++;
+        }
+    }
+    *JsonValue roots = _gj_arr(sc, "nodes");
+    if (roots != null) {
+        for (*JsonValue c = roots.child; c != null; c = c.next) {
+            int ri = c.kind == JNumber ? (int)c.num : -1;
+            if (ri >= 0 && ri < g.nodes.size && g.nodes.data[ri].parent < 0) List_push(&g.roots, ri);
+        }
+    } else {
+        for (i in 0..g.nodes.size) {
+            if (g.nodes.data[i].parent < 0) List_push(&g.roots, i);
+        }
+    }
+    return null;
+}
+
+int _gltf_count_array(*JsonValue root, string key) {
+    *JsonValue a = _gj_arr(root, key);
+    if (a == null) return 0;
+    return JsonValue_len(a);
+}
+
+string _gltf_read_skins(*Gltf g, *JsonValue root) {
+    *JsonValue arr = _gj_arr(root, "skins");
+    if (arr == null) return null;
+    for (*JsonValue s = arr.child; s != null; s = s.next) {
+        GltfSkin skin;
+        _gj_name(s, &skin.name);
+        skin.skeleton = _gj_int(s, "skeleton", -1);
+        *JsonValue js = _gj_arr(s, "joints");
+        if (js != null) {
+            for (*JsonValue c = js.child; c != null; c = c.next) {
+                int j = c.kind == JNumber ? (int)c.num : -1;
+                if (j < 0 || j >= g.nodes.size) {
+                    GltfSkin_free(&skin);
+                    return _gltf_fail("a skin names a missing joint", null);
+                }
+                List_push(&skin.joints, j);
+            }
+        }
+        int ib = _gj_int(s, "inverseBindMatrices", -1);
+        if (ib >= 0) {
+            if (ib >= g._accessors.size || _gltf_count(g, ib) < (uint32)skin.joints.size) {
+                GltfSkin_free(&skin);
+                return _gltf_fail("a skin's inverse bind matrices are missing", null);
+            }
+            skin.inverse_bind = _gltf_floats(g, ib, 16);
+        } else {
+            skin.inverse_bind = alloc<float>((int64)skin.joints.size * 16 + 1);
+            for (j in 0..skin.joints.size) {
+                Mat4 id = mat4_identity();
+                memcpy(skin.inverse_bind + j * 16, &id.m[0], 64);
+            }
+        }
+        List_push(&g.skins, skin);
+    }
+    return null;
+}
+
+// Reads a KHR_animation_pointer JSON pointer into ch: a node's translation, rotation,
+// scale, weights or KHR_node_visibility, or a material's base color, emissive, metallic,
+// roughness, alpha cutoff, or a texture's KHR_texture_transform offset, rotation or scale.
+// Leaves ch.path -1 for any other pointer.
+void _gltf_pointer(string ptr, *GltfAnimChannel ch) {
+    if (ptr == null) return;
+    int idx = 0;
+    int at = 0;
+    if (strncmp(ptr, "/nodes/", 7) == 0) at = 7;
+    else if (strncmp(ptr, "/materials/", 11) == 0) at = 11;
+    else return;
+    if (ptr[at] < '0' || ptr[at] > '9') return;
+    while (ptr[at] >= '0' && ptr[at] <= '9') { idx = idx * 10 + (int)(ptr[at] - '0'); at++; }
+    string rest = (string)((*uint8)ptr + at);
+    if (ptr[1] == 'n') {
+        ch.node = idx;
+        if (strcmp(rest, "/translation") == 0) ch.path = GLTF_TRANSLATION;
+        else if (strcmp(rest, "/rotation") == 0) ch.path = GLTF_ROTATION;
+        else if (strcmp(rest, "/scale") == 0) ch.path = GLTF_SCALE;
+        else if (strcmp(rest, "/weights") == 0) ch.path = GLTF_WEIGHTS;
+        else if (strcmp(rest, "/extensions/KHR_node_visibility/visible") == 0) ch.path = GLTF_VISIBLE;
+        return;
+    }
+    ch.material = idx;
+    if (strcmp(rest, "/pbrMetallicRoughness/baseColorFactor") == 0) { ch.path = GLTF_BASE_COLOR; return; }
+    if (strcmp(rest, "/emissiveFactor") == 0) { ch.path = GLTF_EMISSIVE; return; }
+    if (strcmp(rest, "/pbrMetallicRoughness/metallicFactor") == 0) { ch.path = GLTF_METALLIC; return; }
+    if (strcmp(rest, "/pbrMetallicRoughness/roughnessFactor") == 0) { ch.path = GLTF_ROUGHNESS; return; }
+    if (strcmp(rest, "/alphaCutoff") == 0) { ch.path = GLTF_ALPHA_CUTOFF; return; }
+    string[5] textures = {"/pbrMetallicRoughness/baseColorTexture", "/pbrMetallicRoughness/metallicRoughnessTexture",
+                          "/normalTexture", "/occlusionTexture", "/emissiveTexture"};
+    for (k in 0..5) {
+        uint64 n = strlen(textures[k]);
+        if (strncmp(rest, textures[k], n) != 0) continue;
+        string tail = (string)((*uint8)rest + n);
+        ch.slot = k;
+        if (strcmp(tail, "/extensions/KHR_texture_transform/offset") == 0) ch.path = GLTF_TEX_OFFSET;
+        else if (strcmp(tail, "/extensions/KHR_texture_transform/rotation") == 0) ch.path = GLTF_TEX_ROTATION;
+        else if (strcmp(tail, "/extensions/KHR_texture_transform/scale") == 0) ch.path = GLTF_TEX_SCALE;
+        return;
+    }
+}
+
+string _gltf_read_animations(*Gltf g, *JsonValue root) {
+    *JsonValue arr = _gj_arr(root, "animations");
+    if (arr == null) return null;
+    for (*JsonValue a = arr.child; a != null; a = a.next) {
+        GltfAnimation anim;
+        _gj_name(a, &anim.name);
+        *JsonValue sarr = _gj_arr(a, "samplers");
+        if (sarr != null) {
+            for (*JsonValue s = sarr.child; s != null; s = s.next) {
+                GltfAnimSampler smp;
+                int input = _gj_int(s, "input", -1);
+                int out = _gj_int(s, "output", -1);
+                string interp = _gj_str(s, "interpolation");
+                smp.interpolation = GLTF_LINEAR;
+                if (interp != null && strcmp(interp, "STEP") == 0) smp.interpolation = GLTF_STEP;
+                if (interp != null && strcmp(interp, "CUBICSPLINE") == 0) smp.interpolation = GLTF_CUBIC;
+                if (input >= 0 && input < g._accessors.size && out >= 0 && out < g._accessors.size) {
+                    smp.count = _gltf_count(g, input);
+                    smp.width = g._accessors.data[out].ncomp;
+                    uint32 per = smp.interpolation == GLTF_CUBIC ? smp.count * 3 : smp.count;
+                    if (smp.width >= 1 && smp.width <= 4 && _gltf_count(g, out) >= per) {
+                        smp.times = _gltf_floats(g, input, 1);
+                        smp.values = _gltf_floats(g, out, smp.width);
+                        smp.value_count = _gltf_count(g, out);
+                        for (k in 0..smp.count) {
+                            if (smp.times[k] > anim.duration) anim.duration = smp.times[k];
+                        }
+                    } else {
+                        smp.count = 0;
+                    }
+                }
+                List_push(&anim.samplers, smp);
+            }
+        }
+        *JsonValue carr = _gj_arr(a, "channels");
+        if (carr != null) {
+            for (*JsonValue c = carr.child; c != null; c = c.next) {
+                *JsonValue t = _gj(c, "target");
+                string path = _gj_str(t, "path");
+                GltfAnimChannel ch = GltfAnimChannel{_gj_int(t, "node", -1), -1, _gj_int(c, "sampler", -1), -1, 0};
+                if (path != null && strcmp(path, "translation") == 0) ch.path = GLTF_TRANSLATION;
+                if (path != null && strcmp(path, "rotation") == 0) ch.path = GLTF_ROTATION;
+                if (path != null && strcmp(path, "scale") == 0) ch.path = GLTF_SCALE;
+                if (path != null && strcmp(path, "weights") == 0) ch.path = GLTF_WEIGHTS;
+                if (path != null && strcmp(path, "pointer") == 0) {
+                    _gltf_pointer(_gj_str(_gj(_gj(t, "extensions"), "KHR_animation_pointer"), "pointer"), &ch);
+                }
+                bool on_node = ch.path <= GLTF_VISIBLE && ch.node >= 0 && ch.node < g.nodes.size;
+                bool on_mat = ch.path > GLTF_VISIBLE && ch.material >= 0 && ch.material < g.materials.size;
+                if ((on_node || on_mat) && ch.sampler >= 0 && ch.sampler < anim.samplers.size && ch.path >= 0) {
+                    List_push(&anim.channels, ch);
+                }
+            }
+        }
+        List_push(&g.animations, anim);
+    }
+    return null;
+}

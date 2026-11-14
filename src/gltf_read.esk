@@ -1,0 +1,319 @@
+// gltf_read.esk: the model's nodes, skins and animations, and its queries (part of gltf.esk, which imports it in order after the ones before it)
+
+string _gltf_read(*Gltf g, *JsonValue root, *uint8 bin, uint64 bin_len, string base_dir) {
+    *JsonValue asset = _gj(root, "asset");
+    string version = _gj_str(asset, "version");
+    if (version == null || version[0] != '2') return _gltf_fail("only glTF 2.0 is supported", null);
+    string err = _gltf_check_extensions(root);
+    if (err == null) err = _gltf_read_buffers(g, root, bin, bin_len, base_dir);
+    if (err == null) err = _gltf_read_views(g, root);
+    if (err == null) err = _gltf_read_accessors(g, root);
+    if (err == null) err = _gltf_read_images(g, root, base_dir);
+    if (err != null) return err;
+    _gltf_read_textures(g, root);
+    _gltf_read_materials(g, root, g.textures.size);
+    err = _gltf_read_meshes(g, root);
+    if (err == null) err = _gltf_read_nodes(g, root);
+    if (err == null) err = _gltf_read_skins(g, root);
+    if (err == null) err = _gltf_read_animations(g, root);
+    return err;
+}
+
+// ── Scene evaluation ─────────────────────────────────────────────────────────
+
+// The local matrix of node (an index into nodes): matrix when the node has one, else
+// translation * rotation * scale.
+Mat4 Gltf_local(*Gltf self, int node) {
+    GltfNode* n = &self.nodes.data[node];
+    if (n.has_matrix) return n.matrix;
+    return mat4_trs(n.translation, n.rotation, n.scale);
+}
+
+void _gltf_world(*Gltf self, int node, Mat4 parent, *Mat4 out, int depth) {
+    if (depth > 1000) return;
+    Mat4 local = Gltf_local(self, node);
+    out[node] = parent * local;
+    GltfNode* n = &self.nodes.data[node];
+    for (k in 0..n.children.size) _gltf_world(self, n.children.data[k], out[node], out, depth + 1);
+}
+
+// Fills out[i] with node i's world matrix (out holds nodes.size matrices).
+// Nodes outside the scene keep their own local matrix.
+void Gltf_world(*Gltf self, *Mat4 out) {
+    for (i in 0..self.nodes.size) {
+        if (self.nodes.data[i].parent < 0) _gltf_world(self, i, mat4_identity(), out, 0);
+    }
+}
+
+// The skin's joint matrices (joint world matrix times inverse bind matrix),
+// one per joint, from the world matrices Gltf_world computed.
+void Gltf_joint_matrices(*Gltf self, int skin, *Mat4 world, *Mat4 out) {
+    GltfSkin* s = &self.skins.data[skin];
+    for (j in 0..s.joints.size) {
+        Mat4 ib;
+        memcpy(&ib.m[0], s.inverse_bind + j * 16, 64);
+        out[j] = world[s.joints.data[j]] * ib;
+    }
+}
+
+// Index of the last key at or before t (0 before the first key).
+uint32 _gltf_key(*GltfAnimSampler s, float t) {
+    uint32 lo = 0;
+    uint32 hi = s.count;
+    while (hi - lo > 1) {
+        uint32 mid = (lo + hi) / 2;
+        if (s.times[mid] <= t) lo = mid;
+        else hi = mid;
+    }
+    return lo;
+}
+
+void _gltf_sample(*GltfAnimSampler s, float t, *float out) {
+    _gltf_sample_n(s, t, out, s.width, s.width == 4);
+}
+
+// Samples w floats per key (morph weights: one per target); quat marks a
+// rotation, interpolated on the sphere.
+void _gltf_sample_n(*GltfAnimSampler s, float t, *float out, int w, bool quat) {
+    if (s.count == 0) return;
+    int stride = s.interpolation == GLTF_CUBIC ? w * 3 : w;
+    int voff = s.interpolation == GLTF_CUBIC ? w : 0;
+    uint32 k = _gltf_key(s, t);
+    if (k + 1 >= s.count || t <= s.times[0]) {
+        uint32 at = t <= s.times[0] ? (uint32)0 : s.count - 1;
+        for (c in 0..w) out[c] = s.values[(int64)at * stride + voff + c];
+        return;
+    }
+    float t0 = s.times[k];
+    float t1 = s.times[k + 1];
+    float dt = t1 - t0;
+    float u = dt > 0.0 ? (t - t0) / dt : 0.0;
+    *float a = s.values + (int64)k * stride + voff;
+    *float b = s.values + (int64)(k + 1) * stride + voff;
+    if (s.interpolation == GLTF_STEP) {
+        for (c in 0..w) out[c] = a[c];
+        return;
+    }
+    if (s.interpolation == GLTF_CUBIC) {
+        *float aout = a + w;
+        *float bin = b - w;
+        float u2 = u * u;
+        float u3 = u2 * u;
+        for (c in 0..w) {
+            out[c] = (2.0 * u3 - 3.0 * u2 + 1.0) * a[c] + (u3 - 2.0 * u2 + u) * dt * aout[c]
+                + (-2.0 * u3 + 3.0 * u2) * b[c] + (u3 - u2) * dt * bin[c];
+        }
+        if (quat) {
+            Quat q = Quat{out[0], out[1], out[2], out[3]}.normalize();
+            out[0] = q.x;
+            out[1] = q.y;
+            out[2] = q.z;
+            out[3] = q.w;
+        }
+        return;
+    }
+    if (quat) {
+        Quat q = quat_slerp(Quat{a[0], a[1], a[2], a[3]}, Quat{b[0], b[1], b[2], b[3]}, u);
+        out[0] = q.x;
+        out[1] = q.y;
+        out[2] = q.z;
+        out[3] = q.w;
+        return;
+    }
+    for (c in 0..w) out[c] = a[c] + (b[c] - a[c]) * u;
+}
+
+// Material texture slot k: 0 base color, 1 metallic-roughness, 2 normal, 3 occlusion,
+// 4 emissive.
+*GltfTextureRef _gltf_slot(*GltfMaterial m, int k) {
+    if (k == 1) return &m.metallic_roughness_texture;
+    if (k == 2) return &m.normal_texture;
+    if (k == 3) return &m.occlusion_texture;
+    if (k == 4) return &m.emissive_texture;
+    return &m.base_color_texture;
+}
+
+// Applies one KHR_animation_pointer channel at time t: a node's visibility (a value at or
+// above one half shows it) or a material's property.
+void _gltf_animate_pointer(*Gltf self, *GltfAnimChannel ch, *GltfAnimSampler s, float t) {
+    float[4] v;
+    int w = s.width;
+    if (w < 1 || w > 4 || s.values == null) return;
+    _gltf_sample_n(s, t, &v[0], w, false);
+    if (ch.path == GLTF_VISIBLE) {
+        self.nodes.data[ch.node].hidden = !(v[0] >= 0.5);
+        return;
+    }
+    GltfMaterial* m = &self.materials.data[ch.material];
+    if (ch.path == GLTF_BASE_COLOR && w == 4) m.base_color = Vec4{v[0], v[1], v[2], v[3]};
+    else if (ch.path == GLTF_EMISSIVE && w == 3) {
+        float k = m.emissive_strength > 0.0 ? m.emissive_strength : 1.0;
+        m.emissive = Vec3{v[0] * k, v[1] * k, v[2] * k};
+    } else if (ch.path == GLTF_METALLIC) m.metallic = v[0];
+    else if (ch.path == GLTF_ROUGHNESS) m.roughness = v[0];
+    else if (ch.path == GLTF_ALPHA_CUTOFF) m.alpha_cutoff = v[0];
+    else if (ch.path >= GLTF_TEX_OFFSET) {
+        *GltfTextureRef r = _gltf_slot(m, ch.slot);
+        if (!r.has_transform) { r.has_transform = true; r.tscale = Vec2{1.0, 1.0}; }
+        if (ch.path == GLTF_TEX_OFFSET && w == 2) r.offset = Vec2{v[0], v[1]};
+        else if (ch.path == GLTF_TEX_ROTATION) r.rotation = v[0];
+        else if (ch.path == GLTF_TEX_SCALE && w == 2) r.tscale = Vec2{v[0], v[1]};
+        else return;
+    } else return;
+    self.material_version++;
+}
+
+// Poses the nodes at time t (seconds) of animation anim; t wraps around the
+// animation's duration.
+void Gltf_animate(*Gltf self, int anim, float t) {
+    if (anim < 0 || anim >= self.animations.size) return;
+    GltfAnimation* a = &self.animations.data[anim];
+    if (a.duration > 0.0) t = (float)fmod((double)t, (double)a.duration);
+    if (t < 0.0) t = t + a.duration;
+    float[4] v;
+    for (i in 0..a.channels.size) {
+        GltfAnimChannel* ch = &a.channels.data[i];
+        GltfAnimSampler* s = &a.samplers.data[ch.sampler];
+        if (s.count == 0) continue;
+        if (ch.path >= GLTF_VISIBLE) {
+            _gltf_animate_pointer(self, ch, s, t);
+            continue;
+        }
+        GltfNode* n = &self.nodes.data[ch.node];
+        if (ch.path == GLTF_WEIGHTS) {
+            // Scalar outputs, one per target for each key (three for a cubic
+            // spline: in-tangents, values and out-tangents).
+            int w = n.weights.size;
+            uint32 per = s.interpolation == GLTF_CUBIC ? s.count * 3 : s.count;
+            if (w > 0 && s.width == 1 && s.values != null && s.value_count >= per * (uint32)w) {
+                _gltf_sample_n(s, t, n.weights.data, w, false);
+            }
+            continue;
+        }
+        if (ch.path == GLTF_ROTATION && s.width == 4) {
+            _gltf_sample(s, t, &v[0]);
+            n.rotation = Quat{v[0], v[1], v[2], v[3]};
+        } else if (s.width == 3) {
+            _gltf_sample(s, t, &v[0]);
+            if (ch.path == GLTF_TRANSLATION) n.translation = Vec3{v[0], v[1], v[2]};
+            else if (ch.path == GLTF_SCALE) n.scale = Vec3{v[0], v[1], v[2]};
+        }
+        n.has_matrix = false;
+    }
+}
+
+// Sets node's morph target weights (count of them; the node keeps one per
+// target of its mesh and ignores the rest). <gpu/model> applies them at its
+// next update(), or at once with GpuModel_set_weights.
+void Gltf_set_weights(*Gltf self, int node, *float weights, int count) {
+    if (node < 0 || node >= self.nodes.size || weights == null) return;
+    GltfNode* n = &self.nodes.data[node];
+    for (k in 0..(count < n.weights.size ? count : n.weights.size)) n.weights.data[k] = weights[k];
+}
+
+// The model's bounds over its scene, in world space.
+void Gltf_bounds(*Gltf self, Vec3* lo, Vec3* hi) {
+    *Mat4 world = alloc<Mat4>(self.nodes.size + 1);
+    defer free(world);
+    Gltf_world(self, world);
+    bool any = false;
+    for (i in 0..self.nodes.size) {
+        int m = self.nodes.data[i].mesh;
+        if (m < 0) continue;
+        GltfMesh* mesh = &self.meshes.data[m];
+        for (p in 0..mesh.primitives.size) {
+            GltfPrimitive* pr = &mesh.primitives.data[p];
+            for (c in 0..8) {
+                Vec3 corner = Vec3{(c & 1) != 0 ? pr.max.x : pr.min.x, (c & 2) != 0 ? pr.max.y : pr.min.y,
+                    (c & 4) != 0 ? pr.max.z : pr.min.z};
+                Vec3 w = world[i].point(corner);
+                if (!any) {
+                    *lo = w;
+                    *hi = w;
+                    any = true;
+                }
+                *lo = Vec3{w.x < lo.x ? w.x : lo.x, w.y < lo.y ? w.y : lo.y, w.z < lo.z ? w.z : lo.z};
+                *hi = Vec3{w.x > hi.x ? w.x : hi.x, w.y > hi.y ? w.y : hi.y, w.z > hi.z ? w.z : hi.z};
+            }
+        }
+    }
+    if (!any) {
+        *lo = Vec3{0.0, 0.0, 0.0};
+        *hi = Vec3{0.0, 0.0, 0.0};
+    }
+}
+
+// ── Freeing ──────────────────────────────────────────────────────────────────
+
+// Frees the skin's name, joint list and inverse bind matrices. Gltf_free calls it for
+// every skin.
+void GltfSkin_free(GltfSkin* s) {
+    String_free(&s.name);
+    List_free(&s.joints);
+    if (s.inverse_bind != null) free(s.inverse_bind);
+}
+
+// Frees everything the model holds: vertex and index arrays, morph targets, images it read
+// or decoded from data URIs, buffers, names and lists. Pointers into the model become
+// invalid.
+void Gltf_free(*Gltf self) {
+    for (i in 0..self.meshes.size) {
+        GltfMesh* m = &self.meshes.data[i];
+        for (p in 0..m.primitives.size) {
+            GltfPrimitive* pr = &m.primitives.data[p];
+            free(pr.positions);
+            free(pr.normals);
+            free(pr.uvs);
+            free(pr.uvs1);
+            free(pr.tangents);
+            free(pr.colors);
+            free(pr.joints);
+            free(pr.weights);
+            free(pr.indices);
+            free(pr.target_positions);
+            free(pr.target_normals);
+            free(pr.target_tangents);
+        }
+        List_free(&m.primitives);
+        List_free(&m.weights);
+        String_free(&m.name);
+    }
+    for (i in 0..self.materials.size) String_free(&self.materials.data[i].name);
+    for (i in 0..self.images.size) {
+        GltfImage* im = &self.images.data[i];
+        if (im.owned) free(im.data);
+        String_free(&im.name);
+        String_free(&im.mime);
+    }
+    for (i in 0..self.nodes.size) {
+        String_free(&self.nodes.data[i].name);
+        List_free(&self.nodes.data[i].children);
+        List_free(&self.nodes.data[i].weights);
+    }
+    for (i in 0..self.skins.size) GltfSkin_free(&self.skins.data[i]);
+    for (i in 0..self.animations.size) {
+        GltfAnimation* a = &self.animations.data[i];
+        for (s in 0..a.samplers.size) {
+            free(a.samplers.data[s].times);
+            free(a.samplers.data[s].values);
+        }
+        List_free(&a.samplers);
+        List_free(&a.channels);
+        String_free(&a.name);
+    }
+    for (i in 0..self._buffers.size) {
+        if (self._buffers.data[i].owned) free(self._buffers.data[i].data);
+    }
+    List_free(&self.meshes);
+    List_free(&self.materials);
+    List_free(&self.textures);
+    List_free(&self.images);
+    List_free(&self.samplers);
+    List_free(&self.nodes);
+    List_free(&self.skins);
+    List_free(&self.animations);
+    List_free(&self.roots);
+    List_free(&self._buffers);
+    List_free(&self._views);
+    List_free(&self._accessors);
+}

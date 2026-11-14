@@ -1,0 +1,590 @@
+// render_texture.esk: buffers, textures, mipmaps and readbacks (part of render.esk, which imports it in order after the ones before it)
+
+// A uniform buffer of bytes bytes, updated with write().
+Result<GpuBuffer, string> Gpu_uniform(*Gpu self, *void data, uint64 bytes) {
+    GpuBuffer b = Gpu_buffer(self, bytes, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)?;
+    if (data != null) GpuBuffer_write(&b, 0, data, bytes);
+    return Ok<GpuBuffer, string>(b);
+}
+
+// A single-level 2D texture of width x height texels in format, with the given
+// WGPUTextureUsage flags (0 for the defaults GpuTextureDesc lists). Gpu_texture_with takes
+// the other settings.
+Result<GpuTexture, string> Gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage) {
+    return _gpu_texture(self, width, height, format, usage, 1, 1);
+}
+
+Result<GpuTexture, string> _gpu_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, WGPUTextureUsage usage, uint32 mips, uint32 samples) {
+    GpuTextureDesc d = GpuTextureDesc{width: width, height: height, format: format, mips: mips, usage: usage, samples: samples};
+    return Gpu_texture_with(self, &d);
+}
+
+// The number of mip levels from width x height down to 1x1.
+uint32 gpu_mip_count(uint32 width, uint32 height) {
+    uint32 n = 1;
+    uint32 m = width > height ? width : height;
+    while (m > 1) {
+        m = m / 2;
+        n++;
+    }
+    return n;
+}
+
+// A texture with layers, a cube, mip levels or extra view formats (see
+// GpuTextureDesc). Its view covers all of it: 2D, 2D array or cube.
+Result<GpuTexture, string> Gpu_texture_with(*Gpu self, *GpuTextureDesc d) {
+    WGPUTextureFormat format = d.format != 0 ? d.format : WGPUTextureFormat_RGBA8Unorm;
+    uint32 layers = d.layers != 0 ? d.layers : (d.cube ? (uint32)6 : (uint32)1);
+    if (d.cube && (layers % 6 != 0 || d.width != d.height)) {
+        return Err<GpuTexture, string>(_gpu_fail("texture: a cube needs square faces and 6 layers (or a multiple of 6)", null));
+    }
+    string missing = _gpu_format_missing(self, format);
+    if (missing != null) return Err<GpuTexture, string>(_gpu_fail(missing, null));
+    uint32 mips = d.mipmaps ? gpu_mip_count(d.width, d.height) : (d.mips != 0 ? d.mips : (uint32)1);
+    uint32 samples = d.samples != 0 ? d.samples : (uint32)1;
+    WGPUTextureUsage usage = d.usage != 0 ? d.usage : _gpu_default_usage(format);
+    WGPUTextureViewDimension dim = WGPUTextureViewDimension_2D;
+    if (d.cube) dim = layers > 6 ? WGPUTextureViewDimension_CubeArray : WGPUTextureViewDimension_Cube;
+    else if (layers > 1 || d.array) dim = WGPUTextureViewDimension_2DArray;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: usage, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{d.width, d.height, layers}, format: format, mipLevelCount: mips, sampleCount: samples,
+        viewFormatCount: (uint64)d.view_format_count, viewFormats: d.view_formats};
+    WGPUTexture t = wgpuDeviceCreateTexture(self.device, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: mips,
+            arrayLayerCount: layers, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture");
+    GpuTexture tex = GpuTexture{*self, t, v, format, d.width, d.height, mips, samples, layers, dim, usage};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+
+#ifdef __APPLE__
+// wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu) adds this call; the
+// upstream libraries lack it, so a program that uses Gpu_texture_from_metal links that build.
+extern WGPUTexture wgpuDeviceCreateTextureFromMetal(WGPUDevice device, *void metal_texture, *WGPUTextureDescriptor descriptor);
+
+// A GpuTexture over a Metal texture made outside wgpu (an id<MTLTexture>, borrowed: wgpu
+// retains it): the drawables a system hands over each frame, such as CompositorServices'
+// color and depth textures on visionOS. width, height, format and layers must be the Metal
+// texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is RenderAttachment.
+Result<GpuTexture, string> Gpu_texture_from_metal(*Gpu self, *void metal_texture, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage) {
+    if (metal_texture == null) return Err<GpuTexture, string>(_gpu_fail("texture_from_metal: no texture", null));
+    uint32 n = layers != 0 ? layers : (uint32)1;
+    WGPUTextureUsage u = usage != 0 ? usage : WGPUTextureUsage_RenderAttachment;
+    WGPUTextureViewDimension dim = n > 1 ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: u, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{width, height, n}, format: format, mipLevelCount: 1, sampleCount: 1};
+    WGPUTexture t = wgpuDeviceCreateTextureFromMetal(self.device, metal_texture, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: 1,
+            arrayLayerCount: n, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture_from_metal");
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, 1, 1, n, dim, u};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture_from_metal", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+#endif
+
+#if defined(__ANDROID__) || defined(__linux__) || defined(_WIN32)
+// The Vulkan objects behind a device (wgpu-native's eskiu branch, as Gpu_texture_from_metal):
+// what an OpenXR session's XrGraphicsBindingVulkanKHR names.
+struct WGPUVulkanHandles {
+    *void instance;
+    *void physical_device;
+    *void device;
+    *void queue;
+    uint32 queue_family_index;
+    uint32 queue_index;
+}
+
+extern uint32 wgpuDeviceGetVulkanHandles(WGPUDevice device, *WGPUVulkanHandles handles);
+extern WGPUTexture wgpuDeviceCreateTextureFromVulkan(WGPUDevice device, uint64 vk_image, *WGPUTextureDescriptor descriptor);
+
+// The device's Vulkan instance, physical device, device and queue, for an OpenXR session to
+// bind to. An error when the device is not on the Vulkan backend.
+Result<WGPUVulkanHandles, string> Gpu_vulkan_handles(*Gpu self) {
+    WGPUVulkanHandles h;
+    if (wgpuDeviceGetVulkanHandles(self.device, &h) == 0) {
+        return Err<WGPUVulkanHandles, string>(_gpu_fail("vulkan_handles: the device is not on Vulkan", null));
+    }
+    return Ok<WGPUVulkanHandles, string>(h);
+}
+
+// A GpuTexture over a VkImage made outside wgpu (an OpenXR swapchain image; it stays the
+// caller's). width, height, format and layers must be the image's; layers > 1 is a 2D array.
+// usage 0 is RenderAttachment.
+Result<GpuTexture, string> Gpu_texture_from_vulkan(*Gpu self, uint64 vk_image, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage) {
+    if (vk_image == 0) return Err<GpuTexture, string>(_gpu_fail("texture_from_vulkan: no image", null));
+    uint32 n = layers != 0 ? layers : (uint32)1;
+    WGPUTextureUsage u = usage != 0 ? usage : WGPUTextureUsage_RenderAttachment;
+    WGPUTextureViewDimension dim = n > 1 ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: u, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{width, height, n}, format: format, mipLevelCount: 1, sampleCount: 1};
+    WGPUTexture t = wgpuDeviceCreateTextureFromVulkan(self.device, vk_image, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: 1,
+            arrayLayerCount: n, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture_from_vulkan");
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, 1, 1, n, dim, u};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture_from_vulkan", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+#endif
+
+// A depth texture that shaders can sample (texture_depth_2d, or
+// texture_depth_2d_array when layers > 1) and compare against
+// (GpuSamplerOptions.compare): a shadow map. format is Depth32Float when 0.
+Result<GpuTexture, string> Gpu_depth_texture(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers) {
+    GpuTextureDesc d = GpuTextureDesc{width: width, height: height, format: format != 0 ? format : WGPUTextureFormat_Depth32Float,
+        layers: layers, usage: WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding};
+    return Gpu_texture_with(self, &d);
+}
+
+bool _gpu_is_depth(WGPUTextureFormat f) {
+    return f >= WGPUTextureFormat_Stencil8 && f <= WGPUTextureFormat_Depth32FloatStencil8;
+}
+
+bool _gpu_is_integer(WGPUTextureFormat f) {
+    return f == WGPUTextureFormat_R8Uint || f == WGPUTextureFormat_R8Sint || f == WGPUTextureFormat_R16Uint || f == WGPUTextureFormat_R16Sint
+        || f == WGPUTextureFormat_RG8Uint || f == WGPUTextureFormat_RG8Sint || f == WGPUTextureFormat_R32Uint || f == WGPUTextureFormat_R32Sint
+        || f == WGPUTextureFormat_RG16Uint || f == WGPUTextureFormat_RG16Sint || f == WGPUTextureFormat_RGBA8Uint || f == WGPUTextureFormat_RGBA8Sint
+        || f == WGPUTextureFormat_RGB10A2Uint || f == WGPUTextureFormat_RG32Uint || f == WGPUTextureFormat_RG32Sint
+        || f == WGPUTextureFormat_RGBA16Uint || f == WGPUTextureFormat_RGBA16Sint || f == WGPUTextureFormat_RGBA32Uint || f == WGPUTextureFormat_RGBA32Sint;
+}
+
+// Whether every device can render into a color texture of format f.
+bool _gpu_renderable(WGPUTextureFormat f) {
+    if (f == WGPUTextureFormat_Undefined || f >= WGPUTextureFormat_Stencil8) return false;
+    if (f == WGPUTextureFormat_R8Snorm || f == WGPUTextureFormat_RG8Snorm || f == WGPUTextureFormat_RGBA8Snorm) return false;
+    if (f == WGPUTextureFormat_R16Unorm || f == WGPUTextureFormat_R16Snorm || f == WGPUTextureFormat_RG16Unorm || f == WGPUTextureFormat_RG16Snorm) return false;
+    if (f == WGPUTextureFormat_RGBA16Unorm || f == WGPUTextureFormat_RGBA16Snorm) return false;
+    return f != WGPUTextureFormat_RG11B10Ufloat && f != WGPUTextureFormat_RGB9E5Ufloat;
+}
+
+WGPUTextureUsage _gpu_default_usage(WGPUTextureFormat f) {
+    if (_gpu_is_depth(f)) return WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    if (f >= WGPUTextureFormat_BC1RGBAUnorm) return WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    WGPUTextureUsage u = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+    if (_gpu_renderable(f)) u = u | WGPUTextureUsage_RenderAttachment;
+    return u;
+}
+
+// An RGBA8 texture to render into, sample in a later pass and read back.
+Result<GpuTexture, string> Gpu_target(*Gpu self, uint32 width, uint32 height) {
+    return Gpu_target_with(self, width, height, WGPUTextureFormat_RGBA8Unorm);
+}
+
+// Gpu_target in another format (RGBA8UnormSrgb, BGRA8Unorm, RGBA16Float...).
+Result<GpuTexture, string> Gpu_target_with(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format) {
+    return Gpu_texture(self, width, height, format,
+        WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc | WGPUTextureUsage_TextureBinding);
+}
+
+// A multisampled render attachment of samples samples per pixel (4, the
+// count every WebGPU device supports for the common formats): a color target
+// resolved into a single-sample view at the end of a pass
+// (GpuPassOptions.resolve), or a depth (and stencil) texture for the same
+// pass. It is only drawn into: it cannot be read back or sampled.
+Result<GpuTexture, string> Gpu_target_msaa(*Gpu self, uint32 width, uint32 height, WGPUTextureFormat format, uint32 samples) {
+    return _gpu_texture(self, width, height, format, WGPUTextureUsage_RenderAttachment, 1, samples);
+}
+
+// A format's texel block: 1x1 and the texel size for uncompressed formats,
+// the block size and its bytes for BC, ETC2/EAC and ASTC.
+void _gpu_format_block(WGPUTextureFormat f, *uint32 bw, *uint32 bh, *uint32 bytes) {
+    *bw = 1;
+    *bh = 1;
+    uint32 v = (uint32)f;
+    if (v >= 0x4A && v <= 0x65) {
+        uint32[28] dims = {4, 4, 5, 4, 5, 5, 6, 5, 6, 6, 8, 5, 8, 6, 8, 8, 10, 5, 10, 6, 10, 8, 10, 10, 12, 10, 12, 12};
+        int k = (int)((v - 0x4A) / 2);
+        *bw = dims[k * 2];
+        *bh = dims[k * 2 + 1];
+        *bytes = 16;
+        return;
+    }
+    if (v >= 0x32) {
+        *bw = 4;
+        *bh = 4;
+        bool half = v == 0x32 || v == 0x33 || v == 0x38 || v == 0x39 || (v >= 0x40 && v <= 0x43) || v == 0x46 || v == 0x47;
+        *bytes = half ? (uint32)8 : (uint32)16;
+        return;
+    }
+    if (v <= 0x04 || v == 0x2C) *bytes = 1;
+    else if (v <= 0x0D || v == 0x2D) *bytes = 2;
+    else if (v <= 0x20 || v == 0x2E || v == 0x2F || v == 0x30) *bytes = 4;
+    else if (v <= 0x28 || v == 0x31) *bytes = 8;
+    else *bytes = 16;
+}
+
+// Bytes per texel of an uncompressed format (bytes per block for the others).
+uint32 _gpu_texel_bytes(WGPUTextureFormat f) {
+    uint32 bw = 1;
+    uint32 bh = 1;
+    uint32 b = 4;
+    _gpu_format_block(f, &bw, &bh, &b);
+    return b;
+}
+
+// The sRGB twin of a format (RGBA8Unorm gives RGBA8UnormSrgb; also BGRA8 and
+// the BC1-3, BC7, ETC2 and ASTC formats), f itself when it is sRGB already, or
+// Undefined when it has none.
+WGPUTextureFormat gpu_srgb_format(WGPUTextureFormat f) {
+    uint32 v = (uint32)f;
+    if (v == 0x16 || v == 0x1B) return (WGPUTextureFormat)(v + 1);
+    if (v == 0x17 || v == 0x1C) return f;
+    bool pair = (v >= 0x32 && v <= 0x37) || v == 0x3E || v == 0x3F || (v >= 0x40 && v <= 0x45) || (v >= 0x4A && v <= 0x65);
+    if (!pair) return WGPUTextureFormat_Undefined;
+    return (WGPUTextureFormat)(v | 1);
+}
+
+// The linear twin of a format (RGBA8UnormSrgb gives RGBA8Unorm), f itself when
+// it has an sRGB twin, or Undefined when it has none.
+WGPUTextureFormat gpu_linear_format(WGPUTextureFormat f) {
+    WGPUTextureFormat s = gpu_srgb_format(f);
+    if (s == WGPUTextureFormat_Undefined) return s;
+    uint32 v = (uint32)s;
+    if (v == 0x17 || v == 0x1C) return (WGPUTextureFormat)(v - 1);
+    return (WGPUTextureFormat)(v & 0xFFFFFFFE);
+}
+
+// An RGBA8 texture for shaders to sample, filled from width * height pixels
+// of 4 bytes each.
+Result<GpuTexture, string> Gpu_image(*Gpu self, uint32 width, uint32 height, *void rgba) {
+    return Gpu_image_with(self, width, height, rgba, null);
+}
+
+// Gpu_image with options (null for the defaults: linear, no mipmaps).
+Result<GpuTexture, string> Gpu_image_with(*Gpu self, uint32 width, uint32 height, *void rgba, *GpuImageOptions opts) {
+    bool srgb = opts != null && opts.srgb;
+    bool mipmaps = opts != null && opts.mipmaps;
+    uint32 mips = mipmaps ? gpu_mip_count(width, height) : (uint32)1;
+    WGPUTextureFormat format = srgb ? WGPUTextureFormat_RGBA8UnormSrgb : WGPUTextureFormat_RGBA8Unorm;
+    GpuTexture t = _gpu_texture(self, width, height, format, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst, mips, 1)?;
+    GpuTexture_write(&t, rgba);
+    if (mips > 1) _gpu_write_mips(&t, (*uint8)rgba, srgb);
+    return Ok<GpuTexture, string>(t);
+}
+
+float[256] _gpu_srgb_lin;
+uint8[4096] _gpu_lin_srgb;
+bool _gpu_srgb_ready = false;
+
+void _gpu_srgb_tables() {
+    if (_gpu_srgb_ready) return;
+    for (i in 0..256) {
+        double c = (double)i / 255.0;
+        _gpu_srgb_lin[i] = (float)(c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4));
+    }
+    for (i in 0..4096) {
+        double l = (double)i / 4095.0;
+        double c = l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+        _gpu_lin_srgb[i] = (uint8)(c * 255.0 + 0.5);
+    }
+    _gpu_srgb_ready = true;
+}
+
+// Halves an RGBA8 image with a 2x2 box filter; with srgb, the color channels
+// are averaged in linear light.
+void _gpu_halve(*uint8 src, uint32 w, uint32 h, *uint8 dst, uint32 dw, uint32 dh, bool srgb) {
+    for (y in 0..dh) {
+        uint32 y0 = y * 2 < h ? y * 2 : h - 1;
+        uint32 y1 = y * 2 + 1 < h ? y * 2 + 1 : h - 1;
+        for (x in 0..dw) {
+            uint32 x0 = x * 2 < w ? x * 2 : w - 1;
+            uint32 x1 = x * 2 + 1 < w ? x * 2 + 1 : w - 1;
+            *uint8 a = src + ((uint64)y0 * w + x0) * 4;
+            *uint8 b = src + ((uint64)y0 * w + x1) * 4;
+            *uint8 c = src + ((uint64)y1 * w + x0) * 4;
+            *uint8 d = src + ((uint64)y1 * w + x1) * 4;
+            *uint8 o = dst + ((uint64)y * dw + x) * 4;
+            for (k in 0..4) {
+                if (srgb && k < 3) {
+                    float l = (_gpu_srgb_lin[(int)a[k]] + _gpu_srgb_lin[(int)b[k]] + _gpu_srgb_lin[(int)c[k]] + _gpu_srgb_lin[(int)d[k]]) * 0.25;
+                    o[k] = _gpu_lin_srgb[(int)(l * 4095.0 + 0.5)];
+                } else {
+                    o[k] = (uint8)(((uint32)a[k] + b[k] + c[k] + d[k] + 2) / 4);
+                }
+            }
+        }
+    }
+}
+
+void _gpu_write_mips(*GpuTexture t, *uint8 rgba, bool srgb) {
+    if (srgb) _gpu_srgb_tables();
+    uint32 w = t.width;
+    uint32 h = t.height;
+    *uint8 prev = rgba;
+    *uint8 owned = null;
+    for (level in 1..t.mips) {
+        uint32 dw = w > 1 ? w / 2 : 1;
+        uint32 dh = h > 1 ? h / 2 : 1;
+        *uint8 next = alloc<uint8>((int)(dw * dh * 4));
+        _gpu_halve(prev, w, h, next, dw, dh, srgb);
+        WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: t.handle, mipLevel: level, aspect: WGPUTextureAspect_All};
+        WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, dw * 4, dh};
+        WGPUExtent3D size = WGPUExtent3D{dw, dh, 1};
+        wgpuQueueWriteTexture(t.gpu.queue, &dst, next, (uint64)dw * dh * 4, &layout, &size);
+        if (owned != null) free(owned);
+        owned = next;
+        prev = next;
+        w = dw;
+        h = dh;
+    }
+    if (owned != null) free(owned);
+}
+
+// A Depth24Plus depth texture of width x height for a pass's depth attachment, matching a
+// pipeline whose depth_format is left at its default. Make a new one when the target is
+// resized.
+Result<GpuTexture, string> Gpu_depth(*Gpu self, uint32 width, uint32 height) {
+    return Gpu_texture(self, width, height, WGPUTextureFormat_Depth24Plus, WGPUTextureUsage_RenderAttachment);
+}
+
+// A depth texture with an 8-bit stencil (Depth24PlusStencil8, available on
+// every device), for pipelines with that depth_format.
+Result<GpuTexture, string> Gpu_depth_stencil(*Gpu self, uint32 width, uint32 height) {
+    return Gpu_texture(self, width, height, WGPUTextureFormat_Depth24PlusStencil8, WGPUTextureUsage_RenderAttachment);
+}
+
+bool _gpu_has_stencil(WGPUTextureFormat f) {
+    return f == WGPUTextureFormat_Depth24PlusStencil8 || f == WGPUTextureFormat_Depth32FloatStencil8 || f == WGPUTextureFormat_Stencil8;
+}
+
+// Replaces the texture's pixels (4 bytes each, rows packed).
+void GpuTexture_write(*GpuTexture self, *void rgba) {
+    WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: self.handle, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, self.width * 4, self.height};
+    WGPUExtent3D size = WGPUExtent3D{self.width, self.height, 1};
+    wgpuQueueWriteTexture(self.gpu.queue, &dst, rgba, (uint64)self.width * self.height * 4, &layout, &size);
+}
+
+// Replaces a width x height rectangle of the texture's pixels at (x, y),
+// from rows packed at the texture format's texel size (4 bytes for RGBA8):
+// an atlas update or a scrolling tile layer.
+void GpuTexture_write_region(*GpuTexture self, uint32 x, uint32 y, uint32 width, uint32 height, *void pixels) {
+    uint32 texel = _gpu_texel_bytes(self.format);
+    WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: self.handle, origin: WGPUOrigin3D{x, y, 0}, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, width * texel, height};
+    WGPUExtent3D size = WGPUExtent3D{width, height, 1};
+    wgpuQueueWriteTexture(self.gpu.queue, &dst, pixels, (uint64)width * height * texel, &layout, &size);
+}
+
+// The size of a mip level in texel blocks (texels for uncompressed formats)
+// and its bytes per row of blocks.
+void _gpu_level_blocks(*GpuTexture t, uint32 mip, *uint32 bx, *uint32 by, *uint32 row) {
+    uint32 bw = 1;
+    uint32 bh = 1;
+    uint32 bytes = 4;
+    _gpu_format_block(t.format, &bw, &bh, &bytes);
+    uint32 w = t.width >> mip;
+    uint32 h = t.height >> mip;
+    if (w == 0) w = 1;
+    if (h == 0) h = 1;
+    *bx = (w + bw - 1) / bw;
+    *by = (h + bh - 1) / bh;
+    *row = *bx * bytes;
+}
+
+// Replaces one mip level of one layer (a cube face: +X, -X, +Y, -Y, +Z, -Z)
+// with data: rows packed at the format's texel size or, for a block-compressed
+// format, rows of 4x4 (or ASTC-sized) blocks packed, a level smaller than a
+// block still taking one whole block per row and column.
+Result<int, string> GpuTexture_write_level(*GpuTexture self, uint32 layer, uint32 mip, *void data) {
+    uint32 bx = 0;
+    uint32 by = 0;
+    uint32 row = 0;
+    _gpu_level_blocks(self, mip, &bx, &by, &row);
+    uint32 bw = 1;
+    uint32 bh = 1;
+    uint32 bytes = 4;
+    _gpu_format_block(self.format, &bw, &bh, &bytes);
+    _gpu_push(&self.gpu);
+    WGPUTexelCopyTextureInfo dst = WGPUTexelCopyTextureInfo{texture: self.handle, mipLevel: mip, origin: WGPUOrigin3D{0, 0, layer}, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferLayout layout = WGPUTexelCopyBufferLayout{0, row, by};
+    WGPUExtent3D size = WGPUExtent3D{bx * bw, by * bh, 1};
+    wgpuQueueWriteTexture(self.gpu.queue, &dst, data, (uint64)row * by, &layout, &size);
+    string err = _gpu_pop(&self.gpu, "write_level");
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+// A view of part of the texture (see GpuViewDesc).
+Result<GpuTextureView, string> GpuTexture_view_with(*GpuTexture self, *GpuViewDesc d) {
+    uint32 layers = self.layers != 0 ? self.layers : (uint32)1;
+    uint32 nl = d.layers != 0 ? d.layers : layers - d.base_layer;
+    WGPUTextureViewDimension dim = d.dimension;
+    if (dim == 0) dim = nl == 1 && self.dimension != WGPUTextureViewDimension_2DArray ? WGPUTextureViewDimension_2D : (self.dimension != 0 ? self.dimension : WGPUTextureViewDimension_2D);
+    WGPUTextureFormat format = d.format != 0 ? d.format : self.format;
+    uint32 nm = d.mips != 0 ? d.mips : self.mips - d.base_mip;
+    _gpu_push(&self.gpu);
+    WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, baseMipLevel: d.base_mip,
+        mipLevelCount: nm, baseArrayLayer: d.base_layer, arrayLayerCount: nl,
+        aspect: d.aspect != 0 ? d.aspect : WGPUTextureAspect_All};
+    WGPUTextureView v = wgpuTextureCreateView(self.handle, &vd);
+    string err = _gpu_pop(&self.gpu, "view");
+    uint32 w = self.width >> d.base_mip;
+    uint32 h = self.height >> d.base_mip;
+    GpuTextureView out = GpuTextureView{v, format, w > 0 ? w : (uint32)1, h > 0 ? h : (uint32)1};
+    if (err != null || v == null) {
+        GpuTextureView_release(&out);
+        return Err<GpuTextureView, string>(err != null ? err : _gpu_fail("view", null));
+    }
+    return Ok<GpuTextureView, string>(out);
+}
+
+// A 2D view of one layer (or cube face) and one mip level: a render target
+// for that part of the texture.
+Result<GpuTextureView, string> GpuTexture_view_level(*GpuTexture self, uint32 layer, uint32 mip) {
+    GpuViewDesc d = GpuViewDesc{dimension: WGPUTextureViewDimension_2D, base_mip: mip, mips: 1, base_layer: layer, layers: 1};
+    return GpuTexture_view_with(self, &d);
+}
+
+// The whole texture seen in another format, one of the view_formats it was
+// made with (or the sRGB/linear twin of a surface's): sampled or rendered
+// through an sRGB view, values are converted to and from linear light; through
+// a linear view they are taken as they are.
+Result<GpuTextureView, string> GpuTexture_view_as(*GpuTexture self, WGPUTextureFormat format) {
+    GpuViewDesc d = GpuViewDesc{format: format, dimension: self.dimension};
+    return GpuTexture_view_with(self, &d);
+}
+
+// Releases the view (not its texture); a second call does nothing.
+void GpuTextureView_release(*GpuTextureView self) {
+    if (self.view != null) wgpuTextureViewRelease(self.view);
+    self.view = null;
+}
+
+// Records a copy of the texture into a new MapRead buffer with rows padded
+// to 256 bytes, and submits it.
+Result<GpuReadback, string> _gpu_read_start(*GpuTexture self, uint32 layer, uint32 mip) {
+    *Gpu g = &self.gpu;
+    if (self.samples > 1) return Err<GpuReadback, string>(_gpu_fail("read: a multisampled texture cannot be read back (read the target it resolves into)", null));
+    uint32 bx = 0;
+    uint32 by = 0;
+    uint32 row = 0;
+    _gpu_level_blocks(self, mip, &bx, &by, &row);
+    uint32 bw = 1;
+    uint32 bh = 1;
+    uint32 bytes = 4;
+    _gpu_format_block(self.format, &bw, &bh, &bytes);
+    GpuReadback rb;
+    rb.gpu = *g;
+    rb.width = bx;
+    rb.height = by;
+    rb.row = row;
+    rb.padded = (rb.row + 255) / 256 * 256;
+    GpuBuffer staging = Gpu_buffer(g, (uint64)rb.padded * by, WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst)?;
+    rb.staging = staging.handle;
+    _gpu_push(g);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
+    WGPUTexelCopyTextureInfo src = WGPUTexelCopyTextureInfo{texture: self.handle, mipLevel: mip, origin: WGPUOrigin3D{0, 0, layer}, aspect: WGPUTextureAspect_All};
+    WGPUTexelCopyBufferInfo dst = WGPUTexelCopyBufferInfo{WGPUTexelCopyBufferLayout{0, rb.padded, by}, rb.staging};
+    WGPUExtent3D size = WGPUExtent3D{bx * bw, by * bh, 1};
+    wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &size);
+    string err = _gpu_finish(g, enc, "read");
+    if (err != null) {
+        wgpuBufferRelease(rb.staging);
+        return Err<GpuReadback, string>(err);
+    }
+    rb.wait = alloc<_GpuWait>(1);
+    WGPUBufferMapCallbackInfo mi = WGPUBufferMapCallbackInfo{mode: WGPUCallbackMode_AllowSpontaneous, callback: (*void)_gpu_on_map, userdata1: rb.wait};
+    rb.wait.future = wgpuBufferMapAsync(rb.staging, WGPUMapMode_Read, 0, (uint64)rb.padded * rb.height, mi).id;
+    return Ok<GpuReadback, string>(rb);
+}
+
+// Copies the texture's pixels (rows packed) to out, after the work submitted
+// so far has finished.
+Result<int, string> GpuTexture_read(*GpuTexture self, *void out) {
+    return GpuTexture_read_level(self, 0, 0, out);
+}
+
+// GpuTexture_read for one layer (or cube face) and mip level.
+Result<int, string> GpuTexture_read_level(*GpuTexture self, uint32 layer, uint32 mip, *void out) {
+    GpuReadback rb = _gpu_read_start(self, layer, mip)?;
+    defer GpuReadback_release(&rb);
+    return GpuReadback_take(&rb, out);
+}
+
+// Starts copying the texture's pixels back without waiting for the GPU: after
+// the frame's submission, take the pixels once ready() says so (or call take(),
+// which waits), then release the readback.
+//
+//     GpuReadback rb = target.read_async()?;
+//     ...later frames:
+//     if (rb.ready()) { rb.take(pixels)?; rb.release(); }
+Result<GpuReadback, string> GpuTexture_read_async(*GpuTexture self) {
+    return _gpu_read_start(self, 0, 0);
+}
+
+// Whether the pixels have arrived; it checks without blocking. In a browser, when they
+// have not, it lets the browser run for a moment (its callbacks bring them).
+bool GpuReadback_ready(*GpuReadback self) {
+    if (self.wait == null) return false;
+#ifdef __EMSCRIPTEN__
+    if (self.wait.done == 0) emscripten_sleep(0);
+#else
+    if (self.wait.done == 0) wgpuDevicePoll(self.gpu.device, 0, null);
+#endif
+    return self.wait.done != 0;
+}
+
+// Copies the pixels (rows packed) to out, waiting for them if needed; once.
+Result<int, string> GpuReadback_take(*GpuReadback self, *void out) {
+    if (self.wait == null || self.staging == null) return Err<int, string>(_gpu_fail("read: no readback, or already taken", null));
+    _gpu_wait(&self.gpu, self.wait);
+    if (self.wait.done == 0 || self.wait.status != WGPUMapAsyncStatus_Success) return Err<int, string>(_gpu_fail("read", &self.wait.msg));
+    uint64 bytes = (uint64)self.padded * self.height;
+    *uint8 rows = (*uint8)wgpuBufferGetConstMappedRange(self.staging, 0, bytes);
+    for (y in 0..self.height) {
+        memcpy((*uint8)out + (uint64)y * self.row, rows + (uint64)y * self.padded, (int64)self.row);
+    }
+    wgpuBufferUnmap(self.staging);
+    wgpuBufferRelease(self.staging);
+    self.staging = null;
+    return Ok<int, string>(0);
+}
+
+// Waits for the copy if it is still on its way, then frees the staging buffer, whether or
+// not the pixels were taken.
+void GpuReadback_release(*GpuReadback self) {
+    if (self.wait != null) {
+        _gpu_wait(&self.gpu, self.wait);
+        String_free(&self.wait.msg);
+        free(self.wait);
+    }
+    if (self.staging != null) wgpuBufferRelease(self.staging);
+    self.wait = null;
+    self.staging = null;
+}
+
+// Releases the texture and its view; a second call does nothing. Views made from it with
+// view_with or view_as are released separately.
+void GpuTexture_release(*GpuTexture self) {
+    if (self.view != null) wgpuTextureViewRelease(self.view);
+    if (self.handle != null) wgpuTextureRelease(self.handle);
+    self.view = null;
+    self.handle = null;
+}

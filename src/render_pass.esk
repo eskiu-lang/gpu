@@ -1,0 +1,540 @@
+// render_pass.esk: encoders, passes and surfaces (part of render.esk, which imports it in order after the ones before it)
+
+WGPURenderPassColorAttachment _gpu_color_attachment(GpuColorAttachment a) {
+    return WGPURenderPassColorAttachment{view: a.view, depthSlice: WGPU_DEPTH_SLICE_UNDEFINED,
+        resolveTarget: a.resolve, loadOp: a.load ? WGPULoadOp_Load : WGPULoadOp_Clear,
+        storeOp: a.discard ? WGPUStoreOp_Discard : WGPUStoreOp_Store, clearValue: a.clear};
+}
+
+void _gpu_begin(*GpuPass p, WGPUTextureView target, *GpuPassOptions o) {
+    WGPURenderPassColorAttachment[8] colors;
+    uint32 ncolors = 0;
+    if (o.color_count > 8) {
+        p.err = "pass: more than 8 color attachments";
+    } else if (o.color_count > 0 && target != null) {
+        p.err = "pass: a target and colors given; with colors, pass a null target";
+    } else if (o.color_count > 0) {
+        for (i in 0..o.color_count) colors[i] = _gpu_color_attachment(o.colors[i]);
+        ncolors = o.color_count;
+    } else if (target != null) {
+        colors[0] = _gpu_color_attachment(GpuColorAttachment{target, o.clear, o.load, o.resolve, o.discard});
+        ncolors = 1;
+    }
+    WGPURenderPassDepthStencilAttachment da;
+    WGPURenderPassDescriptor rd = WGPURenderPassDescriptor{colorAttachmentCount: (uint64)ncolors, colorAttachments: &colors[0]};
+    if (o.depth != null || o.depth_view != null) {
+        // Each aspect's ops are given only when the format has it: ops for a
+        // missing aspect are a validation error.
+        WGPUTextureFormat df = o.depth_view != null ? o.depth_view.format : o.depth.format;
+        da = WGPURenderPassDepthStencilAttachment{view: o.depth_view != null ? o.depth_view.view : o.depth.view};
+        p.depth_format = df;
+        if (df != WGPUTextureFormat_Stencil8) {
+            da.depthLoadOp = o.depth_load ? WGPULoadOp_Load : WGPULoadOp_Clear;
+            da.depthStoreOp = WGPUStoreOp_Store;
+            da.depthClearValue = 1.0;
+        }
+        if (_gpu_has_stencil(df)) {
+            da.stencilLoadOp = o.stencil_load ? WGPULoadOp_Load : WGPULoadOp_Clear;
+            da.stencilStoreOp = WGPUStoreOp_Store;
+            da.stencilClearValue = o.stencil_clear;
+        }
+        rd.depthStencilAttachment = &da;
+    }
+    p.pass = wgpuCommandEncoderBeginRenderPass(p.enc, &rd);
+}
+
+// A pass recorded into the encoder: end() closes it, and the encoder's
+// submit() sends it with the others and reports its errors.
+GpuPass GpuEncoder_pass(*GpuEncoder self, WGPUTextureView target, GpuColor clear, *GpuTexture depth) {
+    GpuPassOptions o = GpuPassOptions{clear: clear, depth: depth};
+    return GpuEncoder_pass_with(self, target, &o);
+}
+
+// GpuEncoder_pass with every attachment setting of GpuPassOptions (load instead of clear,
+// stencil, multisample resolve, several color targets).
+GpuPass GpuEncoder_pass_with(*GpuEncoder self, WGPUTextureView target, *GpuPassOptions o) {
+    GpuPass p;
+    p.gpu = self.gpu;
+    p.enc = self.enc;
+    p.encoder = self;
+    _gpu_begin(&p, target, o);
+    return p;
+}
+
+// Sends the passes to the GPU and reports the errors of the whole frame.
+Result<int, string> GpuEncoder_submit(*GpuEncoder self) {
+    string err = _gpu_finish(&self.gpu, self.enc, "frame");
+    self.enc = null;
+    for (i in 0..self.groups.size) wgpuBindGroupRelease(self.groups.data[i]);
+    List_free(&self.groups);
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+// Finishes enc and pops the error scope pushed when it was made; the commands
+// are submitted only when they are valid (wgpu-native aborts on submitting
+// invalid ones). Releases enc.
+string _gpu_finish(*Gpu g, WGPUCommandEncoder enc, string what) {
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(enc, null);
+    wgpuCommandEncoderRelease(enc);
+#ifdef __EMSCRIPTEN__
+    // The wait for the scope lets the browser run, and a canvas texture expires at the
+    // next display refresh: the work goes to the queue before that wait.
+    if (cmd != null) wgpuQueueSubmit(g.queue, 1, &cmd);
+    string err = _gpu_pop(g, what);
+#else
+    string err = _gpu_pop(g, what);
+    if (err == null && cmd != null) wgpuQueueSubmit(g.queue, 1, &cmd);
+#endif
+    if (cmd != null) wgpuCommandBufferRelease(cmd);
+    return err;
+}
+
+// Starts a render pass that clears target to clear (and depth, when given, to
+// 1.0). Errors in the pass are reported by end().
+GpuPass Gpu_pass(*Gpu self, WGPUTextureView target, GpuColor clear, *GpuTexture depth) {
+    GpuPassOptions o = GpuPassOptions{clear: clear, depth: depth};
+    return Gpu_pass_with(self, target, &o);
+}
+
+// Gpu_pass with load ops per attachment: a pass that draws over what an
+// earlier pass left (a UI over the scene).
+GpuPass Gpu_pass_with(*Gpu self, WGPUTextureView target, *GpuPassOptions o) {
+    GpuPass p;
+    p.gpu = *self;
+    _gpu_push(self);
+    p.enc = wgpuDeviceCreateCommandEncoder(self.device, null);
+    _gpu_begin(&p, target, o);
+    return p;
+}
+
+void _gpu_pass_setup(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices) {
+    wgpuRenderPassEncoderSetPipeline(self.pass, pipe.handle);
+    if (pipe.entries.size > 0) {
+        _gpu_group_for(self, pipe.layout, &pipe.entries, &pipe.group, &pipe.group_stale);
+        wgpuRenderPassEncoderSetBindGroup(self.pass, 0, pipe.group, 0, null);
+    }
+    if (vertices != null) wgpuRenderPassEncoderSetVertexBuffer(self.pass, 0, vertices.handle, 0, vertices.size);
+}
+
+// Sets bind group index for the draws that follow (it stays set across
+// pipelines whose layouts agree on it).
+void GpuPass_set_group(*GpuPass self, uint32 index, *GpuBindGroup g) {
+    _gpu_group_for(self, g.layout, &g.entries, &g.handle, &g.stale);
+    wgpuRenderPassEncoderSetBindGroup(self.pass, index, g.handle, 0, null);
+}
+
+// Sets vertex buffer slot for the draws that follow; slot 0 is also set by
+// the vertices argument of draw() when it is not null.
+void GpuPass_set_vertices(*GpuPass self, uint32 slot, *GpuBuffer b) {
+    wgpuRenderPassEncoderSetVertexBuffer(self.pass, slot, b.handle, 0, b.size);
+}
+
+// Clips the draws that follow to a rectangle of the target, in pixels from
+// the top left.
+void GpuPass_set_scissor(*GpuPass self, uint32 x, uint32 y, uint32 width, uint32 height) {
+    wgpuRenderPassEncoderSetScissorRect(self.pass, x, y, width, height);
+}
+
+// Maps clip space to a rectangle of the target, in pixels from the top left,
+// and depth to min_depth..max_depth.
+void GpuPass_set_viewport(*GpuPass self, float x, float y, float width, float height, float min_depth = 0.0, float max_depth = 1.0) {
+    wgpuRenderPassEncoderSetViewport(self.pass, x, y, width, height, min_depth, max_depth);
+}
+
+// The reference value of the stencil tests (and of the Replace op) for the
+// draws that follow; 0 when the pass starts.
+void GpuPass_set_stencil_reference(*GpuPass self, uint32 reference) {
+    wgpuRenderPassEncoderSetStencilReference(self.pass, reference);
+}
+
+// The constant of the GPU_BLEND_CONSTANT preset and of WGPUBlendFactor_Constant.
+void GpuPass_set_blend_constant(*GpuPass self, GpuColor c) {
+    wgpuRenderPassEncoderSetBlendConstant(self.pass, &c);
+}
+
+// Draws count vertices instances times; vertices may be null for a shader
+// that makes its own (from @builtin(vertex_index)) or for buffers set with
+// set_vertices().
+void GpuPass_draw(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, uint32 count, uint32 instances) {
+    _gpu_pass_setup(self, pipe, vertices);
+    wgpuRenderPassEncoderDraw(self.pass, count, instances, 0, 0);
+}
+
+// GpuPass_draw from vertex first and instance first_instance.
+void GpuPass_draw_range(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, uint32 first, uint32 count, uint32 first_instance, uint32 instances) {
+    _gpu_pass_setup(self, pipe, vertices);
+    wgpuRenderPassEncoderDraw(self.pass, count, instances, first, first_instance);
+}
+
+// Draws count indices from the uint32 index buffer indices, instances times, with the
+// vertices of vertices (or of the buffers set with set_vertices() when vertices is null).
+void GpuPass_draw_indexed(*GpuPass self, *GpuPipeline pipe, *GpuBuffer vertices, *GpuBuffer indices, uint32 count, uint32 instances) {
+    _gpu_pass_setup(self, pipe, vertices);
+    wgpuRenderPassEncoderSetIndexBuffer(self.pass, indices.handle, WGPUIndexFormat_Uint32, 0, indices.size);
+    wgpuRenderPassEncoderDrawIndexed(self.pass, count, instances, 0, 0, 0);
+}
+
+// Ends the pass and submits it; a pass from a GpuEncoder is submitted (and
+// its errors reported) by the encoder's submit().
+Result<int, string> GpuPass_end(*GpuPass self) {
+    *Gpu g = &self.gpu;
+    wgpuRenderPassEncoderEnd(self.pass);
+    wgpuRenderPassEncoderRelease(self.pass);
+    self.pass = null;
+    if (self.encoder != null) {
+        for (i in 0..self.groups.size) List_push(&self.encoder.groups, self.groups.data[i]);
+        List_free(&self.groups);
+        if (self.err != null) return Err<int, string>(_gpu_fail(self.err, null));
+        return Ok<int, string>(0);
+    }
+    string err = _gpu_finish(g, self.enc, "render pass");
+    self.enc = null;
+    for (i in 0..self.groups.size) wgpuBindGroupRelease(self.groups.data[i]);
+    List_free(&self.groups);
+    if (self.err != null) return Err<int, string>(_gpu_fail(self.err, null));
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+string _gpu_mip_shader =
+    "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {\n"
+    "    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {\n"
+    "    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1, 1);\n"
+    "    let o = vec2<i32>(pos.xy) * 2;\n"
+    "    let a = textureLoad(src, min(o, last), 0);\n"
+    "    let b = textureLoad(src, min(o + vec2<i32>(1, 0), last), 0);\n"
+    "    let c = textureLoad(src, min(o + vec2<i32>(0, 1), last), 0);\n"
+    "    let d = textureLoad(src, min(o + vec2<i32>(1, 1), last), 0);\n"
+    "    return (a + b + c + d) * 0.25;\n"
+    "}\n";
+
+// Fills mip levels 1 and up of every layer (and cube face) from level 0, on
+// the GPU: each texel of a level is the average of the 2x2 texels under it
+// (the last row or column repeats for odd sizes), in linear light for sRGB
+// formats. WebGPU has no mipmap call, so it is a render pass per level and
+// layer; the texture needs RenderAttachment and TextureBinding usage (the
+// Gpu_texture_with default for renderable formats) and a renderable float or
+// normalized format (RGBA8, BGRA8, sRGB, RGBA16Float, RGBA32Float...).
+// Call it after writing or rendering level 0, such as an environment cube.
+Result<int, string> GpuTexture_generate_mips(*GpuTexture self) {
+    if (self.mips <= 1) return Ok<int, string>(0);
+    *Gpu g = &self.gpu;
+    if (!_gpu_renderable(self.format) || _gpu_is_integer(self.format) || self.samples > 1) {
+        return Err<int, string>(_gpu_fail("generate_mips: the format cannot be rendered into and filtered", null));
+    }
+    WGPUTextureUsage need = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    if (self.usage != 0 && (self.usage & need) != need) {
+        return Err<int, string>(_gpu_fail("generate_mips: the texture needs RenderAttachment and TextureBinding usage", null));
+    }
+#ifdef __EMSCRIPTEN__
+    // WebGL2 cannot sample one layer of a cube or array texture as a 2D texture, so the
+    // backend makes the levels itself, with the same 2x2 box filter.
+    if (g.webgl2) {
+        _gpu_push(g);
+        wgpuTextureSetLabel(self.handle, gpu_str("__gpu_generate_mipmap"));
+        string merr = _gpu_pop(g, "generate_mips");
+        if (merr != null) return Err<int, string>(merr);
+        return Ok<int, string>(0);
+    }
+#endif
+    GpuBindLayout bl = Gpu_bind_layout(g);
+    defer GpuBindLayout_release(&bl);
+    GpuBindLayout_texture(&bl, 0, WGPUShaderStage_Fragment, WGPUTextureSampleType_UnfilterableFloat);
+    *GpuBindLayout[1] groups = {&bl};
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_mip_shader, vertex: "vs", fragment: "fs", format: self.format,
+        groups: &groups[0], group_count: 1};
+    GpuPipeline pipe = Gpu_pipeline(g, &d)?;
+    defer GpuPipeline_release(&pipe);
+    List<WGPUTextureView> views;
+    List<WGPUBindGroup> made;
+    _gpu_push(g);
+    WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(g.device, null);
+    uint32 layers = self.layers != 0 ? self.layers : (uint32)1;
+    for (layer in 0..layers) {
+        for (level in 1..self.mips) {
+            WGPUTextureViewDescriptor sd = WGPUTextureViewDescriptor{format: self.format, dimension: WGPUTextureViewDimension_2D,
+                baseMipLevel: level - 1, mipLevelCount: 1, baseArrayLayer: layer, arrayLayerCount: 1, aspect: WGPUTextureAspect_All};
+            WGPUTextureView src = wgpuTextureCreateView(self.handle, &sd);
+            sd.baseMipLevel = level;
+            WGPUTextureView dst = wgpuTextureCreateView(self.handle, &sd);
+            List_push(&views, src);
+            List_push(&views, dst);
+            WGPUBindGroupEntry e = WGPUBindGroupEntry{binding: 0, textureView: src};
+            WGPUBindGroupDescriptor bd = WGPUBindGroupDescriptor{layout: bl.handle, entryCount: 1, entries: &e};
+            WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g.device, &bd);
+            List_push(&made, bg);
+            WGPURenderPassColorAttachment color = _gpu_color_attachment(GpuColorAttachment{view: dst});
+            WGPURenderPassDescriptor rd = WGPURenderPassDescriptor{colorAttachmentCount: 1, colorAttachments: &color};
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(enc, &rd);
+            wgpuRenderPassEncoderSetPipeline(pass, pipe.handle);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, bg, 0, null);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+        }
+    }
+    string err = _gpu_finish(g, enc, "generate_mips");
+    for (i in 0..made.size) {
+        if (made.data[i] != null) wgpuBindGroupRelease(made.data[i]);
+    }
+    for (i in 0..views.size) {
+        if (views.data[i] != null) wgpuTextureViewRelease(views.data[i]);
+    }
+    List_free(&made);
+    List_free(&views);
+    if (err != null) return Err<int, string>(err);
+    return Ok<int, string>(0);
+}
+
+// The WebGPU format of a Vulkan format number (a KTX2 file's vkFormat), or
+// Undefined for one without an equivalent here.
+WGPUTextureFormat gpu_vk_format(uint32 vk) {
+    if (vk >= 133 && vk <= 146) return (WGPUTextureFormat)(0x32 + vk - 133);
+    if (vk == 131 || vk == 132) return (WGPUTextureFormat)(0x32 + vk - 131);
+    if (vk >= 147 && vk <= 156) return (WGPUTextureFormat)(0x40 + vk - 147);
+    if (vk >= 157 && vk <= 184) return (WGPUTextureFormat)(0x4A + vk - 157);
+    if (vk == 9) return WGPUTextureFormat_R8Unorm;
+    if (vk == 10) return WGPUTextureFormat_R8Snorm;
+    if (vk == 16) return WGPUTextureFormat_RG8Unorm;
+    if (vk == 17) return WGPUTextureFormat_RG8Snorm;
+    if (vk == 37) return WGPUTextureFormat_RGBA8Unorm;
+    if (vk == 38) return WGPUTextureFormat_RGBA8Snorm;
+    if (vk == 43) return WGPUTextureFormat_RGBA8UnormSrgb;
+    if (vk == 44) return WGPUTextureFormat_BGRA8Unorm;
+    if (vk == 50) return WGPUTextureFormat_BGRA8UnormSrgb;
+    if (vk == 64) return WGPUTextureFormat_RGB10A2Unorm;
+    if (vk == 76) return WGPUTextureFormat_R16Float;
+    if (vk == 83) return WGPUTextureFormat_RG16Float;
+    if (vk == 97) return WGPUTextureFormat_RGBA16Float;
+    if (vk == 100) return WGPUTextureFormat_R32Float;
+    if (vk == 103) return WGPUTextureFormat_RG32Float;
+    if (vk == 109) return WGPUTextureFormat_RGBA32Float;
+    if (vk == 122) return WGPUTextureFormat_RG11B10Ufloat;
+    if (vk == 123) return WGPUTextureFormat_RGB9E5Ufloat;
+    return WGPUTextureFormat_Undefined;
+}
+
+// An Err when the device cannot make textures of a block-compressed format.
+string _gpu_format_missing(*Gpu g, WGPUTextureFormat f) {
+    uint32 v = (uint32)f;
+    if (v >= 0x32 && v <= 0x3F && !g.bc) return "texture: this device has no texture-compression-bc (Gpu.bc)";
+    if (v >= 0x40 && v <= 0x49 && !g.etc2) return "texture: this device has no texture-compression-etc2 (Gpu.etc2)";
+    if (v >= 0x4A && v <= 0x65 && !g.astc) return "texture: this device has no texture-compression-astc (Gpu.astc)";
+    return null;
+}
+
+// A texture holding a KTX2 file's images (<gpu/ktx2>): its format, layers,
+// cube faces and mip levels. A file that asks for mip levels to be made gets
+// them from generate_mips when its format is renderable. A block-compressed
+// format needs the device feature (Gpu.bc, etc2, astc), else an Err.
+Result<GpuTexture, string> Gpu_ktx2(*Gpu self, *Ktx2 k) {
+    WGPUTextureFormat f = gpu_vk_format(k.vk_format);
+    if (f == WGPUTextureFormat_Undefined) return Err<GpuTexture, string>(_gpu_fail("ktx2: no WebGPU format for this vkFormat", null));
+    string missing = _gpu_format_missing(self, f);
+    if (missing != null) return Err<GpuTexture, string>(_gpu_fail(missing, null));
+    bool make = k.want_mips && _gpu_renderable(f) && !_gpu_is_integer(f);
+    GpuTextureDesc d = GpuTextureDesc{width: k.width, height: k.height, format: f, layers: k.layers * k.faces,
+        cube: k.faces == 6, mips: k.levels, mipmaps: make};
+    GpuTexture t = Gpu_texture_with(self, &d)?;
+    for (level in 0..k.levels) {
+        for (layer in 0..k.layers) {
+            for (face in 0..k.faces) {
+                Result<int, string> w = GpuTexture_write_level(&t, layer * k.faces + face, level, Ktx2_image(k, level, layer, face));
+                if (!w.ok) {
+                    GpuTexture_release(&t);
+                    return Err<GpuTexture, string>(w.error);
+                }
+            }
+        }
+    }
+    if (make) {
+        Result<int, string> m = GpuTexture_generate_mips(&t);
+        if (!m.ok) {
+            GpuTexture_release(&t);
+            return Err<GpuTexture, string>(m.error);
+        }
+    }
+    return Ok<GpuTexture, string>(t);
+}
+
+Result<GpuSurface, string> _gpu_surface(*Gpu self, *WGPUChainedStruct source) {
+    WGPUSurfaceDescriptor d = WGPUSurfaceDescriptor{nextInChain: source};
+    WGPUSurface s = wgpuInstanceCreateSurface(self.instance, &d);
+    if (s == null) return Err<GpuSurface, string>(_gpu_fail("surface", null));
+    WGPUSurfaceCapabilities caps;
+    wgpuSurfaceGetCapabilities(s, self.adapter, &caps);
+    WGPUTextureFormat format = WGPUTextureFormat_BGRA8Unorm;
+    for (i in 0..caps.formatCount) {
+        if (caps.formats[i] == WGPUTextureFormat_BGRA8Unorm || caps.formats[i] == WGPUTextureFormat_RGBA8Unorm) {
+            format = caps.formats[i];
+            break;
+        }
+    }
+    wgpuSurfaceCapabilitiesFreeMembers(caps);
+    return Ok<GpuSurface, string>(GpuSurface{*self, s, format, 0, 0, WGPUTextureFormat_Undefined});
+}
+
+#ifdef __EMSCRIPTEN__
+extern int emscripten_get_canvas_element_size(string target, *int width, *int height);
+extern int emscripten_request_animation_frame(*void callback, *void user_data);
+
+bool _gpu_on_animation_frame(double time, *void u) {
+    *(*int)u = 1;
+    return false;
+}
+
+Result<GpuSurface, string> _gpu_native_only(string what) {
+    String_clear(&_gpu_err);
+    String_appendf(&_gpu_err, "%s: not in a browser (use Gpu_surface_canvas)", what);
+    return Err<GpuSurface, string>(_gpu_err.data);
+}
+#endif
+
+// A surface over a CAMetalLayer (macOS, iOS).
+Result<GpuSurface, string> Gpu_surface_metal(*Gpu self, *void layer) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_metal");
+#else
+    WGPUSurfaceSourceMetalLayer src = WGPUSurfaceSourceMetalLayer{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceMetalLayer}, layer: layer};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over an X11 window (display is the Display*).
+Result<GpuSurface, string> Gpu_surface_x11(*Gpu self, *void display, uint64 window) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_x11");
+#else
+    WGPUSurfaceSourceXlibWindow src = WGPUSurfaceSourceXlibWindow{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceXlibWindow}, display: display, window: window};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over a Wayland wl_surface (display is the wl_display*).
+Result<GpuSurface, string> Gpu_surface_wayland(*Gpu self, *void display, *void surface) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_wayland");
+#else
+    WGPUSurfaceSourceWaylandSurface src = WGPUSurfaceSourceWaylandSurface{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceWaylandSurface}, display: display, surface: surface};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over a Win32 window.
+Result<GpuSurface, string> Gpu_surface_win32(*Gpu self, *void hinstance, *void hwnd) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_win32");
+#else
+    WGPUSurfaceSourceWindowsHWND src = WGPUSurfaceSourceWindowsHWND{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceWindowsHWND}, hinstance: hinstance, hwnd: hwnd};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over an Android ANativeWindow*.
+Result<GpuSurface, string> Gpu_surface_android(*Gpu self, *void window) {
+#ifdef __EMSCRIPTEN__
+    return _gpu_native_only("surface_android");
+#else
+    WGPUSurfaceSourceAndroidNativeWindow src = WGPUSurfaceSourceAndroidNativeWindow{chain: WGPUChainedStruct{null, WGPUSType_SurfaceSourceAndroidNativeWindow}, window: window};
+    return _gpu_surface(self, (*WGPUChainedStruct)&src);
+#endif
+}
+
+// A surface over an HTML canvas in a browser, found by a CSS selector such as "#canvas",
+// and configured to the canvas's size in pixels (its width and height attributes).
+// Fails outside a browser (wasm32-unknown-emscripten). docs/web.md has the build flags.
+Result<GpuSurface, string> Gpu_surface_canvas(*Gpu self, string selector) {
+#ifdef __EMSCRIPTEN__
+    WGPUEmscriptenSurfaceSourceCanvasHTMLSelector src = WGPUEmscriptenSurfaceSourceCanvasHTMLSelector{
+        chain: WGPUChainedStruct{null, WGPUSType_EmscriptenSurfaceSourceCanvasHTMLSelector}, selector: gpu_str(selector)};
+    GpuSurface s = _gpu_surface(self, (*WGPUChainedStruct)&src)?;
+    int w = 0;
+    int h = 0;
+    emscripten_get_canvas_element_size(selector, &w, &h);
+    GpuSurface_configure(&s, (uint32)(w > 0 ? w : 300), (uint32)(h > 0 ? h : 150));
+    return Ok<GpuSurface, string>(s);
+#else
+    return Err<GpuSurface, string>(_gpu_fail("surface_canvas: only in a browser (wasm32-unknown-emscripten)", null));
+#endif
+}
+
+// Sets the size of the surface's frames, in pixels; call it again when the
+// window is resized.
+void GpuSurface_configure(*GpuSurface self, uint32 width, uint32 height) {
+    self.width = width;
+    self.height = height;
+    WGPUSurfaceConfiguration c = WGPUSurfaceConfiguration{device: self.gpu.device, format: self.format,
+        usage: WGPUTextureUsage_RenderAttachment, width: width, height: height,
+        alphaMode: WGPUCompositeAlphaMode_Auto, presentMode: WGPUPresentMode_Fifo};
+    if (self.view_format != WGPUTextureFormat_Undefined) {
+        c.viewFormatCount = 1;
+        c.viewFormats = &self.view_format;
+    }
+    wgpuSurfaceConfigure(self.handle, &c);
+}
+
+// GpuSurface_configure with a second view format for the frames, the sRGB or
+// linear twin of the surface's format (gpu_srgb_format(surface.format)): each
+// frame then has alt_view, so a frame can draw a scene through the sRGB view
+// and an interface through the linear one. Later configure() calls keep it.
+// Whether a surface can take view formats depends on the platform: Metal can,
+// Vulkan needs VK_KHR_swapchain_mutable_format.
+void GpuSurface_configure_with(*GpuSurface self, uint32 width, uint32 height, WGPUTextureFormat view_format) {
+    self.view_format = view_format;
+    GpuSurface_configure(self, width, height);
+}
+
+// The next frame to draw into. An error means the surface needs configure()
+// again (after a resize) or the frame was skipped.
+Result<GpuFrame, string> GpuSurface_frame(*GpuSurface self) {
+    WGPUSurfaceTexture st;
+    wgpuSurfaceGetCurrentTexture(self.handle, &st);
+    if (st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && st.status != WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal) {
+        if (st.texture != null) wgpuTextureRelease(st.texture);
+        String_clear(&_gpu_err);
+        String_appendf(&_gpu_err, "surface frame unavailable (status %d)", (int)st.status);
+        return Err<GpuFrame, string>(_gpu_err.data);
+    }
+    GpuFrame f = GpuFrame{st.texture, wgpuTextureCreateView(st.texture, null), null};
+    if (self.view_format != WGPUTextureFormat_Undefined) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: self.view_format, dimension: WGPUTextureViewDimension_2D,
+            mipLevelCount: 1, arrayLayerCount: 1, aspect: WGPUTextureAspect_All};
+        f.alt_view = wgpuTextureCreateView(st.texture, &vd);
+    }
+    return Ok<GpuFrame, string>(f);
+}
+
+// Shows the frame and releases it. In a browser the canvas shows it at the next display
+// refresh: present releases the frame and suspends the program until the browser's
+// next animation frame, which keeps a frame loop at the display's rate.
+void GpuSurface_present(*GpuSurface self, *GpuFrame frame) {
+#ifndef __EMSCRIPTEN__
+    wgpuSurfacePresent(self.handle);
+#endif
+    if (frame.alt_view != null) wgpuTextureViewRelease(frame.alt_view);
+    wgpuTextureViewRelease(frame.view);
+    wgpuTextureRelease(frame.texture);
+#ifdef __EMSCRIPTEN__
+    int shown = 0;
+    emscripten_request_animation_frame((*void)_gpu_on_animation_frame, &shown);
+    for (i in 0..1000) {
+        if (shown != 0) break;
+        emscripten_sleep(1);
+    }
+#endif
+}
+
+// Unconfigures and releases the surface; a second call does nothing. Present or drop the
+// current frame first.
+void GpuSurface_release(*GpuSurface self) {
+    if (self.handle != null) {
+        wgpuSurfaceUnconfigure(self.handle);
+        wgpuSurfaceRelease(self.handle);
+    }
+    self.handle = null;
+}

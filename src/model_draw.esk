@@ -1,0 +1,619 @@
+// model_draw.esk: the drawable model: its GPU resources, lights, morphs, camera and joints (part of model.esk, which imports it in order after the ones before it)
+
+// Uploads data's meshes, materials and textures and builds the pipelines for color targets
+// of format (an sRGB format or not: the shader encodes sRGB itself when it is not). The
+// pipelines test against a Depth24Plus depth texture (Gpu_depth). Point and line
+// primitives are skipped. data must outlive the model. The light
+// starts as a warm white sun from above (intensity 3) with a gray-blue ambient.
+Result<GpuModel, string> Gpu_model(*Gpu self, *Gltf data, WGPUTextureFormat format) {
+    GpuModel m;
+    m.gpu = *self;
+    m.data = data;
+    m.light = GpuLight{Vec3{-0.4, -1.0, -0.6}, Vec3{1.0, 0.97, 0.92}, 3.0, Vec3{0.35, 0.38, 0.42}};
+    m.transform = mat4_identity();
+    m.encode_srgb = !_gpu_is_srgb(format);
+    Result<int, string> pr = _gpu_model_pipelines(&m, format);
+    if (!pr.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(pr.error);
+    }
+    Result<GpuBuffer, string> fb = Gpu_uniform(self, null, 224);
+    if (!fb.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(fb.error);
+    }
+    m.frame = fb.value;
+    Result<int, string> nr = _gpu_model_fallbacks(&m);
+    if (!nr.ok) {
+        GpuModel_release(&m);
+        return Err<GpuModel, string>(nr.error);
+    }
+
+    uint8[4] white = {255, 255, 255, 255};
+    uint8[4] flat = {128, 128, 255, 255};
+    GpuImageOptions srgb = GpuImageOptions{srgb: true};
+    List_push(&m.textures, Gpu_image_with(self, 1, 1, &white, &srgb).value);
+    List_push(&m.textures, Gpu_image(self, 1, 1, &white).value);
+    List_push(&m.textures, Gpu_image(self, 1, 1, &flat).value);
+    GpuSamplerOptions dso = _gpu_gltf_sampler(null);
+    List_push(&m.samplers, Gpu_sampler_with(self, &dso).value);
+    for (i in 0..data.samplers.size) {
+        GpuSamplerOptions so = _gpu_gltf_sampler(&data.samplers.data[i]);
+        List_push(&m.samplers, Gpu_sampler_with(self, &so).value);
+    }
+
+    int nmat = data.materials.size;
+    for (i in 0..nmat + 1) {
+        GltfMaterial gm;
+        if (i < nmat) gm = data.materials.data[i];
+        else gm = GltfMaterial{base_color: Vec4{1.0, 1.0, 1.0, 1.0}, metallic: 0.0, roughness: 0.8,
+            base_color_texture: GltfTextureRef{-1, 0, 1.0}, metallic_roughness_texture: GltfTextureRef{-1, 0, 1.0},
+            normal_texture: GltfTextureRef{-1, 0, 1.0}, occlusion_texture: GltfTextureRef{-1, 0, 1.0},
+            emissive_texture: GltfTextureRef{-1, 0, 1.0}, alpha_cutoff: 0.5};
+        _GpuMat mat;
+        GltfTextureRef[5] refs = {gm.base_color_texture, gm.metallic_roughness_texture, gm.normal_texture,
+            gm.occlusion_texture, gm.emissive_texture};
+        bool[5] is_srgb = {true, false, false, false, true};
+        int[5] fallback = {0, 1, 2, 1, 0};
+        for (k in 0..5) {
+            mat.tex[k] = fallback[k];
+            mat.samp[k] = 0;
+            int ti = refs[k].texture;
+            if (ti >= 0 && ti < data.textures.size) {
+                GltfTexture* tx = &data.textures.data[ti];
+                mat.tex[k] = _gpu_model_texture(&m, tx.image, is_srgb[k], fallback[k]);
+                if (tx.sampler >= 0) mat.samp[k] = tx.sampler + 1;
+            }
+        }
+        float[60] u;
+        _gpu_model_material_floats(&gm, &u[0]);
+        Result<GpuBuffer, string> ub = Gpu_uniform(self, &u, sizeof(u));
+        if (!ub.ok) {
+            GpuModel_release(&m);
+            return Err<GpuModel, string>(ub.error);
+        }
+        mat.uniforms = ub.value;
+        mat.blend = gm.alpha_mode == GLTF_BLEND;
+        mat.pipeline = (mat.blend ? 2 : 0) + (gm.double_sided ? 1 : 0);
+        List_push(&m.materials, mat);
+    }
+
+    for (i in 0..data.meshes.size) {
+        List_push(&m.prim_start, m.prims.size);
+        GltfMesh* mesh = &data.meshes.data[i];
+        for (p in 0..mesh.primitives.size) {
+            GltfPrimitive* gp = &mesh.primitives.data[p];
+            _GpuPrim prim;
+            prim.drawable = gp.mode == GLTF_TRIANGLES && gp.index_count >= 3 && gp.vertex_count > 0;
+            if (prim.drawable) {
+                *float verts = _gpu_model_vertices(gp);
+                Result<GpuBuffer, string> vb = Gpu_vertices(self, verts, (uint64)gp.vertex_count * _GM_VERTEX_FLOATS * 4);
+                free(verts);
+                Result<GpuBuffer, string> ib = Gpu_indices(self, gp.indices, (uint64)gp.index_count);
+                if (!vb.ok || !ib.ok) {
+                    GpuModel_release(&m);
+                    return Err<GpuModel, string>(!vb.ok ? vb.error : ib.error);
+                }
+                prim.vertices = vb.value;
+                prim.indices = ib.value;
+                prim.index_count = gp.index_count;
+                prim.vertex_count = gp.vertex_count;
+                if (gp.target_count > 0 && self.webgl2) {
+                    Result<GpuTexture, string> mt = _gpu_model_morph_texture(self, gp);
+                    if (!mt.ok) {
+                        prim.vertices.release();
+                        prim.indices.release();
+                        GpuModel_release(&m);
+                        return Err<GpuModel, string>(mt.error);
+                    }
+                    prim.morph_tex = mt.value;
+                    prim.targets = gp.target_count;
+                } else if (gp.target_count > 0) {
+                    *float deltas = _gpu_model_morph(gp);
+                    Result<GpuBuffer, string> mb = Gpu_buffer(self, (uint64)gp.target_count * gp.vertex_count * 48,
+                        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+                    if (mb.ok) mb.value.write(0, deltas, (uint64)gp.target_count * gp.vertex_count * 48);
+                    free(deltas);
+                    if (!mb.ok) {
+                        prim.vertices.release();
+                        prim.indices.release();
+                        GpuModel_release(&m);
+                        return Err<GpuModel, string>(mb.error);
+                    }
+                    prim.morph = mb.value;
+                    prim.targets = gp.target_count;
+                }
+            }
+            List_push(&m.prims, prim);
+        }
+    }
+
+    Mat4 ident = mat4_identity();
+    for (i in 0..data.nodes.size) {
+        GltfNode* node = &data.nodes.data[i];
+        if (node.mesh < 0) continue;
+        GltfMesh* mesh = &data.meshes.data[node.mesh];
+        for (p in 0..mesh.primitives.size) {
+            int pi = m.prim_start.data[node.mesh] + p;
+            if (!m.prims.data[pi].drawable) continue;
+            _GpuDraw d;
+            d.node = i;
+            d.mesh = node.mesh;
+            d.prim = pi;
+            int mi = mesh.primitives.data[p].material;
+            d.material = mi >= 0 && mi < nmat ? mi : nmat;
+            d.pipeline = m.materials.data[d.material].pipeline;
+            Result<GpuBuffer, string> ub = Gpu_uniform(self, null, 144);
+            int njoints = 1;
+            d.skinned = node.skin >= 0 && node.skin < data.skins.size && mesh.primitives.data[p].joints != null;
+            if (d.skinned) njoints = data.skins.data[node.skin].joints.size;
+            if (njoints < 1) njoints = 1;
+            if (self.webgl2 && njoints > _GM_GL_JOINTS) {
+                if (ub.ok) ub.value.release();
+                GpuModel_release(&m);
+                return Err<GpuModel, string>(_gpu_fail("model: a skin with more than 256 joints (WebGL2)", null));
+            }
+            Result<GpuBuffer, string> jb = self.webgl2
+                ? Gpu_buffer(self, (uint64)_GM_GL_JOINTS * 64, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)
+                : Gpu_buffer(self, (uint64)njoints * 64, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+            if (!ub.ok || !jb.ok) {
+                GpuModel_release(&m);
+                return Err<GpuModel, string>(!ub.ok ? ub.error : jb.error);
+            }
+            d.uniforms = ub.value;
+            d.joints = jb.value;
+            if (!d.skinned) d.joints.write(0, &ident, 64);
+            d.targets = m.prims.data[pi].targets;
+            if (d.targets > 0) {
+                Result<GpuBuffer, string> wb = self.webgl2
+                    ? Gpu_buffer(self, (uint64)_GM_GL_TARGETS * 4, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)
+                    : Gpu_buffer(self, (uint64)((d.targets + 3) / 4 * 16), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst);
+                if (!wb.ok) {
+                    d.uniforms.release();
+                    d.joints.release();
+                    GpuModel_release(&m);
+                    return Err<GpuModel, string>(wb.error);
+                }
+                d.weights = wb.value;
+            }
+            List_push(&m.draws, d);
+        }
+    }
+    m.world = alloc<Mat4>(data.nodes.size + 1);
+    m.shown = alloc<bool>(data.nodes.size + 1);
+    m.material_version = data.material_version;
+    GpuModel_update(&m, ident);
+    return Ok<GpuModel, string>(m);
+}
+
+// Recomputes the node and joint matrices from the Gltf's current pose (after
+// Gltf_animate, or after changing nodes by hand) and places the whole model
+// with transform.
+void GpuModel_update(*GpuModel self, Mat4 transform) {
+    self.transform = transform;
+    Gltf_world(self.data, self.world);
+    _gpu_model_visibility(self);
+    if (self.material_version != self.data.material_version) {
+        // Animation pointer channels changed materials: write their uniforms again.
+        self.material_version = self.data.material_version;
+        for (i in 0..self.data.materials.size) {
+            if (i >= self.materials.size) break;
+            float[60] mu;
+            _gpu_model_material_floats(&self.data.materials.data[i], &mu[0]);
+            self.materials.data[i].uniforms.write(0, &mu, sizeof(mu));
+        }
+    }
+    *Mat4 jm = null;
+    int jcap = 0;
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        Mat4 model = transform * self.world[d.node];
+        float skinned = 0.0;
+        if (d.skinned) {
+            model = transform;
+            skinned = 1.0;
+            int skin = self.data.nodes.data[d.node].skin;
+            int n = self.data.skins.data[skin].joints.size;
+            if (n > jcap) {
+                if (jm != null) free(jm);
+                jm = alloc<Mat4>(n);
+                jcap = n;
+            }
+            Gltf_joint_matrices(self.data, skin, self.world, jm);
+            d.joints.write(0, jm, (uint64)n * 64);
+        }
+        Mat4 normal = model.inverse().transpose();
+        float[36] u;
+        for (k in 0..16) {
+            u[k] = model.m[k];
+            u[16 + k] = normal.m[k];
+        }
+        u[32] = skinned;
+        if (d.targets > 0) {
+            u[33] = (float)d.targets;
+            u[34] = (float)self.prims.data[d.prim].vertex_count;
+            _gpu_model_upload_weights(self, d);
+        }
+        d.uniforms.write(0, &u, 144);
+    }
+    if (jm != null) free(jm);
+}
+
+void _gpu_model_upload_weights(*GpuModel self, _GpuDraw* d) {
+    List<float>* w = &self.data.nodes.data[d.node].weights;
+    float[64] small;
+    *float buf = d.targets <= 64 ? &small[0] : alloc<float>(d.targets);
+    for (k in 0..d.targets) buf[k] = k < w.size ? w.data[k] : 0.0;
+    d.weights.write(0, buf, (uint64)d.targets * 4);
+    if (d.targets > 64) free(buf);
+}
+
+// Sets node's morph target weights (as Gltf_set_weights) and sends them to
+// the GPU at once, without a full update().
+void GpuModel_set_weights(*GpuModel self, int node, *float weights, int count) {
+    Gltf_set_weights(self.data, node, weights, count);
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (d.node == node && d.targets > 0) _gpu_model_upload_weights(self, d);
+    }
+}
+
+// Lights the model with ibl (diffuse and specular ambient, scaled by
+// ibl.intensity) instead of the hemisphere ambient of GpuModel.light; null
+// goes back to it. ibl must outlive its use by the model.
+void GpuModel_set_ibl(*GpuModel self, *GpuIbl ibl) {
+    self.ibl = ibl;
+}
+
+// The textures bound when a feature is off: a zero storage buffer, a 1x1
+// cube and a 1x1 depth texture.
+Result<int, string> _gpu_model_fallbacks(*GpuModel self) {
+    if (self.gpu.webgl2) {
+        self._no_morph = Gpu_buffer(&self.gpu, (uint64)_GM_GL_TARGETS * 4, WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst)?;
+        self._no_morph_tex = Gpu_texture(&self.gpu, 1, 1, WGPUTextureFormat_RGBA32Float, WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst)?;
+    } else {
+        self._no_morph = Gpu_buffer(&self.gpu, 48, WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst)?;
+    }
+    GpuTextureDesc cd = GpuTextureDesc{width: 1, height: 1, format: WGPUTextureFormat_RGBA16Float, cube: true};
+    self._no_cube = Gpu_texture_with(&self.gpu, &cd)?;
+    self._no_shadow = Gpu_depth_texture(&self.gpu, 1, 1, 0, 1)?;
+    GpuSamplerOptions so = GpuSamplerOptions{wrap_u: WGPUAddressMode_ClampToEdge, wrap_v: WGPUAddressMode_ClampToEdge,
+        compare: WGPUCompareFunction_LessEqual};
+    self.shadow_sampler = Gpu_sampler_with(&self.gpu, &so)?;
+    return Ok<int, string>(0);
+}
+
+// Turns on shadows from GpuModel.light (see GpuShadowOptions; null for the
+// defaults). Each frame, after update() and before the pass that draws the
+// model, render the shadow map with render_shadows (or render_shadows_in).
+Result<int, string> GpuModel_enable_shadows(*GpuModel self, *GpuShadowOptions o) {
+    GpuShadowOptions so;
+    if (o != null) so = *o;
+    if (so.size == 0) so.size = 2048;
+    if (so.bias == 0.0) so.bias = 0.002;
+    if (so.normal_bias == 0.0) so.normal_bias = 1.5;
+    if (so.slope_bias == 0.0) so.slope_bias = 1.0;
+    GpuModel_disable_shadows(self);
+    GpuTexture map = Gpu_depth_texture(&self.gpu, so.size, so.size, WGPUTextureFormat_Depth32Float, 1)?;
+    GpuVertexLayout layout = GpuVertexLayout{stride: (uint64)_GM_VERTEX_FLOATS * 4};
+    defer layout.release();
+    _gpu_model_layout(&layout);
+    GpuPipelineDesc d = GpuPipelineDesc{wgsl: _gpu_model_wgsl(&self.gpu), vertex: "vs_shadow", fragment: null, layout: &layout,
+        depth: true, depth_format: WGPUTextureFormat_Depth32Float, depth_bias_slope: so.slope_bias};
+    Result<GpuPipeline, string> p = Gpu_pipeline(&self.gpu, &d);
+    if (!p.ok) {
+        map.release();
+        return Err<int, string>(p.error);
+    }
+    self.shadow = so;
+    self.shadow_map = map;
+    self.shadow_pipeline = p.value;
+    self.shadows = true;
+    return Ok<int, string>(0);
+}
+
+// Turns shadows off and releases the shadow map and its pipeline; does nothing when they
+// are off.
+void GpuModel_disable_shadows(*GpuModel self) {
+    if (!self.shadows) return;
+    self.shadow_map.release();
+    self.shadow_pipeline.release();
+    self.shadows = false;
+}
+
+// The light's view and orthographic projection around the model (or around
+// GpuShadowOptions.center), and the shader's shadow settings, into the frame
+// uniforms.
+void _gpu_model_light(*GpuModel self) {
+    Vec3 dir = self.light.direction.normalize();
+    Vec3 c = self.shadow.center;
+    float r = self.shadow.radius;
+    if (r <= 0.0) {
+        Vec3 lo;
+        Vec3 hi;
+        Gltf_bounds(self.data, &lo, &hi);
+        Vec3 a;
+        Vec3 b;
+        for (k in 0..8) {
+            Vec3 p = self.transform.point(Vec3{(k & 1) != 0 ? hi.x : lo.x, (k & 2) != 0 ? hi.y : lo.y, (k & 4) != 0 ? hi.z : lo.z});
+            if (k == 0) {
+                a = p;
+                b = p;
+            }
+            a = Vec3{p.x < a.x ? p.x : a.x, p.y < a.y ? p.y : a.y, p.z < a.z ? p.z : a.z};
+            b = Vec3{p.x > b.x ? p.x : b.x, p.y > b.y ? p.y : b.y, p.z > b.z ? p.z : b.z};
+        }
+        c = (a + b) * 0.5;
+        r = (b - a).length() * 0.5;
+        if (r <= 0.0) r = 1.0;
+    }
+    Vec3 up = dir.y > 0.99 || dir.y < -0.99 ? Vec3{0.0, 0.0, 1.0} : Vec3{0.0, 1.0, 0.0};
+    Mat4 view = mat4_look_at(c - dir * (r * 2.0), c, up);
+    self.light_view_proj = mat4_ortho(-r, r, -r, r, 0.0, r * 4.0) * view;
+    self._shadow_params[0] = 1.0;
+    self._shadow_params[1] = self.shadow.bias;
+    self._shadow_params[2] = self.shadow.normal_bias * 2.0 * r / (float)self.shadow.size;
+    self._shadow_params[3] = 1.0 / (float)self.shadow.size;
+    float[20] f;
+    for (k in 0..16) f[k] = self.light_view_proj.m[k];
+    for (k in 0..4) f[16 + k] = self._shadow_params[k];
+    self.frame.write(128, &f, sizeof(f));
+}
+
+void _gpu_model_shadow_draws(*GpuModel self, *GpuPass pass) {
+    GpuPipeline* pipe = &self.shadow_pipeline;
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (self.materials.data[d.material].blend || !self.shown[d.node]) continue;
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pipe.bind(0, &self.frame);
+        pipe.bind(1, &d.uniforms);
+        pipe.bind(3, &d.joints);
+        _gpu_model_bind_morph(self, pipe, d, pr);
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+}
+
+// Renders the shadow map from the light, in a submission of its own. The
+// opaque and masked parts cast shadows (masks as if opaque), blended ones do
+// not. Does nothing when shadows are off.
+Result<int, string> GpuModel_render_shadows(*GpuModel self) {
+    if (!self.shadows) return Ok<int, string>(0);
+    _gpu_model_light(self);
+    GpuPassOptions o = GpuPassOptions{depth: &self.shadow_map};
+    GpuPass pass = Gpu_pass_with(&self.gpu, null, &o);
+    _gpu_model_shadow_draws(self, &pass);
+    return pass.end();
+}
+
+// GpuModel_render_shadows as a pass of enc, before the pass that draws the
+// model in the same submission.
+Result<int, string> GpuModel_render_shadows_in(*GpuModel self, *GpuEncoder enc) {
+    if (!self.shadows) return Ok<int, string>(0);
+    _gpu_model_light(self);
+    GpuPassOptions o = GpuPassOptions{depth: &self.shadow_map};
+    GpuPass pass = GpuEncoder_pass_with(enc, null, &o);
+    _gpu_model_shadow_draws(self, &pass);
+    return pass.end();
+}
+
+void _gpu_model_bind_morph(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d, _GpuPrim* pr) {
+    if (self.gpu.webgl2) pipe.bind_texture(14, d.targets > 0 ? &pr.morph_tex : &self._no_morph_tex);
+    else pipe.bind(14, d.targets > 0 ? &pr.morph : &self._no_morph);
+    pipe.bind(15, d.targets > 0 ? &d.weights : &self._no_morph);
+}
+
+void _gpu_model_bind(*GpuModel self, *GpuPipeline pipe, _GpuDraw* d) {
+    _GpuMat* mat = &self.materials.data[d.material];
+    pipe.bind(0, &self.frame);
+    pipe.bind(1, &d.uniforms);
+    pipe.bind(2, &mat.uniforms);
+    pipe.bind(3, &d.joints);
+    for (k in 0..5) {
+        pipe.bind_texture((uint32)(4 + k * 2), &self.textures.data[mat.tex[k]]);
+        pipe.bind_sampler((uint32)(5 + k * 2), &self.samplers.data[mat.samp[k]]);
+    }
+    _GpuPrim* pr = &self.prims.data[d.prim];
+    _gpu_model_bind_morph(self, pipe, d, pr);
+    pipe.bind_texture(16, self.ibl != null ? &self.ibl.irradiance : &self._no_cube);
+    pipe.bind_texture(17, self.ibl != null ? &self.ibl.specular : &self._no_cube);
+    pipe.bind_texture(18, self.ibl != null ? &self.ibl.brdf : &self.textures.data[1]);
+    pipe.bind_sampler(19, self.ibl != null ? &self.ibl.sampler : &self.samplers.data[0]);
+    pipe.bind_texture(20, self.shadows ? &self.shadow_map : &self._no_shadow);
+    pipe.bind_sampler(21, &self.shadow_sampler);
+}
+
+// Draws the model into pass (which needs a depth texture) as seen by camera:
+// opaque and masked parts first, then blended parts from back to front.
+void GpuModel_draw(*GpuModel self, *GpuPass pass, *GpuCamera camera) {
+    Mat4 vp = camera.proj * camera.view;
+    Vec3 dir = self.light.direction.normalize();
+    float[56] f;
+    for (k in 0..16) f[k] = vp.m[k];
+    f[16] = camera.eye.x;
+    f[17] = camera.eye.y;
+    f[18] = camera.eye.z;
+    f[19] = 1.0;
+    f[20] = dir.x;
+    f[21] = dir.y;
+    f[22] = dir.z;
+    f[23] = self.light.intensity;
+    f[24] = self.light.color.x;
+    f[25] = self.light.color.y;
+    f[26] = self.light.color.z;
+    f[27] = 1.0;
+    f[28] = self.light.ambient.x;
+    f[29] = self.light.ambient.y;
+    f[30] = self.light.ambient.z;
+    f[31] = self.encode_srgb ? 1.0 : 0.0;
+    if (self.shadows) {
+        for (k in 0..16) f[32 + k] = self.light_view_proj.m[k];
+        for (k in 0..4) f[48 + k] = self._shadow_params[k];
+    }
+    if (self.ibl != null) {
+        f[52] = 1.0;
+        f[53] = self.ibl.intensity;
+        f[54] = GpuIbl_max_lod(self.ibl);
+    }
+    self.frame.write(0, &f, sizeof(f));
+    List<int> blended;
+    defer List_free(&blended);
+    for (i in 0..self.draws.size) {
+        _GpuDraw* d = &self.draws.data[i];
+        if (!self.shown[d.node]) continue;
+        if (self.materials.data[d.material].blend) {
+            Vec3 c = (self.transform * self.world[d.node]).point(Vec3{0.0, 0.0, 0.0});
+            d.depth = (camera.view.point(c)).z;
+            List_push(&blended, i);
+            continue;
+        }
+        GpuPipeline* pipe = &self.pipelines.data[d.pipeline];
+        _gpu_model_bind(self, pipe, d);
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+    for (a in 0..blended.size) {
+        for (b in a + 1..blended.size) {
+            if (self.draws.data[blended.data[b]].depth < self.draws.data[blended.data[a]].depth) {
+                int t = blended.data[a];
+                blended.data[a] = blended.data[b];
+                blended.data[b] = t;
+            }
+        }
+    }
+    for (i in 0..blended.size) {
+        _GpuDraw* d = &self.draws.data[blended.data[i]];
+        GpuPipeline* pipe = &self.pipelines.data[d.pipeline];
+        _gpu_model_bind(self, pipe, d);
+        _GpuPrim* pr = &self.prims.data[d.prim];
+        pass.draw_indexed(pipe, &pr.vertices, &pr.indices, pr.index_count, 1);
+    }
+}
+
+// A camera at eye looking at target, with a perspective of fovy radians.
+GpuCamera gpu_camera(Vec3 eye, Vec3 target, float fovy, float aspect, float near, float far) {
+    return GpuCamera{mat4_look_at(eye, target, Vec3{0.0, 1.0, 0.0}), mat4_perspective(fovy, aspect, near, far), eye};
+}
+
+// A camera that frames the whole model from the front, a little above.
+GpuCamera GpuModel_camera(*GpuModel self, float aspect) {
+    Vec3 lo;
+    Vec3 hi;
+    Gltf_bounds(self.data, &lo, &hi);
+    Vec3 center = self.transform.point((lo + hi) * 0.5);
+    float radius = (hi - lo).length() * 0.5;
+    if (radius <= 0.0) radius = 1.0;
+    Vec3 eye = center + Vec3{0.0, radius * 0.35, radius * 2.4};
+    return gpu_camera(eye, center, 0.8, aspect, radius * 0.05, radius * 20.0);
+}
+
+// Releases every GPU object of the model and its buffers of matrices. It does not free the
+// Gltf or the GpuIbl.
+void GpuModel_release(*GpuModel self) {
+    for (i in 0..self.pipelines.size) self.pipelines.data[i].release();
+    for (i in 0..self.textures.size) self.textures.data[i].release();
+    for (i in 0..self.samplers.size) self.samplers.data[i].release();
+    for (i in 0..self.materials.size) self.materials.data[i].uniforms.release();
+    for (i in 0..self.prims.size) {
+        if (self.prims.data[i].drawable) {
+            self.prims.data[i].vertices.release();
+            self.prims.data[i].indices.release();
+        }
+    }
+    for (i in 0..self.prims.size) {
+        if (self.prims.data[i].targets > 0) {
+            self.prims.data[i].morph.release();
+            self.prims.data[i].morph_tex.release();
+        }
+    }
+    for (i in 0..self.draws.size) {
+        self.draws.data[i].uniforms.release();
+        self.draws.data[i].joints.release();
+        if (self.draws.data[i].targets > 0) self.draws.data[i].weights.release();
+    }
+    GpuModel_disable_shadows(self);
+    self._no_morph.release();
+    self._no_morph_tex.release();
+    self._no_cube.release();
+    self._no_shadow.release();
+    self.shadow_sampler.release();
+    self.frame.release();
+    List_free(&self.pipelines);
+    List_free(&self.textures);
+    List_free(&self.texture_keys);
+    List_free(&self.samplers);
+    List_free(&self.materials);
+    List_free(&self.prims);
+    List_free(&self.prim_start);
+    List_free(&self.draws);
+    if (self.world != null) free(self.world);
+    self.world = null;
+    if (self.shown != null) free(self.shown);
+    self.shown = null;
+}
+
+// A skin's joint matrices in a GPU buffer, for skinning in your own shader:
+// joint j's matrix (joint world matrix times inverse bind matrix) is the
+// mat4x4<f32> at byte j * 64. Gpu_joints makes a storage buffer
+// (var<storage, read> joints: array<mat4x4<f32>>); Gpu_joints_uniform a
+// uniform buffer of capacity matrices (var<uniform> joints:
+// array<mat4x4<f32>, capacity>), for targets without vertex storage buffers.
+// As in glTF, a skinned mesh ignores its own node's transform:
+//
+//     let skin = joints[j.x] * w.x + joints[j.y] * w.y + joints[j.z] * w.z + joints[j.w] * w.w;
+//     out.pos = view_proj * skin * vec4(p, 1.0);
+//
+// update() recomputes the matrices from the Gltf's current pose.
+struct GpuJoints {
+    GpuBuffer buffer;
+    int skin;
+    int count;
+    *Mat4 world;
+    *Mat4 matrices;
+}
+
+// The joint matrices of skin (an index into data.skins) in a storage buffer, filled from
+// data's current pose. Fails when the skin does not exist.
+Result<GpuJoints, string> Gpu_joints(*Gpu self, *Gltf data, int skin) {
+    return _gpu_joints(self, data, skin, 0, WGPUBufferUsage_Storage);
+}
+
+// The joint matrices of skin in a uniform buffer of capacity matrices (the unused ones are
+// identity). Fails when the skin does not exist or has more joints than capacity.
+Result<GpuJoints, string> Gpu_joints_uniform(*Gpu self, *Gltf data, int skin, int capacity) {
+    return _gpu_joints(self, data, skin, capacity, WGPUBufferUsage_Uniform);
+}
+
+Result<GpuJoints, string> _gpu_joints(*Gpu self, *Gltf data, int skin, int capacity, WGPUBufferUsage usage) {
+    if (skin < 0 || skin >= data.skins.size) return Err<GpuJoints, string>(_gpu_fail("joints: no such skin", null));
+    GpuJoints j;
+    j.skin = skin;
+    j.count = data.skins.data[skin].joints.size;
+    if (capacity > 0 && capacity < j.count) return Err<GpuJoints, string>(_gpu_fail("joints: the skin has more joints than capacity", null));
+    int n = capacity > 0 ? capacity : j.count;
+    if (n < 1) n = 1;
+    j.buffer = Gpu_buffer(self, (uint64)n * 64, usage | WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc)?;
+    j.world = alloc<Mat4>(data.nodes.size + 1);
+    j.matrices = alloc<Mat4>(n);
+    for (i in 0..n) j.matrices[i] = mat4_identity();
+    j.buffer.write(0, j.matrices, (uint64)n * 64);
+    GpuJoints_update(&j, data);
+    return Ok<GpuJoints, string>(j);
+}
+
+// Recomputes the joint matrices from data's current pose (after Gltf_animate) and writes
+// them to the buffer. data must be the Gltf the joints were made from.
+void GpuJoints_update(*GpuJoints self, *Gltf data) {
+    Gltf_world(data, self.world);
+    Gltf_joint_matrices(data, self.skin, self.world, self.matrices);
+    if (self.count > 0) self.buffer.write(0, self.matrices, (uint64)self.count * 64);
+}
+
+// Releases the buffer and frees the matrices.
+void GpuJoints_release(*GpuJoints self) {
+    self.buffer.release();
+    if (self.world != null) free(self.world);
+    if (self.matrices != null) free(self.matrices);
+    self.world = null;
+    self.matrices = null;
+}
