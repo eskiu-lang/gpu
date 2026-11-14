@@ -63,7 +63,14 @@ uint16 image_f16(float f) {
 // texture.
 void HdrBitmap_to_half(*HdrBitmap self, *uint16 out) {
     uint64 n = (uint64)self.width * self.height * 4;
-    for (i in 0..n) out[i] = image_f16(self.rgba[i]);
+    for (i in 0..n) {
+        // within half's finite range: an unclipped sun (a value past 65504) would be infinite
+        // and turn the lighting made from it into NaN
+        float v = self.rgba[i];
+        if (!(v > 0.0)) v = 0.0;
+        if (v > 65504.0) v = 65504.0;
+        out[i] = image_f16(v);
+    }
 }
 
 struct _Hdr {
