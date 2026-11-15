@@ -1,0 +1,162 @@
+// tokenizer.esk: the tokenizer (part of llama2.esk, which imports it in order after the ones before it)
+
+// ── Tokenizer ────────────────────────────────────────────────────────────────
+
+string load_tokenizer(Tokenizer* t, string path, int vocab_size) {
+    int64 n = 0;
+    *uint8 d = fs_read_all(path, &n);
+    if (d == null) return "cannot read the tokenizer";
+    defer free(d);
+    t.vocab_size = vocab_size;
+    t.vocab = alloc<*char>(vocab_size);
+    t.scores = alloc<float>(vocab_size);
+    for (i in 0..256) {
+        t.byte_pieces[i * 2] = (uint8)i;
+        t.byte_pieces[i * 2 + 1] = 0;
+    }
+    Map_init(&t.lookup, vocab_size * 2);
+    int64 at = 0;
+    if (n < 4) return "the tokenizer is too short";
+    memcpy(&t.max_token_length, d, 4);
+    at = 4;
+    for (i in 0..vocab_size) {
+        if (at + 8 > n) return "the tokenizer is truncated";
+        int len = 0;
+        memcpy(&t.scores[i], d + at, 4);
+        memcpy(&len, d + at + 4, 4);
+        at += 8;
+        if (len < 0 || at + len > n) return "the tokenizer is truncated";
+        t.vocab[i] = alloc<char>(len + 1);
+        memcpy(t.vocab[i], d + at, len);
+        at += len;
+        int created = 0;
+        *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
+        if (created != 0) *slot = i;
+    }
+    return null;
+}
+
+// The tokenizer stored in a GGUF file (SentencePiece pieces, with U+2581 for
+// a space as llama2.c's tokenizer.bin writes a plain space).
+string load_tokenizer_gguf(Tokenizer* t, *Gguf f) {
+    List<String> toks;
+    f.strings("tokenizer.ggml.tokens", &toks);
+    if (toks.size == 0) return "the GGUF file has no tokenizer";
+    t.vocab_size = toks.size;
+    t.vocab = alloc<*char>(toks.size);
+    t.scores = alloc<float>(toks.size);
+    f.floats("tokenizer.ggml.scores", t.scores, (uint64)toks.size);
+    for (i in 0..256) {
+        t.byte_pieces[i * 2] = (uint8)i;
+        t.byte_pieces[i * 2 + 1] = 0;
+    }
+    Map_init(&t.lookup, toks.size * 2);
+    for (i in 0..toks.size) {
+        String* src = &toks.data[i];
+        String piece;
+        int64 k = 0;
+        while (k < src.len) {
+            if (k + 2 < src.len && (uint8)src.data[k] == 0xE2 && (uint8)src.data[k + 1] == 0x96 && (uint8)src.data[k + 2] == 0x81) {
+                String_push(&piece, ' ');
+                k += 3;
+            } else {
+                String_push(&piece, src.data[k]);
+                k++;
+            }
+        }
+        if (piece.data == null) String_append(&piece, "");
+        if ((int)piece.len > t.max_token_length) t.max_token_length = (int)piece.len;
+        t.vocab[i] = piece.data;
+        int created = 0;
+        *int slot = Map_at(&t.lookup, (string)t.vocab[i], &created);
+        if (created != 0) *slot = i;
+        String_free(src);
+    }
+    List_free(&toks);
+    return null;
+}
+
+int str_lookup(Tokenizer* t, string s) {
+    return Map_get_or(&t.lookup, s, -1);
+}
+
+int hex_digit(char c) {
+    if (c >= '0' && c <= '9') return (int)(c - '0');
+    if (c >= 'A' && c <= 'F') return (int)(c - 'A') + 10;
+    if (c >= 'a' && c <= 'f') return (int)(c - 'a') + 10;
+    return 0;
+}
+
+string decode(Tokenizer* t, int prev, int token) {
+    *char piece = t.vocab[token];
+    if (prev == 1 && piece[0] == ' ') piece = piece + 1;
+    if (piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && piece[5] == '>' && piece[6] == 0) {
+        int b = hex_digit(piece[3]) * 16 + hex_digit(piece[4]);
+        piece = (*char)&t.byte_pieces[b * 2];
+    }
+    return (string)piece;
+}
+
+void safe_print(string piece) {
+    if (piece == null || piece[0] == 0) return;
+    if (piece[1] == 0) {
+        uint8 b = (uint8)piece[0];
+        if (!(isprint((int)b) != 0 || isspace((int)b) != 0)) return;
+    }
+    printf("%s", piece);
+}
+
+// Encodes text into tokens (BPE by merge score), with BOS and no EOS.
+int encode(Tokenizer* t, string text, *int tokens) {
+    *char buf = alloc<char>(t.max_token_length * 2 + 3);
+    defer free(buf);
+    int n = 0;
+    tokens[n] = 1;
+    n++;
+    if (text[0] != 0) {
+        tokens[n] = str_lookup(t, " ");
+        n++;
+    }
+    int len = 0;
+    for (*char c = (*char)text; *c != 0; c = c + 1) {
+        if (((int)(uint8)*c & 0xC0) != 0x80) len = 0;
+        buf[len] = *c;
+        len++;
+        buf[len] = 0;
+        if (((int)(uint8)c[1] & 0xC0) == 0x80 && len < 4) continue;
+        int id = str_lookup(t, (string)buf);
+        if (id != -1) {
+            tokens[n] = id;
+            n++;
+        } else {
+            for (i in 0..len) {
+                tokens[n] = (int)(uint8)buf[i] + 3;
+                n++;
+            }
+        }
+        len = 0;
+    }
+    String pair;
+    defer String_free(&pair);
+    while (true) {
+        float best_score = -10000000000.0;
+        int best_id = -1;
+        int best_idx = -1;
+        for (i in 0..n - 1) {
+            String_clear(&pair);
+            String_append(&pair, (string)t.vocab[tokens[i]]);
+            String_append(&pair, (string)t.vocab[tokens[i + 1]]);
+            int id = str_lookup(t, pair.data);
+            if (id != -1 && t.scores[id] > best_score) {
+                best_score = t.scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+        if (best_idx == -1) break;
+        tokens[best_idx] = best_id;
+        for (i in best_idx + 1..n - 1) tokens[i] = tokens[i + 1];
+        n--;
+    }
+    return n;
+}
