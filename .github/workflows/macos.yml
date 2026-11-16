@@ -1,0 +1,29 @@
+# The macOS jobs, apart from CI: the org's macOS runners can take long to start, and a
+# job that waits too long is cancelled; here that does not mark CI failed.
+name: macOS
+on:
+  # once per change: develop (main and the tags only get commits that already ran here)
+  push:
+    branches: [develop]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  WGPU_VERSION: v29.0.1.1
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu, wgpu-native and SDL3
+        run: |
+          brew install eskiu-lang/eskiu/eskiu wgpu-native sdl3
+      - name: Layout check
+        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $(brew --prefix wgpu-native)/include $(brew --prefix)/lib
+      - name: Tests
+        run: eskiuc test -L$(brew --prefix)/lib
+      - name: Examples build
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done

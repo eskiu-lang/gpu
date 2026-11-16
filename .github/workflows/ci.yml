@@ -93,22 +93,6 @@ jobs:
             node tools/web_run.mjs build/web/$t.js --no-webgpu --swiftshader
           done
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Eskiu, wgpu-native and SDL3
-        run: |
-          brew install eskiu-lang/eskiu/eskiu wgpu-native sdl3
-      - name: Layout check
-        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $(brew --prefix wgpu-native)/include $(brew --prefix)/lib
-      - name: Tests
-        run: eskiuc test -L$(brew --prefix)/lib
-      - name: Examples build
-        run: |
-          mkdir -p build
-          for f in examples/*.esk; do eskiuc -L$(brew --prefix)/lib "$f" -o build/$(basename "$f" .esk); done
-
   windows:
     # DirectX 12 through WARP, Windows' software adapter: the tests run with no GPU.
     runs-on: windows-latest
