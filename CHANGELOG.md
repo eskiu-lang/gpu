@@ -3,7 +3,7 @@
 All notable changes to this package are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.7.0] - 2026-11-16
 
 ### Added
 
@@ -20,8 +20,25 @@ All notable changes to this package are documented in this file. The format is b
 - `tests/vrx.esk` with `tests/data/quad.vrx` from `tools/gen_test_vrx.py`, and
   `tests/data/object_star_anim.vrx` from ViroReact's sample app (MIT, Viro Media and the
   Viro Community).
+- `<gpu/external>`: textures made outside wgpu and the device's Vulkan objects, for headset
+  compositors. `Gpu_texture_from_metal` wraps a Metal texture (CompositorServices' color and
+  depth drawables on visionOS); the Vulkan calls import a `VkImage` (an OpenXR swapchain
+  image on Quest) and give the instance, physical device, device and queue an OpenXR session
+  binds to. These calls come from wgpu-native's branch for Eskiu, not in the upstream
+  libraries, so only a program that imports `<gpu/external>` needs that build.
 
-## [0.6.0] - 2026-11-10
+### Fixed
+
+- `HdrBitmap_to_half` keeps values within half's finite range: a sun brighter than 65504 in
+  an HDR environment became infinite and turned the lighting made from it into NaN.
+
+### Changed
+
+- The larger modules keep their parts in private directories (`src/_render/`,
+  `src/_gltf/`, ...), and `examples/llama2` is split by topic. No API change; the package
+  still needs Eskiu 0.15.1, and 0.16.0 for a visionOS build.
+
+## [0.6.0]
 
 ### Added
 

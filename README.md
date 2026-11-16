@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.6.0-6448d4" alt="Version 0.6.0">
+  <img src="https://img.shields.io/badge/version-0.7.0-6448d4" alt="Version 0.7.0">
   <img src="https://img.shields.io/badge/wgpu--native-29-orange" alt="wgpu-native 29">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
@@ -110,7 +110,7 @@ $ eskiuc run twice.esk
 In an Eskiu package (Eskiu 0.15.1 or newer: older compilers reject the `[web]` table):
 
 ```bash
-eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.6.0
+eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.7.0
 eskiuc build
 ```
 

@@ -60,6 +60,7 @@ fingers at once) is in [docs/mobile.md](mobile.md).
 | `<gpu/train>` | `NnGraph`: inputs, parameters, matmul, bias, ReLU, tanh, cross entropy, MSE, `backward`, Adam, SGD |
 | `<gpu/gguf>` | `gguf_load`, metadata, tensors, dequantization of F32, F16, BF16, Q4_0 to Q8_0 and Q2_K to Q6_K |
 | `<gpu/safetensors>` | `safetensors_load`, `SafeTensor_floats`, `SafetensorsWriter` |
+| `<gpu/external>` | `Gpu_texture_from_metal`, `Gpu_texture_from_vulkan`, `Gpu_vulkan_handles`: textures a headset's compositor hands over (visionOS, OpenXR) and the Vulkan objects an OpenXR session binds to; needs wgpu-native's branch for Eskiu |
 | `<gpu/async>` | `Gpu_wait_async` and `GpuBuffer_read_async` for code on the event loop |
 | `<gpu/raw>` | the WebGPU C API, generated from `webgpu.h` and `wgpu.h` |
 
