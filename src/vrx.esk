@@ -329,7 +329,9 @@ int _vrx_image(*_Vrx v, string name) {
     String ext;
     defer String_free(&ext);
     path_extension(&ext, name);
-    bool jpeg = ext.data != null && (strcasecmp(ext.data, ".jpg") == 0 || strcasecmp(ext.data, ".jpeg") == 0);
+    // lower case first: strcasecmp is not in Windows' C library
+    String_lower(&ext);
+    bool jpeg = ext.data != null && (strcmp(ext.data, ".jpg") == 0 || strcmp(ext.data, ".jpeg") == 0);
     String_append(&img.mime, ktx_is_ktx(data, (uint64)n) ? "image/ktx" : jpeg ? "image/jpeg" : "image/png");
     img.data = data;
     img.len = (uint64)n;
