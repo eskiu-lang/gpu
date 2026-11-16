@@ -1,4 +1,4 @@
-// jpeg_decode.esk: scans, Huffman tables, the decoder and EXIF orientation (part of jpeg.esk, which imports it in order after the ones before it)
+// _jpeg/decode.esk: scans, Huffman tables, the decoder and EXIF orientation (part of jpeg.esk, which imports it in order after the ones before it)
 
 string _j_scan(*_Jpeg j) {
     _j_reset(j);

@@ -552,5 +552,5 @@ bool _vrx_has_alpha(*_Vrx v, int texture) {
     return false;
 }
 
-import "vrx_material.esk";
-import "vrx_scene.esk";
+import "_vrx/material.esk";
+import "_vrx/scene.esk";

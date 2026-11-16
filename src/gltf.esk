@@ -537,5 +537,5 @@ int _gltf_ncomp(string t) {
     return 0;
 }
 
-import "gltf_access.esk";
-import "gltf_read.esk";
+import "_gltf/access.esk";
+import "_gltf/read.esk";

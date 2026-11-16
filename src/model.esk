@@ -620,4 +620,4 @@ void _gpu_model_visibility(*GpuModel self) {
     }
 }
 
-import "model_draw.esk";
+import "_model/draw.esk";

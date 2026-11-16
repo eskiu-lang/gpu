@@ -501,4 +501,4 @@ bool _j_after_mcu(*_Jpeg j) {
     return true;
 }
 
-import "jpeg_decode.esk";
+import "_jpeg/decode.esk";

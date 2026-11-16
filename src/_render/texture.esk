@@ -1,4 +1,4 @@
-// render_texture.esk: buffers, textures, mipmaps and readbacks (part of render.esk, which imports it in order after the ones before it)
+// _render/texture.esk: buffers, textures, mipmaps and readbacks (part of render.esk, which imports it in order after the ones before it)
 
 // A uniform buffer of bytes bytes, updated with write().
 Result<GpuBuffer, string> Gpu_uniform(*Gpu self, *void data, uint64 bytes) {

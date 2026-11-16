@@ -1,4 +1,4 @@
-// gltf_access.esk: accessors, primitives and materials (part of gltf.esk, which imports it in order after the ones before it)
+// _gltf/access.esk: accessors, primitives and materials (part of gltf.esk, which imports it in order after the ones before it)
 
 int _gltf_csize(int ctype) {
     if (ctype == 5120 || ctype == 5121) return 1;

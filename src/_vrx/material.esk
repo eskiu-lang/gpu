@@ -1,4 +1,4 @@
-// vrx_material.esk: materials, animations and node transforms (part of vrx.esk, which imports it in order after the ones before it)
+// _vrx/material.esk: materials, animations and node transforms (part of vrx.esk, which imports it in order after the ones before it)
 
 // A viro.Node.Geometry.Material as a glTF material; returns its index.
 int _vrx_material(*_Vrx v, _Pb b) {

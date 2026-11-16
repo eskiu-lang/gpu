@@ -1,4 +1,4 @@
-// render_pass.esk: encoders, passes and surfaces (part of render.esk, which imports it in order after the ones before it)
+// _render/pass.esk: encoders, passes and surfaces (part of render.esk, which imports it in order after the ones before it)
 
 WGPURenderPassColorAttachment _gpu_color_attachment(GpuColorAttachment a) {
     return WGPURenderPassColorAttachment{view: a.view, depthSlice: WGPU_DEPTH_SLICE_UNDEFINED,

@@ -404,6 +404,6 @@ Result<GpuBuffer, string> Gpu_indices(*Gpu self, *uint32 data, uint64 count) {
     return Ok<GpuBuffer, string>(b);
 }
 
-import "render_texture.esk";
-import "render_pipeline.esk";
-import "render_pass.esk";
+import "_render/texture.esk";
+import "_render/pipeline.esk";
+import "_render/pass.esk";

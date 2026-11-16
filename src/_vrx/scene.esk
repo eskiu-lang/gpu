@@ -1,4 +1,4 @@
-// vrx_scene.esk: rigs, nodes and the scene (part of vrx.esk, which imports it in order after the ones before it)
+// _vrx/scene.esk: rigs, nodes and the scene (part of vrx.esk, which imports it in order after the ones before it)
 
 // A rig of node's parent and transform with these bind matrices and animations, -1 when
 // there is none.

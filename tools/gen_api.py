@@ -8,8 +8,9 @@ Run from the package root (the directory holding eskiu.toml). Every top-level pu
 declaration of src/*.esk (a name not starting with `_`, not `extern` or `intrinsic`) is
 listed under its module with the comment block right above it: functions, structs,
 unions, interfaces, enums, type aliases and constants.
-A file a module imports as a part (`import "part.esk";`) is not a module of its own: its
-declarations are listed under the module, in the place of the import. The comment at the top of a file
+A module's parts live in its private directory (`src/_module/`, imported with
+`import "_module/part.esk";`): they are not modules of their own, their declarations are listed
+under the module, in the place of the import. The comment at the top of a file
 describes its module. Lines of a comment indented by four or more spaces are code.
 Files listed in API_SKIP (generated bindings and the WebGL2 backend's embedded
 JavaScript) are left out.
@@ -26,6 +27,11 @@ CONST_RE = re.compile(r"^const\s+.*?\b([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*=")
 FN_RE = re.compile(r"^(?:export\s+|must_use\s+|async\s+|deprecated\s*\([^)]*\)\s*)*"
                    r"[\w<>,\*\[\]\s?]+?[\s\*]([A-Za-z_]\w*)\s*(?:<[^>()]*>)?\s*\(")
 PART_RE = re.compile(r'^import\s+"([^"]+\.esk)"\s*;')
+
+
+def private(rel):
+    # a path inside a module's private directory (a component starting with `_`)
+    return any(c.startswith("_") for c in os.path.normpath(rel).split(os.sep)[:-1])
 OP_RE = re.compile(r"^[\w<>,\*\[\]\s]+?\boperator\s*(\S+?)\s*\(")
 
 
@@ -236,7 +242,7 @@ def parse(path):
             i += 1
             continue
         part = PART_RE.match(line)
-        if part:
+        if part and private(os.path.relpath(os.path.normpath(os.path.join(os.path.dirname(path), part.group(1))), "src")):
             # a part of this module: its declarations are listed here, where it is imported
             items += parse(os.path.join(os.path.dirname(path), part.group(1)))[1]
             comment = []
@@ -346,9 +352,9 @@ def build():
         with open(os.path.join("src", f), encoding="utf-8") as fh:
             for line in fh:
                 m = PART_RE.match(line)
-                if m:
+                if m and private(os.path.normpath(os.path.join(os.path.dirname(f), m.group(1)))):
                     parts.add(os.path.normpath(os.path.join(os.path.dirname(f), m.group(1))))
-    files = [f for f in files if f not in parts]
+    files = [f for f in files if f not in parts and not private(f)]
     main = [f for f in files if os.path.splitext(f)[0] in (pkg, "lib")]
     files = main + [f for f in files if f not in main]
     out = [f"# {pkg} API reference", "",

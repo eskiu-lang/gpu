@@ -1,4 +1,4 @@
-// model_draw.esk: the drawable model: its GPU resources, lights, morphs, camera and joints (part of model.esk, which imports it in order after the ones before it)
+// _model/draw.esk: the drawable model: its GPU resources, lights, morphs, camera and joints (part of model.esk, which imports it in order after the ones before it)
 
 // Uploads data's meshes, materials and textures and builds the pipelines for color targets
 // of format (an sRGB format or not: the shader encodes sRGB itself when it is not). The

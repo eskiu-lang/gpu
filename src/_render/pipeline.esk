@@ -1,4 +1,4 @@
-// render_pipeline.esk: samplers, vertex layouts, pipelines and bind groups (part of render.esk, which imports it in order after the ones before it)
+// _render/pipeline.esk: samplers, vertex layouts, pipelines and bind groups (part of render.esk, which imports it in order after the ones before it)
 
 // A sampler that repeats the texture; linear filtering when linear is true,
 // nearest otherwise. Gpu_sampler_with takes the other settings.

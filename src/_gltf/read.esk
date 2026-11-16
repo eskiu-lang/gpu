@@ -1,4 +1,4 @@
-// gltf_read.esk: the model's nodes, skins and animations, and its queries (part of gltf.esk, which imports it in order after the ones before it)
+// _gltf/read.esk: the model's nodes, skins and animations, and its queries (part of gltf.esk, which imports it in order after the ones before it)
 
 string _gltf_read(*Gltf g, *JsonValue root, *uint8 bin, uint64 bin_len, string base_dir) {
     *JsonValue asset = _gj(root, "asset");
