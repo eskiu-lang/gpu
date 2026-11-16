@@ -2,7 +2,7 @@
 // the drawables a headset's compositor hands over (CompositorServices' Metal textures on
 // visionOS, OpenXR's VkImages on Quest) and the handles an OpenXR session binds to.
 //
-// These calls come from wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu);
+// These calls come from wgpu-native's branch for Eskiu (eskiu-packages/wgpu-native, branch eskiu);
 // the upstream libraries lack them. They are a module of their own so that only a program that
 // imports <gpu/external> needs that build: everything else links the upstream wgpu-native.
 
@@ -11,7 +11,7 @@ import <gpu/core>;
 import <gpu/render>;
 
 #ifdef __APPLE__
-// wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu) adds this call; the
+// wgpu-native's branch for Eskiu (eskiu-packages/wgpu-native, branch eskiu) adds this call; the
 // upstream libraries lack it, so a program that uses Gpu_texture_from_metal links that build.
 extern WGPUTexture wgpuDeviceCreateTextureFromMetal(WGPUDevice device, *void metal_texture, *WGPUTextureDescriptor descriptor);
 

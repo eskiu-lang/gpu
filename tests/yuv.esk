@@ -329,7 +329,7 @@ Result<int, string> draws(*Gpu gpu) {
     return Ok<int, string>(0);
 }
 
-// eskiu-lang/ui-camera's CameraFrame (and eskiu-lang/video's VideoFrame) as they are
+// eskiu-packages/ui-camera's CameraFrame (and eskiu-packages/video's VideoFrame) as they are
 // declared: GpuYuvImage must keep their layout for a pointer cast to work.
 struct CameraPlaneShape { *uint8 data; int row_stride; int pixel_stride; int64 size; }
 struct CameraFrameShape {

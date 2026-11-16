@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/gpu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/eskiu-packages/gpu/actions/workflows/ci.yml"><img src="https://github.com/eskiu-packages/gpu/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/version-0.7.0-6448d4" alt="Version 0.7.0">
   <img src="https://img.shields.io/badge/wgpu--native-29-orange" alt="wgpu-native 29">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
@@ -45,7 +45,7 @@ WGSL.
   GPU too), layered, cube maps and BC, ETC2 or ASTC compressed.
 - **Windows, mobile views and input.** `<gpu/window>` opens a desktop window over SDL3 and
   gives its surface and its keyboard, mouse, gamepad (with rumble) and touch input;
-  `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer` on iOS, `SurfaceView` on Android) inside an [`eskiu-lang/ui`](https://github.com/eskiu-lang/ui) app.
+  `<gpu/ui>` mounts a `GpuView` (`CAMetalLayer` on iOS, `SurfaceView` on Android) inside an [`eskiu-packages/ui`](https://github.com/eskiu-packages/ui) app.
 - **Errors as `Result`.** Every call that can fail returns one, with the message from the
   WebGPU validation layer; a WGSL error comes with its line and column.
 - **The whole API underneath.** `<gpu/raw>` is all of `webgpu.h` and `wgpu.h`, generated,
@@ -110,7 +110,7 @@ $ eskiuc run twice.esk
 In an Eskiu package (Eskiu 0.15.1 or newer: older compilers reject the `[web]` table):
 
 ```bash
-eskiuc add gpu --git https://github.com/eskiu-lang/gpu --rev v0.7.0
+eskiuc add gpu --git https://github.com/eskiu-packages/gpu --rev v0.7.0
 eskiuc build
 ```
 

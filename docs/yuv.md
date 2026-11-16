@@ -17,8 +17,8 @@ GpuSurface surface;
 GpuYuv yuv;        // from gpu.yuv(surface.format), once
 
 // Called with each new frame: (*GpuYuvImage)frame for a CameraFrame from
-// use_camera_frames (eskiu-lang/ui-camera) or a VideoFrame from use_video_frames
-// (eskiu-lang/video).
+// use_camera_frames (eskiu-packages/ui-camera) or a VideoFrame from use_video_frames
+// (eskiu-packages/video).
 Result<int, string> show(*GpuYuvImage frame) {
     yuv.upload(frame)?;
     GpuFrame f = surface.frame()?;
@@ -37,8 +37,8 @@ Result<int, string> show(*GpuYuvImage frame) {
 `GpuYuvImage` describes one frame: its size, its layout (`format`), up to three planes, how
 far to turn it to be upright (`rotation`), and how its YUV maps to RGB (`matrix` and
 `full_range`). It has the field layout of `CameraFrame` from
-[eskiu-lang/ui-camera](https://github.com/eskiu-lang/ui-camera) and `VideoFrame` from
-[eskiu-lang/video](https://github.com/eskiu-lang/video), with the same format and matrix
+[eskiu-packages/ui-camera](https://github.com/eskiu-packages/ui-camera) and `VideoFrame` from
+[eskiu-packages/video](https://github.com/eskiu-packages/video), with the same format and matrix
 numbers, so a pointer to either is cast to a `*GpuYuvImage` and uploaded with no copy;
 `tests/yuv.esk` checks the layout. Any other source fills one by hand.
 

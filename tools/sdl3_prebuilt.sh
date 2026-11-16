@@ -17,7 +17,7 @@ set -eu
 SDL_VERSION=3.4.18
 SDL_SOURCE_SHA256=9c75cf16330322c217dedd2e0609f1124f1b54b8633e763467b4684d0f4334a3
 SDL_MINGW_SHA256=049b9dd711e3fb3f8d84feb998dfec54a75e17cf539c4a80ff4d058d839771cf
-RELEASE_URL=${SDL3_RELEASE_URL:-https://github.com/eskiu-lang/gpu/releases/download/sdl3-$SDL_VERSION}
+RELEASE_URL=${SDL3_RELEASE_URL:-https://github.com/eskiu-packages/gpu/releases/download/sdl3-$SDL_VERSION}
 
 if [ $# -ne 2 ]; then
     echo "usage: $0 PLATFORM OUT_DIR" >&2
@@ -83,10 +83,10 @@ case "$platform" in
 esac
 
 cat > "$stage/README.txt" <<EOF
-SDL $SDL_VERSION for $platform, as eskiu-lang/gpu's eskiu.toml names it ([native.SDL3]).
+SDL $SDL_VERSION for $platform, as eskiu-packages/gpu's eskiu.toml names it ([native.SDL3]).
 
 Source: https://github.com/libsdl-org/SDL/releases/tag/release-$SDL_VERSION
-Built by tools/sdl3_prebuilt.sh in https://github.com/eskiu-lang/gpu (Windows: SDL's own
+Built by tools/sdl3_prebuilt.sh in https://github.com/eskiu-packages/gpu (Windows: SDL's own
 MinGW build, repackaged). SDL is under the zlib license, in LICENSE.txt.
 EOF
 

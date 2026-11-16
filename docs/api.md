@@ -296,7 +296,7 @@ Textures made outside wgpu and the device's Vulkan objects (`<gpu/external>`):
 the drawables a headset's compositor hands over (CompositorServices' Metal textures on
 visionOS, OpenXR's VkImages on Quest) and the handles an OpenXR session binds to.
 
-These calls come from wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu);
+These calls come from wgpu-native's branch for Eskiu (eskiu-packages/wgpu-native, branch eskiu);
 the upstream libraries lack them. They are a module of their own so that only a program that
 imports `<gpu/external>` needs that build: everything else links the upstream wgpu-native.
 
@@ -4389,7 +4389,7 @@ Releases both programs and every value, gradient and optimizer tensor of the gra
 
 ## `<gpu/ui>`
 
-GpuView for eskiu-lang/ui apps on iOS (CAMetalLayer) and Android
+GpuView for eskiu-packages/ui apps on iOS (CAMetalLayer) and Android
 (SurfaceView / ANativeWindow). Import `<gpu/ui>` alongside `<ui>` and `<gpu>`:
 
 ```eskiu
@@ -4859,8 +4859,8 @@ yuv.draw(&pass, &d);
 pass.end()?;
 ```
 
-GpuYuvImage has the field layout of eskiu-lang/ui-camera's CameraFrame and
-eskiu-lang/video's VideoFrame, so a pointer to either is a pointer to one.
+GpuYuvImage has the field layout of eskiu-packages/ui-camera's CameraFrame and
+eskiu-packages/video's VideoFrame, so a pointer to either is a pointer to one.
 
 ### GpuYuvFormat
 

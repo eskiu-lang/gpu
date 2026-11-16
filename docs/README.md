@@ -23,7 +23,7 @@ Guides and reference for gpu. The [README](../README.md) has the overview.
 |---|---|---|---|---|---|---|
 | WebGPU: `<gpu>`, `<gpu/core>`, `<gpu/render>`, `<gpu/yuv>`, `<gpu/model>`, `<gpu/nn>`, `<gpu/train>`, `<gpu/raw>` | yes (Metal) | yes (Vulkan) | yes (DirectX 12, Vulkan) | yes (Metal) | yes (Vulkan) | yes (the browser's WebGPU; rendering also on WebGL2) |
 | `<gpu/window>` (SDL3 desktop windows) | yes | yes | yes | no (use `<gpu/ui>`) | no (use `<gpu/ui>`) | yes (the page's canvas) |
-| `<gpu/ui>` (`GpuView` for `eskiu-lang/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
+| `<gpu/ui>` (`GpuView` for `eskiu-packages/ui`) | — | — | — | yes (`CAMetalLayer`) | yes (`SurfaceView`) | — |
 | `<gpu/math>`, `<gpu/touch>`, `<gpu/image>`, `<gpu/ktx2>`, `<gpu/png>`, `<gpu/jpeg>`, `<gpu/gltf>`, `<gpu/obj>`, `<gpu/vrx>`, `<gpu/gguf>`, `<gpu/safetensors>` | yes | yes | yes | yes | yes | yes |
 
 On iOS and Android, an app renders either into a `<gpu/ui>` `GpuView` (`use_gpu_surface` +
@@ -45,7 +45,7 @@ fingers at once) is in [docs/mobile.md](mobile.md).
 | `<gpu/core>` | `gpu_open`, `Gpu`, `GpuBuffer` (storage, read, write) and `GpuKernel` (compute) |
 | `<gpu/render>` | `GpuTexture` (`Gpu_texture_with`: layers, cube maps, mip levels, view formats; `generate_mips`), `GpuTextureView`, `GpuSampler`, `GpuPipeline`, `GpuPass`, `GpuEncoder`, `GpuBindLayout`, `GpuBindGroup`, `GpuReadback`, vertex, index and uniform buffers, window, mobile and canvas surfaces (`surface_metal`, `surface_android`, `surface_x11`, `surface_wayland`, `surface_win32`, `surface_canvas`) |
 | `<gpu/window>` | `window_open`, `Window` input events (keyboard, mouse, gamepads, touch), `PadState` and its `GpuSurface`, over SDL3 on desktop (links SDL3) |
-| `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-lang/ui` apps on iOS and Android |
+| `<gpu/ui>` | `GpuView`, `use_gpu_surface`, `gpu_ui_surface`, `use_gpu_touch` and `use_gpu_touches` for `eskiu-packages/ui` apps on iOS and Android |
 | `<gpu/touch>` | `GpuTouch`, `GpuTouches` (the fingers that are down) and the `"gpu"` channel's touch payload |
 | `<gpu/image>` | `image_load`, `image_decode`: PNG and JPEG to RGBA8; `hdr_load`, `hdr_decode`: Radiance `.hdr` to floats (`HdrBitmap`) |
 | `<gpu/yuv>` | `Gpu_yuv`, `GpuYuv` (`upload`, `draw`, `to_rgba`): camera and video frames (NV12, NV21, I420, three-plane YUV, RGBA) to RGB in a shader, BT.601 and BT.709, full and limited range, turned upright |

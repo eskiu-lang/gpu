@@ -16,8 +16,8 @@
 //     yuv.draw(&pass, &d);
 //     pass.end()?;
 //
-// GpuYuvImage has the field layout of eskiu-lang/ui-camera's CameraFrame and
-// eskiu-lang/video's VideoFrame, so a pointer to either is a pointer to one.
+// GpuYuvImage has the field layout of eskiu-packages/ui-camera's CameraFrame and
+// eskiu-packages/video's VideoFrame, so a pointer to either is a pointer to one.
 
 import <mem>;
 import <string>;

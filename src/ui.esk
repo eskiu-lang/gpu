@@ -1,4 +1,4 @@
-// ui.esk: GpuView for eskiu-lang/ui apps on iOS (CAMetalLayer) and Android
+// ui.esk: GpuView for eskiu-packages/ui apps on iOS (CAMetalLayer) and Android
 // (SurfaceView / ANativeWindow). Import <gpu/ui> alongside <ui> and <gpu>:
 //
 //     use_gpu_surface(void(uint32 w, uint32 h) {
