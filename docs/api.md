@@ -3082,14 +3082,26 @@ GpuTextureDesc). Its view covers all of it: 2D, 2D array or cube.
 Result<GpuTexture, string> Gpu_texture_from_metal(*Gpu self, *void metal_texture, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage)
 ```
 
-Apple platforms only. A GpuTexture over a Metal texture made outside wgpu (an
-id<MTLTexture>, borrowed: wgpu retains it): the drawables a system hands over each frame,
-such as CompositorServices' color and depth textures on visionOS. width, height, format and
-layers must be the Metal texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is
-RenderAttachment. It calls wgpuDeviceCreateTextureFromMetal, which upstream wgpu-native
-lacks: a program that uses it links wgpu-native from eskiu-lang/wgpu-native's eskiu branch
-(its eskiu/build_apple.sh builds visionOS, iOS and macOS). eskiu-scene's
-examples/xr/visionos draws a scene into a visionOS immersive space this way.
+A GpuTexture over a Metal texture made outside wgpu (an id<MTLTexture>, borrowed: wgpu
+retains it): the drawables a system hands over each frame, such as CompositorServices'
+color and depth textures on visionOS. width, height, format and layers must be the Metal
+texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is RenderAttachment.
+
+### WGPUVulkanHandles
+
+```eskiu
+struct WGPUVulkanHandles {
+    *void instance;
+    *void physical_device;
+    *void device;
+    *void queue;
+    uint32 queue_family_index;
+    uint32 queue_index;
+}
+```
+
+The Vulkan objects behind a device (wgpu-native's eskiu branch, as Gpu_texture_from_metal):
+what an OpenXR session's XrGraphicsBindingVulkanKHR names.
 
 ### Gpu_vulkan_handles
 
@@ -3097,10 +3109,8 @@ examples/xr/visionos draws a scene into a visionOS immersive space this way.
 Result<WGPUVulkanHandles, string> Gpu_vulkan_handles(*Gpu self)
 ```
 
-Android, Linux and Windows. The device's Vulkan instance, physical device, device, queue
-family and queue index, for an OpenXR session to bind to (XrGraphicsBindingVulkanKHR); an
-error when the device is not on the Vulkan backend. Like Gpu_texture_from_metal it needs
-wgpu-native from eskiu-lang/wgpu-native's eskiu branch (eskiu/build_android.sh).
+The device's Vulkan instance, physical device, device and queue, for an OpenXR session to
+bind to. An error when the device is not on the Vulkan backend.
 
 ### Gpu_texture_from_vulkan
 
@@ -3108,10 +3118,9 @@ wgpu-native from eskiu-lang/wgpu-native's eskiu branch (eskiu/build_android.sh).
 Result<GpuTexture, string> Gpu_texture_from_vulkan(*Gpu self, uint64 vk_image, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage)
 ```
 
-Android, Linux and Windows. A GpuTexture over a VkImage made outside wgpu, such as an OpenXR
-swapchain image; the image stays the caller's. width, height, format and layers must be the
-image's; usage 0 is RenderAttachment. eskiu-scene's examples/xr/quest draws into Quest's
-swapchains this way.
+A GpuTexture over a VkImage made outside wgpu (an OpenXR swapchain image; it stays the
+caller's). width, height, format and layers must be the image's; layers > 1 is a 2D array.
+usage 0 is RenderAttachment.
 
 ### Gpu_depth_texture
 
