@@ -1,0 +1,98 @@
+// external.esk: textures made outside wgpu and the device's Vulkan objects (<gpu/external>):
+// the drawables a headset's compositor hands over (CompositorServices' Metal textures on
+// visionOS, OpenXR's VkImages on Quest) and the handles an OpenXR session binds to.
+//
+// These calls come from wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu);
+// the upstream libraries lack them. They are a module of their own so that only a program that
+// imports <gpu/external> needs that build: everything else links the upstream wgpu-native.
+
+import <gpu/raw>;
+import <gpu/core>;
+import <gpu/render>;
+
+#ifdef __APPLE__
+// wgpu-native's branch for Eskiu (eskiu-lang/wgpu-native, branch eskiu) adds this call; the
+// upstream libraries lack it, so a program that uses Gpu_texture_from_metal links that build.
+extern WGPUTexture wgpuDeviceCreateTextureFromMetal(WGPUDevice device, *void metal_texture, *WGPUTextureDescriptor descriptor);
+
+// A GpuTexture over a Metal texture made outside wgpu (an id<MTLTexture>, borrowed: wgpu
+// retains it): the drawables a system hands over each frame, such as CompositorServices'
+// color and depth textures on visionOS. width, height, format and layers must be the Metal
+// texture's; layers > 1 is a 2D array (one layer per eye). usage 0 is RenderAttachment.
+Result<GpuTexture, string> Gpu_texture_from_metal(*Gpu self, *void metal_texture, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage) {
+    if (metal_texture == null) return Err<GpuTexture, string>(_gpu_fail("texture_from_metal: no texture", null));
+    uint32 n = layers != 0 ? layers : (uint32)1;
+    WGPUTextureUsage u = usage != 0 ? usage : WGPUTextureUsage_RenderAttachment;
+    WGPUTextureViewDimension dim = n > 1 ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: u, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{width, height, n}, format: format, mipLevelCount: 1, sampleCount: 1};
+    WGPUTexture t = wgpuDeviceCreateTextureFromMetal(self.device, metal_texture, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: 1,
+            arrayLayerCount: n, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture_from_metal");
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, 1, 1, n, dim, u};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture_from_metal", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+#endif
+
+#if defined(__ANDROID__) || defined(__linux__) || defined(_WIN32)
+// The Vulkan objects behind a device (wgpu-native's eskiu branch, as Gpu_texture_from_metal):
+// what an OpenXR session's XrGraphicsBindingVulkanKHR names.
+struct WGPUVulkanHandles {
+    *void instance;
+    *void physical_device;
+    *void device;
+    *void queue;
+    uint32 queue_family_index;
+    uint32 queue_index;
+}
+
+extern uint32 wgpuDeviceGetVulkanHandles(WGPUDevice device, *WGPUVulkanHandles handles);
+extern WGPUTexture wgpuDeviceCreateTextureFromVulkan(WGPUDevice device, uint64 vk_image, *WGPUTextureDescriptor descriptor);
+
+// The device's Vulkan instance, physical device, device and queue, for an OpenXR session to
+// bind to. An error when the device is not on the Vulkan backend.
+Result<WGPUVulkanHandles, string> Gpu_vulkan_handles(*Gpu self) {
+    WGPUVulkanHandles h;
+    if (wgpuDeviceGetVulkanHandles(self.device, &h) == 0) {
+        return Err<WGPUVulkanHandles, string>(_gpu_fail("vulkan_handles: the device is not on Vulkan", null));
+    }
+    return Ok<WGPUVulkanHandles, string>(h);
+}
+
+// A GpuTexture over a VkImage made outside wgpu (an OpenXR swapchain image; it stays the
+// caller's). width, height, format and layers must be the image's; layers > 1 is a 2D array.
+// usage 0 is RenderAttachment.
+Result<GpuTexture, string> Gpu_texture_from_vulkan(*Gpu self, uint64 vk_image, uint32 width, uint32 height, WGPUTextureFormat format, uint32 layers, WGPUTextureUsage usage) {
+    if (vk_image == 0) return Err<GpuTexture, string>(_gpu_fail("texture_from_vulkan: no image", null));
+    uint32 n = layers != 0 ? layers : (uint32)1;
+    WGPUTextureUsage u = usage != 0 ? usage : WGPUTextureUsage_RenderAttachment;
+    WGPUTextureViewDimension dim = n > 1 ? WGPUTextureViewDimension_2DArray : WGPUTextureViewDimension_2D;
+    _gpu_push(self);
+    WGPUTextureDescriptor td = WGPUTextureDescriptor{usage: u, dimension: WGPUTextureDimension_2D,
+        size: WGPUExtent3D{width, height, n}, format: format, mipLevelCount: 1, sampleCount: 1};
+    WGPUTexture t = wgpuDeviceCreateTextureFromVulkan(self.device, vk_image, &td);
+    WGPUTextureView v = null;
+    if (t != null) {
+        WGPUTextureViewDescriptor vd = WGPUTextureViewDescriptor{format: format, dimension: dim, mipLevelCount: 1,
+            arrayLayerCount: n, aspect: WGPUTextureAspect_All};
+        v = wgpuTextureCreateView(t, &vd);
+    }
+    string err = _gpu_pop(self, "texture_from_vulkan");
+    GpuTexture tex = GpuTexture{*self, t, v, format, width, height, 1, 1, n, dim, u};
+    if (err != null || t == null) {
+        GpuTexture_release(&tex);
+        return Err<GpuTexture, string>(err != null ? err : _gpu_fail("texture_from_vulkan", null));
+    }
+    return Ok<GpuTexture, string>(tex);
+}
+#endif
