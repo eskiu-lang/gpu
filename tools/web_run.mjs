@@ -95,12 +95,15 @@ const flags = ["--headless=new", "--remote-debugging-port=0", `--user-data-dir=$
   "--hide-scrollbars", "--window-size=1280,1024", "--enable-unsafe-webgpu",
   "--enable-features=WebAssemblyJSPromiseIntegration", "about:blank"];
 if (opt.swiftshader) flags.splice(-1, 0, "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--use-webgpu-adapter=swiftshader");
+if (process.platform === "linux" && process.env.CI) flags.splice(-1, 0, "--no-sandbox");
 if (opt.noWebgpu || opt.nullAdapter) flags.splice(flags.indexOf("--enable-unsafe-webgpu"), 1, "--disable-features=WebGPU,WebGPUService", "--disable-webgpu");
 const chrome = spawn(browsers[0], flags, { stdio: ["ignore", "ignore", "pipe"] });
 let wsUrl = "";
 await new Promise((res, rej) => {
   let buf = "";
-  const t = setTimeout(() => rej(new Error("web_run: the browser did not start")), 20000);
+  const fail = (why) => rej(new Error(`web_run: the browser did not start (${why})\n${buf.slice(-2000)}`));
+  const t = setTimeout(() => fail("no DevTools line in 20 s"), 20000);
+  chrome.on("exit", (c) => { clearTimeout(t); fail(`exit code ${c}`); });
   chrome.stderr.on("data", (d) => {
     buf += d;
     const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
