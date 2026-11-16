@@ -3,7 +3,13 @@
 All notable changes to this package are documented in this file. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.7.0] - 2026-11-16
+## [0.7.1] - 2026-11-16
+
+### Changed
+
+- The package moved to the eskiu-packages organization (github.com/eskiu-packages/gpu); the old URL redirects. No API change.
+
+## [0.7.0]
 
 ### Added
 
